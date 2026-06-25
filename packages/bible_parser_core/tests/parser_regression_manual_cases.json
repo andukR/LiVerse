@@ -600,5 +600,26 @@
     "source": "manual",
     "line": 0,
     "tags": ["range", "chapter_tail", "manual", "recent_fix"]
+  },
+  {
+    "text": "Псалом сто тридцать два.",
+    "ref": "Псалтирь 132:1-3",
+    "source": "manual",
+    "line": 0,
+    "tags": ["psalm", "short_chapter", "manual", "recent_fix"]
+  },
+  {
+    "text": "Псалом сто тридцать второй первый третий стих.",
+    "ref": "Псалтирь 132:1-3",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "psalm", "short_chapter", "manual", "recent_fix"]
+  },
+  {
+    "text": "Псалом сто тридцать два с первого стиха конца главы.",
+    "ref": "Псалтирь 132:1-3",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "psalm", "short_chapter", "chapter_tail", "asr_variant", "manual", "recent_fix"]
   }
 ]

@@ -500,6 +500,20 @@ def replace_number_words(tokens: list[str]) -> list[str]:
         following, following_from_extractor = (
             number_word_value(tokens[index + 1]) if index + 1 < len(tokens) else (None, False)
         )
+        third, third_from_extractor = (
+            number_word_value(tokens[index + 2]) if index + 2 < len(tokens) else (None, False)
+        )
+        if (
+            current is not None
+            and following is not None
+            and third is not None
+            and current >= 100
+            and 20 <= following < 100
+            and third < 10
+        ):
+            result.append(str(current + following + third))
+            index += 3
+            continue
         if (
             current is not None
             and following is not None
@@ -935,7 +949,7 @@ def ref_candidates(normalized: str, book: str, bible: dict[str, dict[int, dict[i
         chapter_end = max(chapter_map) if chapter_map else None
         tokens = [token for token, _start, _end in token_spans(normalized)]
         for match in re.finditer(
-            r"(?:с\s+)?(\d+)\s+стих(?:\s+\w+){0,4}?\s+(?:и\s+)?до\s+конца\s+глава",
+            r"(?:с\s+)?(\d+)\s+стих(?:\s+\w+){0,4}?\s+(?:и\s+)?(?:до\s+)?конца\s+глава",
             normalized,
         ):
             start_verse = int(match.group(1))
@@ -1308,12 +1322,15 @@ def parse_live_reference(text: str, bible_path: Path = DEFAULT_BIBLE) -> ParsedR
         return None
     if (
         start_verse == end_verse
-        and re.search(r"\b(?:с\s+)?\d+\s+стих\s+и\s+до\s+конца\s+глава\b", normalized)
+        and re.search(r"\b(?:с\s+)?\d+\s+стих(?:\s+\w+){0,4}?\s+(?:и\s+)?(?:до\s+)?конца\s+глава\b", normalized)
         and chapter_map
     ):
         chapter_end = max(chapter_map)
         if start_verse < chapter_end:
             end_verse = chapter_end
+    if chapter_map and len(chapter_map) <= 5:
+        start_verse = min(chapter_map)
+        end_verse = max(chapter_map)
     if end_verse not in chapter_map:
         end_verse = start_verse
     verse_ids = list(range(start_verse, end_verse + 1))
