@@ -1,0 +1,583 @@
+[
+  {
+    "text": "Иисуса Навин, первая глава 90 стиха",
+    "ref": "Иисус Навин 1:9",
+    "source": "manual",
+    "line": 0,
+    "tags": ["asr_variant", "trailing_zero_verse", "manual", "recent_fix"]
+  },
+  {
+    "text": "Написано Ивангедет, от яна 316, так возбил Бог мир",
+    "ref": "Иоанн 3:16",
+    "source": "manual",
+    "line": 0,
+    "tags": ["asr_variant", "compact_chapter_verse", "manual", "recent_fix"]
+  },
+  {
+    "text": "послание Яна 4 глава 7 по 12 стих",
+    "ref": "1 Иоанна 4:7-12",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "manual", "recent_fix"]
+  },
+  {
+    "text": "книга пророка Исаи 64 Агла Вашей Сестой Стивы",
+    "ref": "Исаия 64:6",
+    "source": "manual",
+    "line": 0,
+    "tags": ["asr_variant", "manual", "recent_fix"]
+  },
+  {
+    "text": "Лука 6 глава 43-44-х нет доброго дерева",
+    "ref": "Лука 6:43-44",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "manual", "recent_fix"]
+  },
+  {
+    "text": "если мы откроем притчет 22 главу и мы посмотрим да там есть один очень хороший стих не один два стиха мы будем смотреть да притчет 22 глава 6 стих",
+    "ref": "Притчи 22:6",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "negative_context", "manual", "recent_fix"]
+  },
+  {
+    "text": "Второе послание Петра, вторая глава, с 20 по 22 стиха",
+    "ref": "2 Петра 2:20-22",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "manual", "recent_fix"]
+  },
+  {
+    "text": "Первое послание Иоанна, вторая глава, с 8 по 9 стих",
+    "ref": "1 Иоанна 2:8-9",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "manual", "recent_fix"]
+  },
+  {
+    "text": "Первое послание Иоанна. Вторая глава, седьмой, восьмой стих.",
+    "ref": "1 Иоанна 2:7-8",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "ordinal_words", "manual", "recent_fix"]
+  },
+  {
+    "text": "с 18 стиха. Вторая глава первого послания Иоанна, с 18 стиха и до конца главы.",
+    "ref": "1 Иоанна 2:18-29",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "chapter_tail", "manual", "recent_fix"]
+  },
+  {
+    "text": "Первое послание Петра, вторая глава, с первого по третий стих",
+    "ref": "1 Петра 2:1-3",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "ordinal_words", "manual", "recent_fix"]
+  },
+  {
+    "text": "Иисус Навин, 18 глава, с 1 по 4 стих",
+    "ref": "Иисус Навин 18:1-4",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "manual", "recent_fix"]
+  },
+  {
+    "text": "Иеремия 32:40-43",
+    "ref": "Иеремия 32:40-43",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "colon_format", "manual", "recent_fix"]
+  },
+  {
+    "text": "Тремя я 32 глава 40-43 стих",
+    "ref": "Иеремия 32:40-43",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "manual", "recent_fix"]
+  },
+  {
+    "text": "Ко-Ко-И-С-А-И 57 глава с 6 по 8 стих",
+    "ref": "Исаия 57:6-8",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "manual"]
+  },
+  {
+    "text": "Мы, опять же, читаем в книге Бытиев, вторая глава 25 из них, и были оба ноги",
+    "ref": "Бытие 2:25",
+    "source": "manual",
+    "line": 0,
+    "tags": ["asr_variant", "book_alias", "live_holdout", "manual", "recent_fix"]
+  },
+  {
+    "text": "Евангелия от Матвея, 22 глава. И мы будем сегодня смотреть с 15 стиха по 46",
+    "ref": "Матфей 22:15-46",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "live_holdout", "manual", "recent_fix"]
+  },
+  {
+    "text": "Диане Апостолов 13 глава С первого по 3 Посмотрим до вот 3 стих",
+    "ref": "Деяния 13:1-3",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "book_alias", "live_holdout", "manual", "recent_fix"]
+  },
+  {
+    "text": "Диане 4 глава 32 стих",
+    "ref": "Деяния 4:32",
+    "source": "manual",
+    "line": 0,
+    "tags": ["asr_variant", "book_alias", "live_holdout", "manual", "recent_fix"]
+  },
+  {
+    "text": "деяние 4 глава 3 2 стих",
+    "ref": "Деяния 4:32",
+    "source": "manual",
+    "line": 0,
+    "tags": ["asr_variant", "split_digit_verse", "live_holdout", "manual", "recent_fix"]
+  },
+  {
+    "text": "Диания 4 глава 34 и 37 стих",
+    "ref": "Деяния 4:34-37",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "book_alias", "live_holdout", "manual", "recent_fix"]
+  },
+  {
+    "text": "Калася нам в третья глава 15 из них",
+    "ref": "Колоссянам 3:15",
+    "source": "manual",
+    "line": 0,
+    "tags": ["asr_variant", "book_alias", "live_holdout", "manual", "recent_fix"]
+  },
+  {
+    "text": "1 послание Петра, 3 глава, 8 из них",
+    "ref": "1 Петра 3:8",
+    "source": "manual",
+    "line": 0,
+    "tags": ["asr_variant", "verse_word", "live_holdout", "manual", "recent_fix"]
+  },
+  {
+    "text": "второзаконяешь стае глава с четвертого по девятый стих",
+    "ref": "Второзаконие 6:4-9",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "chapter_word", "live_holdout", "manual", "recent_fix"]
+  },
+  {
+    "text": "если мы открываем книгу судей 18 главу aji 1 стих в те дни не было царя у израиля 21 глава",
+    "ref": "Судьи 18:1",
+    "source": "manual",
+    "line": 0,
+    "tags": ["asr_noise", "live_holdout", "manual", "recent_fix"]
+  },
+  {
+    "text": "в первом послании Каринфена 12 глава, с 12 по 31 стих",
+    "ref": "1 Коринфянам 12:12-31",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "book_alias", "live_holdout", "manual", "recent_fix"]
+  },
+  {
+    "text": "Первым посланником Каримфинам, 15 главе, 55-й, 57-й стих",
+    "ref": "1 Коринфянам 15:55-57",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "book_alias", "live_holdout", "manual", "recent_fix"]
+  },
+  {
+    "text": "1-го книга царств 10-я глава 17-19 из Тихо",
+    "ref": "1 Царств 10:17-19",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "book_alias", "live_holdout", "manual", "recent_fix"]
+  },
+  {
+    "text": "в 15 главе Евангел от Матвея. 7-9 из тих. Евангел от Матвея 15 глава 7-9 из тих",
+    "ref": "Матфей 15:7-9",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "live_holdout", "manual", "recent_fix"]
+  },
+  {
+    "text": "Послание Филиппица, третья глава, восьмой, девятой Иль с тринадцатого по шестнадцатой стихии",
+    "ref": "Филиппийцам 3:13-16",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "book_alias", "live_holdout", "manual", "recent_fix"]
+  },
+  {
+    "text": "Мы читаем, можно открыть, при 16 главе 9 стих. Там написано очень просто. Сердце человека обдумывает свой путь.",
+    "ref": "Притчи 16:9",
+    "source": "manual",
+    "line": 0,
+    "tags": ["asr_variant", "book_alias", "live_holdout", "manual", "recent_fix"]
+  },
+  {
+    "text": "Иван Гелятматфея, 19 глава 5 и 6 стиха",
+    "ref": "Матфей 19:5-6",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "book_alias", "live_holdout", "manual", "recent_fix"]
+  },
+  {
+    "text": "в Таразаконе 1 Глава 22 стих. Если вы будете соблюдать все заповеди, которые заповедую вам исполнять",
+    "ref": "Второзаконие 11:22",
+    "source": "manual",
+    "line": 0,
+    "tags": ["asr_variant", "book_alias", "live_holdout", "manual", "recent_fix"]
+  },
+  {
+    "text": "Давайте сегодня прочитаем с 8-9 и 13-16 стихи. Послание Филиппитс, Антрите Огова.",
+    "ref": "Филиппийцам 3:13-16",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "book_alias", "live_holdout", "manual", "recent_fix"]
+  },
+  {
+    "text": "Евангелия Атеана, первоглава первостих, в начале было слово и слово было у Бога",
+    "ref": "Иоанн 1:1",
+    "source": "manual",
+    "line": 0,
+    "tags": ["asr_variant", "book_alias", "live_holdout", "manual", "recent_fix"]
+  },
+  {
+    "text": "Постанет к Римлянам, 8 глава 35 и 39 и есть такие слова",
+    "ref": "Римлянам 8:35-39",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "live_holdout", "manual", "recent_fix"]
+  },
+  {
+    "text": "4-5 из тих 22-го солма",
+    "ref": "Псалтирь 22:4-5",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "psalm", "live_holdout", "manual", "recent_fix"]
+  },
+  {
+    "text": "Книга Пророка Малахи, вторая глава 15-16, из стих. 14, давайте прочитаем",
+    "ref": "Малахия 2:14-16",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "book_alias", "live_holdout", "manual", "recent_fix"]
+  },
+  {
+    "text": "Это 1 послание 4-го 8-го. Кто не любит, тот не познал Бога, потому что Бог есть любовь.",
+    "ref": "",
+    "source": "manual",
+    "line": 0,
+    "tags": ["negative", "incomplete_ref", "asr_variant", "live_holdout", "manual", "recent_fix"]
+  },
+  {
+    "text": "от Матфея 16 из третей главы",
+    "ref": "Матфей 3:16",
+    "source": "manual",
+    "line": 0,
+    "tags": ["asr_variant", "reordered_ref", "live_smoke", "manual", "recent_fix"]
+  },
+  {
+    "text": "Евангелия от Матфея 16-тестих 3-й главы",
+    "ref": "Матфей 3:16",
+    "source": "manual",
+    "line": 0,
+    "tags": ["asr_variant", "reordered_ref", "live_smoke", "manual", "recent_fix"]
+  },
+  {
+    "text": "16 из их третья глава Ивангелия от Матфея",
+    "ref": "Матфей 3:16",
+    "source": "manual",
+    "line": 0,
+    "tags": ["asr_variant", "reordered_ref", "live_smoke", "manual", "recent_fix"]
+  },
+  {
+    "text": "1 книга царств 10 глава",
+    "ref": "",
+    "source": "manual",
+    "line": 0,
+    "tags": ["negative", "incomplete_ref", "manual", "recent_fix"]
+  },
+  {
+    "text": "Апостол Иоанн в третьем послании в 9 10 стихе пишет такие слова",
+    "ref": "3 Иоанна 1:9-10",
+    "source": "manual",
+    "line": 0,
+    "tags": ["one_chapter_book", "john_epistle", "live_smoke", "manual", "recent_fix"]
+  },
+  {
+    "text": "Апостол Иоанн во втором послании в 7 стихе пишет такие слова",
+    "ref": "2 Иоанна 1:7",
+    "source": "manual",
+    "line": 0,
+    "tags": ["one_chapter_book", "john_epistle", "live_smoke", "manual", "recent_fix"]
+  },
+  {
+    "text": "третье послание Иоанна 9 10 стих",
+    "ref": "3 Иоанна 1:9-10",
+    "source": "manual",
+    "line": 0,
+    "tags": ["one_chapter_book", "john_epistle", "manual", "recent_fix"]
+  },
+  {
+    "text": "Петер во втором послании второй главе в 13 и 15 стихии пишет",
+    "ref": "2 Петра 2:13-15",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "peter_epistle", "live_smoke", "manual", "recent_fix"]
+  },
+  {
+    "text": "Паралипоменон, Десятую главу, Десятые одиннадцатые стихи.",
+    "ref": "2 Паралипоменон 10:10-11",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "ordinal_words", "asr_variant", "live_smoke", "manual", "recent_fix"]
+  },
+  {
+    "text": "Пусть будем читать из книги Пророка Агея. Откроем вторую главу с 11 по 14 стих.",
+    "ref": "Аггей 2:11-14",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "prophet_book", "live_smoke", "manual", "recent_fix"]
+  },
+  {
+    "text": "Матфей 5:48-6:4",
+    "ref": "Матфей 5:48-6:4",
+    "source": "manual",
+    "line": 0,
+    "tags": ["cross_chapter_range", "colon_format", "manual", "recent_fix"]
+  },
+  {
+    "text": "Евангелие от Матфея 5 глава 48 стих по 6 глава 4 стих",
+    "ref": "Матфей 5:48-6:4",
+    "source": "manual",
+    "line": 0,
+    "tags": ["cross_chapter_range", "live_smoke", "manual", "recent_fix"]
+  },
+  {
+    "text": "Давайте прочитаем первое послание Феселоникейцам. Первая глава, первый стих.",
+    "ref": "1 Фессалоникийцам 1:1",
+    "source": "manual",
+    "line": 0,
+    "tags": ["asr_variant", "book_alias", "live_smoke", "manual", "recent_fix"]
+  },
+  {
+    "text": "Первое феселоникиицам, третья голова с первого по четвертой стих.",
+    "ref": "1 Фессалоникийцам 3:1-4",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "book_alias", "chapter_word", "live_smoke", "manual", "recent_fix"]
+  },
+  {
+    "text": "Первое послание апостола Павлы, фесолоникицем. Фессалоникийцам, третья глава, первые четвертые стих.",
+    "ref": "1 Фессалоникийцам 3:1-4",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "book_alias", "live_context", "manual", "recent_fix"]
+  },
+  {
+    "text": "Проверим из третьей главы с первого по четвертой стих. Первое фес с алоникейцем.",
+    "ref": "1 Фессалоникийцам 3:1-4",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "book_alias", "live_smoke", "manual", "recent_fix"]
+  },
+  {
+    "text": "Пророка Иссайи 51 глава с 4 по 6 стих.",
+    "ref": "Исаия 51:4-6",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "book_alias", "live_smoke", "manual", "recent_fix"]
+  },
+  {
+    "text": "Второзаконие. Двадцатую главу с 10 по 15 стих.",
+    "ref": "Второзаконие 20:10-15",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "ordinal_words", "live_smoke", "manual", "recent_fix"]
+  },
+  {
+    "text": "Первая книга, парлипоминон, 18 глава, с 7 по 10 стих.",
+    "ref": "1 Паралипоменон 18:7-10",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "book_alias", "live_smoke", "manual", "recent_fix"]
+  },
+  {
+    "text": "Встаем первую книгу паралипоминон, 20 главу с 9 по 6 стих. Пропардон с четвертого по шестой стих.",
+    "ref": "1 Паралипоменон 20:4-6",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "book_alias", "live_context", "manual", "recent_fix"]
+  },
+  {
+    "text": "Послание Римляном, 8 глава, с 2 стиха и до 12.",
+    "ref": "Римлянам 8:2-12",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "live_smoke", "manual", "recent_fix"]
+  },
+  {
+    "text": "Сегодняшний же отрывок — это Деяния Апостола в четвертой лас, первого по четвертой стихе. Этот отрывок описывает продолжение событий происходящих в третьей главе.",
+    "ref": "Деяния 4:1-4",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "live_sermon", "manual", "recent_fix"]
+  },
+  {
+    "text": "Давайте мы откроем идея боссов 4 глава с первого по 40.",
+    "ref": "Деяния 4:1-4",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "trailing_zero_verse", "live_sermon", "manual", "recent_fix"]
+  },
+  {
+    "text": "Например, в Евангелии от Луки 20 главе с 29 подлит с 3 стиха описана интересная история.",
+    "ref": "Лука 20:27-33",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "live_sermon", "manual", "recent_fix"]
+  },
+  {
+    "text": "Ивангелия Гуана, 15 глава с 18-го года, 20-е месяц.",
+    "ref": "Иоанн 15:18-21",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "live_sermon", "manual", "recent_fix"]
+  },
+  {
+    "text": "И прочитаем еще евангелие от Иоанна XV, глава с 18 по 21 сих.",
+    "ref": "Иоанн 15:18-21",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "roman_numeral", "asr_variant", "live_sermon", "manual", "recent_fix"]
+  },
+  {
+    "text": "Первое послание Иоанна, второй главоз, четвертого по седьмой стих.",
+    "ref": "1 Иоанна 2:4-7",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "john_epistle", "live_sermon", "manual", "recent_fix"]
+  },
+  {
+    "text": "Второзаконие 28 глава, 13 стиха по 25.",
+    "ref": "Второзаконие 28:13-25",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "live_sermon", "manual", "recent_fix"]
+  },
+  {
+    "text": "Давайте заглянем сегодня в книгу ИОФ. 41 глава с 19 по 24 стиха.",
+    "ref": "Иов 41:19-24",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "book_alias", "live_sermon", "manual", "recent_fix"]
+  },
+  {
+    "text": "с 13 по 15 стих, 13 главы, книги, паророка и языки.",
+    "ref": "Иезекииль 13:13-15",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "prophet_book", "live_sermon", "manual", "recent_fix"]
+  },
+  {
+    "text": "Давайте прочитаем стихи 47-50 из 6 главы Евангелия от Иоанна.",
+    "ref": "Иоанн 6:47-50",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "reordered_ref", "live_sermon", "manual", "recent_fix"]
+  },
+  {
+    "text": "Евангелие от Иоанна 3 глава с 16 по 21 стих.",
+    "ref": "Иоанн 3:16-21",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "live_context", "live_sermon", "manual", "recent_fix"]
+  },
+  {
+    "text": "Все прочитаем с вами стихи с 1-го под 10-й, 14-й главы, Евангелия от Илана.",
+    "ref": "Иоанн 14:1-10",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "reordered_ref", "asr_variant", "live_sermon", "manual", "recent_fix"]
+  },
+  {
+    "text": "Наум 1 глава И еще прочитаем там же 13 и 15 стих.",
+    "ref": "Наум 1:13-15",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "live_context", "manual", "recent_fix"]
+  },
+  {
+    "text": "Книга про Рокас Афоний. Первая глава, четвертый и пятый стихи.",
+    "ref": "Софония 1:4-5",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "prophet_book", "manual", "recent_fix"]
+  },
+  {
+    "text": "Софония 1 глава, там же стихи 11 и 12.",
+    "ref": "Софония 1:11-12",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "live_context", "manual", "recent_fix"]
+  },
+  {
+    "text": "Пророк Астафония, 8-9 из стихи 1 главы.",
+    "ref": "Софония 1:8-9",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "reordered_ref", "asr_variant", "prophet_book", "manual", "recent_fix"]
+  },
+  {
+    "text": "Римлянам 3 глава. И там же прочитаем 22-23.",
+    "ref": "Римлянам 3:22-23",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "live_context", "same_place", "manual", "recent_fix"]
+  },
+  {
+    "text": "Первое послание Иоанна. Третья глава, седьмой, восьмой стихи.",
+    "ref": "1 Иоанна 3:7-8",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "numbered_book", "live_context", "manual", "recent_fix"]
+  },
+  {
+    "text": "Третье послание. Апостол и Иоанна 8-9.",
+    "ref": "3 Иоанна 1:8-9",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "one_chapter_book", "asr_variant", "numbered_book", "manual", "recent_fix"]
+  },
+  {
+    "text": "1 Иоанна 4 глава. Там же прочитаем 17 из тих.",
+    "ref": "1 Иоанна 4:17",
+    "source": "manual",
+    "line": 0,
+    "tags": ["asr_variant", "live_context", "same_place", "manual", "recent_fix"]
+  },
+  {
+    "text": "Отрывок с 7 по 9 стих, 1 послание и уанна. 1 послание и у ванов, 2 глава.",
+    "ref": "1 Иоанна 2:7-9",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "asr_variant", "split_reference", "numbered_book", "manual", "recent_fix"]
+  },
+  {
+    "text": "Вторая глава, первого послания Иоанна. Вторая глава, 5 и 6 стих, первое послание Иоанна.",
+    "ref": "1 Иоанна 2:5-6",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "repeated_reference", "numbered_book", "manual", "recent_fix"]
+  },
+  {
+    "text": "Первый псалом, первый стих и до конца главы.",
+    "ref": "Псалтирь 1:1-6",
+    "source": "manual",
+    "line": 0,
+    "tags": ["range", "chapter_tail", "psalm", "manual", "recent_fix"]
+  }
+]

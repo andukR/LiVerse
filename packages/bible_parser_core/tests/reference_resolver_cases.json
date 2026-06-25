@@ -1,0 +1,49 @@
+{
+  "metadata": {
+    "purpose": "Regression cases for candidate resolver over noisy ASR Bible references."
+  },
+  "cases": [
+    {
+      "text": "1 послание Яна 4 главу 7 по 12 стих",
+      "top_ref": "1 Иоанна 4:7-12",
+      "best_ref": "1 Иоанна 4:7-12",
+      "tags": ["asr_variant", "epistle_hint", "range"]
+    },
+    {
+      "text": "послание вся на 2 глава с 8 по 9 стиха",
+      "top_ref": "Ефесянам 2:8-9",
+      "best_ref": "Ефесянам 2:8-9",
+      "tags": ["asr_variant", "epistle_hint", "range"]
+    },
+    {
+      "text": "от яна 316 так возлюбил Бог мир",
+      "top_ref": "Иоанн 3:16",
+      "best_ref": "Иоанн 3:16",
+      "tags": ["asr_variant", "gospel_hint", "compact_chapter_verse"]
+    },
+    {
+      "text": "Иона 3 глава 16 стих",
+      "top_ref": "Иоанн 3:16",
+      "best_ref": "Иоанн 3:16",
+      "tags": ["confusable_book", "invalid_original_book"]
+    },
+    {
+      "text": "Иона 3 глава 5 стих",
+      "top_ref": "Иона 3:5",
+      "best_ref": null,
+      "tags": ["confusable_book", "valid_original_book"]
+    },
+    {
+      "text": "Лука 6 глава 43-44-х нет доброго дерева",
+      "top_ref": "Лука 6:43-44",
+      "best_ref": "Лука 6:43-44",
+      "tags": ["range", "asr_variant"]
+    },
+    {
+      "text": "первому посланию Иоанну. Вторая глава. Первый послание Иоанну, вторая глава. И мы будем читать с 12 по 17 стих",
+      "top_ref": "1 Иоанна 2:12-17",
+      "best_ref": "1 Иоанна 2:12-17",
+      "tags": ["asr_variant", "epistle_hint", "range", "holdout_error"]
+    }
+  ]
+}

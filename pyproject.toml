@@ -1,0 +1,30 @@
+[project]
+name = "live-verse-vosk"
+version = "0.1.0"
+description = "Vosk-based Bible reference probe with Holyrics integration."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "sounddevice",
+  "vosk",
+]
+
+[project.scripts]
+liverse = "tools.vosk_grammar_probe:main"
+live-verse-vosk = "tools.vosk_grammar_probe:main"
+live-verse-vosk-analyze = "tools.analyze_vosk_probe_logs:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = true
+packages = ["tools", "bible_parser_core"]
+
+[tool.setuptools.package-dir]
+tools = "tools"
+bible_parser_core = "packages/bible_parser_core/src/bible_parser_core"
+
+[tool.setuptools.package-data]
+bible_parser_core = ["data/*.json"]
