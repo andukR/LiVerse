@@ -12,12 +12,28 @@ const manualApply = document.querySelector("#manualApply");
 const manualStatus = document.querySelector("#manualStatus");
 const bookNames = document.querySelector("#bookNames");
 const bookSuggestions = document.querySelector("#bookSuggestions");
+const bookGrid = document.querySelector("#bookGrid");
+const chapterGrid = document.querySelector("#chapterGrid");
+const verseGrid = document.querySelector("#verseGrid");
+const pickedReference = document.querySelector("#pickedReference");
+const bookStep = document.querySelector("#bookStep");
+const chapterStep = document.querySelector("#chapterStep");
+const verseStep = document.querySelector("#verseStep");
+const rangeClear = document.querySelector("#rangeClear");
+const rangeApply = document.querySelector("#rangeApply");
 const pipelineStage = document.querySelector("#pipelineStage");
 const pipelineProgress = document.querySelector("#pipelineProgress");
 const pipelineMessage = document.querySelector("#pipelineMessage");
 const manualHint = document.querySelector("#manualHint");
 const manualCard = document.querySelector("#manualCard");
 let books = [];
+let bibleStructure = {};
+const rangePick = {
+  book: "",
+  chapter: null,
+  startVerse: null,
+  endVerse: null,
+};
 
 const stageNames = {
   listening: "Слушаю",
@@ -98,16 +114,163 @@ function renderBookSuggestions() {
     });
 }
 
+function referenceFromPick() {
+  if (!rangePick.book || !rangePick.chapter || !rangePick.startVerse) return "";
+  const chapter = rangePick.chapter;
+  const start = rangePick.startVerse;
+  const end = rangePick.endVerse;
+  if (end && end !== start) {
+    return `${rangePick.book} ${chapter}:${Math.min(start, end)}-${Math.max(start, end)}`;
+  }
+  return `${rangePick.book} ${chapter}:${start}`;
+}
+
+function setStep(activeStep) {
+  bookStep.classList.toggle("active", activeStep === "book");
+  chapterStep.classList.toggle("active", activeStep === "chapter");
+  verseStep.classList.toggle("active", activeStep === "verse");
+  bookGrid.classList.toggle("hidden", activeStep !== "book");
+  chapterGrid.classList.toggle("hidden", activeStep !== "chapter");
+  verseGrid.classList.toggle("hidden", activeStep !== "verse");
+}
+
+function updatePickedReference() {
+  const ref = referenceFromPick();
+  if (ref) {
+    pickedReference.textContent = ref;
+    manualRef.value = ref;
+    return;
+  }
+  if (rangePick.book && rangePick.chapter) {
+    pickedReference.textContent = `${rangePick.book} ${rangePick.chapter}: выберите стих или диапазон`;
+    return;
+  }
+  if (rangePick.book) {
+    pickedReference.textContent = `${rangePick.book}: выберите главу`;
+    return;
+  }
+  pickedReference.textContent = "Выберите книгу";
+}
+
+function button(label, className, onClick) {
+  const item = document.createElement("button");
+  item.type = "button";
+  item.className = className;
+  item.textContent = label;
+  item.addEventListener("click", onClick);
+  return item;
+}
+
+function renderBooksGrid() {
+  bookGrid.replaceChildren();
+  books.forEach((book) => {
+    const item = button(book, "picker-button book-button", () => {
+      rangePick.book = book;
+      rangePick.chapter = null;
+      rangePick.startVerse = null;
+      rangePick.endVerse = null;
+      renderChaptersGrid();
+      updatePickedReference();
+      setStep("chapter");
+    });
+    item.classList.toggle("selected", rangePick.book === book);
+    bookGrid.append(item);
+  });
+}
+
+function renderChaptersGrid() {
+  chapterGrid.replaceChildren();
+  const chapters = bibleStructure[rangePick.book] || {};
+  Object.keys(chapters)
+    .map(Number)
+    .sort((a, b) => a - b)
+    .forEach((chapter) => {
+      const item = button(String(chapter), "picker-button number-button", () => {
+        rangePick.chapter = chapter;
+        rangePick.startVerse = null;
+        rangePick.endVerse = null;
+        renderChaptersGrid();
+        renderVersesGrid();
+        updatePickedReference();
+        setStep("verse");
+      });
+      item.classList.toggle("selected", rangePick.chapter === chapter);
+      chapterGrid.append(item);
+    });
+}
+
+function verseClass(verse) {
+  const start = rangePick.startVerse;
+  const end = rangePick.endVerse;
+  if (verse === start || verse === end) return "selected";
+  if (start && end && verse > Math.min(start, end) && verse < Math.max(start, end)) {
+    return "in-range";
+  }
+  return "";
+}
+
+function chooseVerse(verse) {
+  if (!rangePick.startVerse || (rangePick.startVerse && rangePick.endVerse)) {
+    rangePick.startVerse = verse;
+    rangePick.endVerse = null;
+  } else if (verse === rangePick.startVerse) {
+    rangePick.startVerse = null;
+    rangePick.endVerse = null;
+  } else {
+    rangePick.endVerse = verse;
+  }
+  renderVersesGrid();
+  updatePickedReference();
+}
+
+function renderVersesGrid() {
+  verseGrid.replaceChildren();
+  const chapters = bibleStructure[rangePick.book] || {};
+  const verses = chapters[String(rangePick.chapter)] || [];
+  verses.forEach((verse) => {
+    const item = button(String(verse), "picker-button number-button", () => chooseVerse(Number(verse)));
+    const state = verseClass(Number(verse));
+    if (state) item.classList.add(state);
+    verseGrid.append(item);
+  });
+}
+
+function resetRangePick() {
+  rangePick.book = "";
+  rangePick.chapter = null;
+  rangePick.startVerse = null;
+  rangePick.endVerse = null;
+  manualRef.value = "";
+  renderBooksGrid();
+  chapterGrid.replaceChildren();
+  verseGrid.replaceChildren();
+  updatePickedReference();
+  setStep("book");
+}
+
+function applyRangePick() {
+  const value = referenceFromPick();
+  if (!value) {
+    manualStatus.textContent = "Выберите книгу, главу и стих";
+    return;
+  }
+  manualRef.value = value;
+  applyManualReference();
+}
+
 async function loadBooks() {
   try {
-    const response = await fetch("/api/books");
+    const response = await fetch("/api/bible-structure");
     const result = await response.json();
     books = result.books || [];
+    bibleStructure = result.structure || {};
     books.forEach((book) => {
       const option = document.createElement("option");
       option.value = book;
       bookNames.append(option);
     });
+    renderBooksGrid();
+    setStep("book");
   } catch {
     manualStatus.textContent = "Не удалось загрузить список книг";
   }
@@ -143,6 +306,15 @@ manualRef.addEventListener("keydown", (event) => {
   if (event.key === "Enter") applyManualReference();
 });
 manualApply.addEventListener("click", applyManualReference);
+rangeClear.addEventListener("click", resetRangePick);
+rangeApply.addEventListener("click", applyRangePick);
+bookStep.addEventListener("click", () => setStep("book"));
+chapterStep.addEventListener("click", () => {
+  if (rangePick.book) setStep("chapter");
+});
+verseStep.addEventListener("click", () => {
+  if (rangePick.book && rangePick.chapter) setStep("verse");
+});
 
 const events = new EventSource("/operator-events");
 events.onopen = () => { connection.textContent = "Телефон подключён"; };

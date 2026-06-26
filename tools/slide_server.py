@@ -170,6 +170,18 @@ def bible_book_names() -> list[str]:
     return [book for book, _aliases in books_data]
 
 
+def bible_structure() -> dict:
+    from bible_parser_core.parser import bible_map
+
+    structure = {}
+    for book, chapters in bible_map().items():
+        structure[book] = {
+            str(chapter): sorted(verses)
+            for chapter, verses in sorted(chapters.items())
+        }
+    return structure
+
+
 def manual_reference_candidate(reference: str) -> tuple[dict | None, str]:
     from bible_parser_core.parser import parse_live_reference
 
@@ -318,6 +330,9 @@ class SlideHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/books":
             self.send_json({"books": bible_book_names()})
+            return
+        if self.path == "/api/bible-structure":
+            self.send_json({"books": bible_book_names(), "structure": bible_structure()})
             return
         if self.path == "/operator-qr.svg":
             self.send_qr()

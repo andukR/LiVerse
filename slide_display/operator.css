@@ -29,4 +29,29 @@ button:disabled { opacity: .5; }
 .manual-apply { width: 100%; min-height: 58px; margin-top: 12px; background: #315e9b; }
 .suggestions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 9px; }
 .book-suggestion { min-height: 42px; padding: 8px 12px; background: #283849; font-size: 16px; font-weight: 600; }
+.range-picker { margin-top: 14px; padding-top: 14px; border-top: 1px solid #2b3847; }
+.picker-tabs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 10px; }
+.picker-tabs span { min-height: 34px; display: grid; place-items: center; border-radius: 8px; background: #263443; color: #aebdcc; font-size: 14px; font-weight: 750; }
+.picker-tabs .active { background: #d9a83d; color: #101720; }
+.picked-reference { min-height: 44px; display: flex; align-items: center; padding: 10px 12px; border-radius: 10px; background: #101922; color: #f5ce7c; font-size: 18px; font-weight: 750; }
+.picker-grid { display: grid; gap: 8px; margin-top: 12px; }
+.book-grid { grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); }
+.compact-grid { grid-template-columns: repeat(auto-fill, minmax(54px, 1fr)); }
+.picker-button { min-height: 48px; padding: 8px; border: 1px solid #3f5265; border-radius: 8px; background: #203040; color: #f3f6f9; font-size: 16px; font-weight: 700; }
+.book-button { text-align: left; justify-content: start; }
+.number-button { font-size: 19px; }
+.picker-button.selected { background: #148447; border-color: #23a660; }
+.picker-button.in-range { background: #315e9b; border-color: #4f81c4; }
+.range-actions { display: grid; grid-template-columns: 1fr 2fr; gap: 10px; margin-top: 12px; }
+.range-actions button { min-height: 50px; border-radius: 10px; font-size: 16px; }
+#rangeClear { background: #4a5c6e; }
+#rangeApply { background: #315e9b; }
 #manualStatus { min-height: 24px; margin-top: 12px; color: #c8d2dc; }
+
+@media (max-width: 460px) {
+  main { padding: 12px; }
+  .card { padding: 16px; border-radius: 12px; }
+  .book-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .compact-grid { grid-template-columns: repeat(5, 1fr); }
+  .book-button { font-size: 14px; }
+}

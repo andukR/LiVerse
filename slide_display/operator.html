@@ -57,6 +57,23 @@
       >
       <datalist id="bookNames"></datalist>
       <div id="bookSuggestions" class="suggestions"></div>
+
+      <div class="range-picker" aria-label="Выбор ссылки по книгам, главам и стихам">
+        <div class="picker-tabs" aria-hidden="true">
+          <span id="bookStep" class="active">Книга</span>
+          <span id="chapterStep">Глава</span>
+          <span id="verseStep">Стихи</span>
+        </div>
+        <div id="pickedReference" class="picked-reference">Выберите книгу</div>
+        <div id="bookGrid" class="picker-grid book-grid"></div>
+        <div id="chapterGrid" class="picker-grid compact-grid hidden"></div>
+        <div id="verseGrid" class="picker-grid compact-grid hidden"></div>
+        <div class="range-actions">
+          <button id="rangeClear" type="button">Сбросить</button>
+          <button id="rangeApply" type="button">Подставить выбранное</button>
+        </div>
+      </div>
+
       <button id="manualApply" class="manual-apply">Подставить цитату</button>
       <div id="manualStatus"></div>
     </section>
