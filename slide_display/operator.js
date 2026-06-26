@@ -65,8 +65,16 @@ function render(state) {
   if (!candidate) return;
   ref.textContent = candidate.ref || "Неизвестная ссылка";
   verse.textContent = candidate.verse || "";
+  resizeCandidateVerse();
   asr.textContent = candidate.asr || candidate.detected_text || "";
   status.textContent = "";
+}
+
+function resizeCandidateVerse() {
+  const length = verse.textContent.trim().length;
+  verse.classList.toggle("long", length > 260);
+  verse.classList.toggle("very-long", length > 520);
+  verse.classList.toggle("extra-long", length > 900);
 }
 
 async function decide(action) {

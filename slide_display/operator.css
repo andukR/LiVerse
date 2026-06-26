@@ -81,12 +81,27 @@ button:disabled { opacity: .5; }
   .manual-hint { font-size: 14px; }
   .manual-hint { padding: 9px; }
   .waiting { padding-block: 22px; }
-  #candidate { min-height: 0; overflow: auto; }
+  #candidate {
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
   #candidate h1 { font-size: 30px; margin-bottom: 8px; }
-  #verse { font-size: 18px; line-height: 1.3; }
-  details { margin-top: 12px; }
-  .actions { grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 14px; }
+  #verse {
+    min-height: 0;
+    margin: 0;
+    overflow: hidden;
+    font-size: 17px;
+    line-height: 1.24;
+  }
+  #verse.long { font-size: 15px; line-height: 1.2; }
+  #verse.very-long { font-size: 13px; line-height: 1.16; }
+  #verse.extra-long { font-size: 12px; line-height: 1.12; }
+  details { margin-top: 10px; flex: 0 0 auto; }
+  .actions { grid-template-columns: 1fr 1fr; gap: 8px; margin-top: auto; padding-top: 10px; }
   button { min-height: 42px; border-radius: 8px; font-size: 16px; }
+  #status { flex: 0 0 auto; min-height: 20px; margin-top: 8px; font-size: 14px; }
 
   .manual {
     grid-column: 2;
