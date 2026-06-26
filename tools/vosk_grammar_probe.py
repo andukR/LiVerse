@@ -597,7 +597,19 @@ def main() -> int:
     parser.add_argument("--start-slide-server", action="store_true", help="Start local web slide/operator server.")
     parser.add_argument("--slide-host", default="0.0.0.0", help="Web slide server host.")
     parser.add_argument("--slide-port", type=int, default=8765, help="Web slide server port.")
-    parser.add_argument("--open-operator-qr", action="store_true", help="Open generated operator QR PNG.")
+    parser.add_argument(
+        "--open-operator-qr",
+        dest="open_operator_qr",
+        action="store_true",
+        default=True,
+        help="Open generated operator QR PNG. Enabled by default.",
+    )
+    parser.add_argument(
+        "--no-open-operator-qr",
+        dest="open_operator_qr",
+        action="store_false",
+        help="Do not open the generated operator QR PNG.",
+    )
     parser.add_argument("--open-operator-browser", action="store_true", help="Open operator UI on this computer.")
     parser.add_argument(
         "--holyrics-url",
