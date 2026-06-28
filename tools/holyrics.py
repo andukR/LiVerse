@@ -15,10 +15,79 @@ from urllib.parse import urlencode
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
 DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
-DEFAULT_HOST = "127.0.0.1"
+DEFAULT_HOST = "http://localhost"
 DEFAULT_PORT = 8091
 DEFAULT_TIMEOUT = 5.0
 DEFAULT_HOLYRICS_ACTION = "ShowQuickPresentation"
+HOLYRICS_BOOKS = (
+    "Бытие",
+    "Исход",
+    "Левит",
+    "Числа",
+    "Второзаконие",
+    "Иисус Навин",
+    "Судьи",
+    "Руфь",
+    "1 Царств",
+    "2 Царств",
+    "3 Царств",
+    "4 Царств",
+    "1 Паралипоменон",
+    "2 Паралипоменон",
+    "Ездра",
+    "Неемия",
+    "Есфирь",
+    "Иов",
+    "Псалтирь",
+    "Притчи",
+    "Екклесиаст",
+    "Песня Песней",
+    "Исаия",
+    "Иеремия",
+    "Плач Иеремии",
+    "Иезекииль",
+    "Даниил",
+    "Осия",
+    "Иоиль",
+    "Амос",
+    "Авдий",
+    "Иона",
+    "Михей",
+    "Наум",
+    "Аввакум",
+    "Софония",
+    "Аггей",
+    "Захария",
+    "Малахия",
+    "Матфей",
+    "Марк",
+    "Лука",
+    "Иоанн",
+    "Деяния",
+    "Римлянам",
+    "1 Коринфянам",
+    "2 Коринфянам",
+    "Галатам",
+    "Ефесянам",
+    "Филиппийцам",
+    "Колоссянам",
+    "1 Фессалоникийцам",
+    "2 Фессалоникийцам",
+    "1 Тимофею",
+    "2 Тимофею",
+    "Титу",
+    "Филимону",
+    "Евреям",
+    "Иаков",
+    "1 Петра",
+    "2 Петра",
+    "1 Иоанна",
+    "2 Иоанна",
+    "3 Иоанна",
+    "Иуда",
+    "Откровение",
+)
+HOLYRICS_BOOK_INDEX = {book: index for index, book in enumerate(HOLYRICS_BOOKS, start=1)}
 
 
 def parse_env_value(value: str) -> str:
@@ -85,18 +154,21 @@ def default_holyrics_url() -> str:
         return normalize_holyrics_url(explicit_url)
 
     host = env_setting("HOLYRICS_HOST")
-    port = env_setting("HOLYRICS_API_PORT")
+    port = env_setting("HOLYRICS_PORT") or env_setting("HOLYRICS_API_PORT")
     if host or port:
-        return f"http://{host or DEFAULT_HOST}:{port or DEFAULT_PORT}"
+        base = normalize_holyrics_url(host or DEFAULT_HOST)
+        if port and ":" not in base.rsplit("/", 1)[-1]:
+            return f"{base}:{port}"
+        return base
 
-    return "auto"
+    return f"{DEFAULT_HOST}:{DEFAULT_PORT}"
 
 
 def describe_holyrics_target(args: Any) -> str:
     if str(getattr(args, "holyrics_url", "")).strip().lower() != "auto":
-        return f"{str(getattr(args, 'holyrics_url', '')).rstrip('/')}/api/{getattr(args, 'holyrics_action', DEFAULT_HOLYRICS_ACTION)}"
+        return f"{str(getattr(args, 'holyrics_url', '')).rstrip('/')}/api/ShowVerse"
     return "auto: " + ", ".join(
-        f"{url}/api/{getattr(args, 'holyrics_action', DEFAULT_HOLYRICS_ACTION)}"
+        f"{url}/api/ShowVerse"
         for url in holyrics_candidate_urls(getattr(args, "holyrics_url", "auto"))
     )
 
@@ -105,7 +177,27 @@ def holyrics_candidate_urls(holyrics_url: str) -> list[str]:
     value = normalize_holyrics_url(str(holyrics_url or ""))
     if value and value.lower() != "auto":
         return [value.rstrip("/")]
-    return [f"http://127.0.0.1:{DEFAULT_PORT}", f"http://127.0.0.1:4888"]
+    return [f"{DEFAULT_HOST}:{DEFAULT_PORT}", f"http://127.0.0.1:{DEFAULT_PORT}"]
+
+
+def holyrics_log(message: str) -> None:
+    print(f"Holyrics: {message}", flush=True)
+
+
+def holyrics_verse_id(payload: dict) -> tuple[str | None, str]:
+    book = str(payload.get("book") or "").strip()
+    try:
+        chapter = int(payload.get("chapter") or 0)
+        verse = int(payload.get("start_verse") or 0)
+    except (TypeError, ValueError):
+        return None, "invalid_chapter_or_verse"
+
+    book_number = HOLYRICS_BOOK_INDEX.get(book)
+    if book_number is None:
+        return None, f"unknown_book:{book or 'empty'}"
+    if chapter <= 0 or verse <= 0:
+        return None, "invalid_chapter_or_verse"
+    return f"{book_number:02d}{chapter:03d}{verse:03d}", ""
 
 
 def slide_payload_to_holyrics_text(payload: dict) -> str:
@@ -152,13 +244,12 @@ def parse_holyrics_response(body: str) -> tuple[bool, str]:
     return False, f"holyrics_error:{error}"
 
 
-def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, str]:
+def post_holyrics_api(args: Any, base_url: str, endpoint: str, body: dict) -> tuple[bool, str, str]:
     base_url = str(base_url).rstrip("/")
     query = urlencode({"token": getattr(args, "holyrics_token", "")})
-    url = f"{base_url}/api/{getattr(args, 'holyrics_action', DEFAULT_HOLYRICS_ACTION)}?{query}"
-    holyrics_payload = slide_payload_to_holyrics_body(args, payload)
+    url = f"{base_url}/api/{endpoint}?{query}"
 
-    data = json.dumps(holyrics_payload, ensure_ascii=False).encode("utf-8")
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
     req = request.Request(
         url,
         data=data,
@@ -169,12 +260,45 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
         with request.urlopen(req, timeout=float(getattr(args, "holyrics_timeout", DEFAULT_TIMEOUT))) as response:
             body = response.read().decode("utf-8", errors="replace").strip()
             if not (200 <= response.status < 300):
-                return False, f"holyrics_http_{response.status}"
-            return parse_holyrics_response(body)
+                return False, f"holyrics_http_{response.status}", body
+            ok, reason = parse_holyrics_response(body)
+            return ok, reason, body
     except HTTPError as exc:
-        return False, f"holyrics_http_{exc.code}"
+        body = exc.read().decode("utf-8", errors="replace").strip()
+        return False, f"holyrics_http_{exc.code}", body
     except URLError as exc:
-        return False, f"holyrics_unavailable:{exc.reason}"
+        return False, f"holyrics_unavailable:{exc.reason}", ""
+
+
+def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, str]:
+    verse_id, reason = holyrics_verse_id(payload)
+    ref = str(payload.get("ref") or "").strip()
+    if not verse_id:
+        return False, reason
+
+    holyrics_log(f"recognized_ref={ref or '(empty)'}")
+    holyrics_log(f"verse_id={verse_id}")
+
+    settings_ok, settings_reason, settings_body = post_holyrics_api(
+        args,
+        base_url,
+        "SetBibleSettings",
+        {"show_x_verses": 1},
+    )
+    holyrics_log(f"SetBibleSettings response={settings_body or settings_reason or 'ok'}")
+    if not settings_ok:
+        return False, settings_reason
+
+    show_ok, show_reason, show_body = post_holyrics_api(
+        args,
+        base_url,
+        "ShowVerse",
+        {"id": verse_id},
+    )
+    holyrics_log(f"ShowVerse response={show_body or show_reason or 'ok'}")
+    if not show_ok:
+        return False, show_reason
+    return True, f"verse_id:{verse_id}"
 
 
 def post_holyrics_update(args: Any, payload: dict) -> tuple[bool, str]:
@@ -188,7 +312,7 @@ def post_holyrics_update(args: Any, payload: dict) -> tuple[bool, str]:
         if ok:
             if auto_target:
                 setattr(args, "holyrics_url", url)
-            return True, ""
+            return True, reason
         if not auto_target and (reason.startswith("holyrics_token_") or reason.startswith("holyrics_error:")):
             return False, reason
         reasons.append(f"{url}={reason}")
@@ -199,6 +323,11 @@ def live_parsed_ref_to_slide_payload_with_source_text(parsed, source: str, sourc
     return {
         "ref": parsed.ref,
         "verse": parsed.verse_text,
+        "book": parsed.book,
+        "chapter": parsed.chapter,
+        "start_verse": parsed.start_verse,
+        "end_verse": parsed.end_verse,
+        "end_chapter": parsed.end_chapter,
         "source": source,
         "asr": source_text,
         "detected_text": source_text,

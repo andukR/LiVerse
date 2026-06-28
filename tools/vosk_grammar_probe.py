@@ -29,7 +29,6 @@ from bible_parser_core.reference_resolver import (
     resolve_reference_candidates,
 )
 from tools.holyrics import (
-    DEFAULT_HOLYRICS_ACTION,
     default_holyrics_url,
     describe_holyrics_target,
     env_setting,
@@ -802,22 +801,12 @@ def main() -> int:
     parser.add_argument(
         "--holyrics-url",
         default=default_holyrics_url(),
-        help="Holyrics local API base URL. Default: HOLYRICS_URL, HOLYRICS_HOST/HOLYRICS_API_PORT, or auto.",
+        help="Holyrics local API base URL. Default: HOLYRICS_URL, HOLYRICS_HOST/HOLYRICS_PORT, or http://localhost:8091.",
     )
     parser.add_argument(
         "--holyrics-token",
         default=env_setting("HOLYRICS_TOKEN"),
         help="Holyrics API token. Can also be set via HOLYRICS_TOKEN or .env.",
-    )
-    parser.add_argument(
-        "--holyrics-action",
-        default=env_setting("HOLYRICS_ACTION", DEFAULT_HOLYRICS_ACTION),
-        help="Holyrics API action. Default: ShowQuickPresentation.",
-    )
-    parser.add_argument(
-        "--holyrics-theme",
-        default=env_setting("HOLYRICS_THEME"),
-        help="Optional Holyrics theme name for quick presentations.",
     )
     parser.add_argument("--holyrics-timeout", type=float, default=float(env_setting("HOLYRICS_TIMEOUT", "1.5")))
     args = parser.parse_args()

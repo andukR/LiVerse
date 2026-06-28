@@ -78,12 +78,31 @@ python3 tools/vosk_grammar_probe.py --log-audio
 
 Аудио пишется в `audio.wav` рядом с `events.jsonl`.
 
-Если нужен вывод в Holyrics, задайте переменные окружения:
+Если нужен вывод в Holyrics, задайте переменные окружения в `.env`:
 
-- `HOLYRICS_URL`
-- `HOLYRICS_TOKEN`
-- `HOLYRICS_ACTION`
-- `HOLYRICS_THEME`
+```env
+HOLYRICS_TOKEN=...
+HOLYRICS_HOST=http://localhost
+HOLYRICS_PORT=8091
+```
+
+`HOLYRICS_TOKEN` - это token из `Holyrics -> Settings -> API Server -> Manage permissions`.
+Это не Web `API_KEY`. Для Local API token передаётся в URL.
+
+В Holyrics API Server Local должны быть разрешены:
+
+- `ShowVerse`
+- `SetBibleSettings`
+- `GetBibleSettings` - желательно для диагностики
+
+LiVerse больше не отправляет собственный текст Библии в Holyrics через
+`ShowQuickPresentation` для распознанных библейских ссылок. Вместо этого он:
+
+1. вычисляет Holyrics verse id в формате `BBCCCVVV`;
+2. вызывает `SetBibleSettings` с `{"show_x_verses": 1}`;
+3. вызывает `ShowVerse` с `{"id": "<verse_id>"}`.
+
+Например, `Иоанн 3:16` превращается в `43003016`.
 
 ## Установка на Windows 10
 

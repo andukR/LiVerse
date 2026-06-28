@@ -163,6 +163,11 @@ def submit_candidate(payload: dict) -> dict:
     candidate = {
         "ref": str(payload.get("ref") or "").strip(),
         "verse": str(payload.get("verse") or "").strip(),
+        "book": str(payload.get("book") or "").strip(),
+        "chapter": payload.get("chapter"),
+        "start_verse": payload.get("start_verse"),
+        "end_verse": payload.get("end_verse"),
+        "end_chapter": payload.get("end_chapter"),
         "source": str(payload.get("source") or "").strip(),
         "asr": str(payload.get("asr") or "").strip(),
         "detected_text": str(payload.get("detected_text") or "").strip(),
@@ -235,6 +240,11 @@ def manual_reference_candidate(reference: str) -> tuple[dict | None, str]:
     return {
         "ref": parsed.ref,
         "verse": parsed.verse_text,
+        "book": parsed.book,
+        "chapter": parsed.chapter,
+        "start_verse": parsed.start_verse,
+        "end_verse": parsed.end_verse,
+        "end_chapter": parsed.end_chapter,
         "source": "operator:manual",
         "asr": str(current.get("asr") or ""),
         "detected_text": reference.strip(),
