@@ -6,4 +6,8 @@ if not exist .venv (
   exit /b 1
 )
 call .venv\Scripts\activate.bat
-python tools\vosk_grammar_probe.py %*
+if "%~1"=="" (
+  python tools\vosk_grammar_probe.py --require-approval --slide-output holyrics --open-operator-qr
+) else (
+  python tools\vosk_grammar_probe.py %*
+)

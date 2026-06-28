@@ -7,6 +7,7 @@ import argparse
 import io
 import json
 import mimetypes
+import os
 import queue
 import shutil
 import socket
@@ -335,27 +336,47 @@ def save_operator_qr_png(url: str, path: Path = DEFAULT_QR_PATH) -> Path:
 
 def open_operator_windows(url: str, qr_path: Path, *, open_qr: bool, open_browser: bool) -> None:
     if open_qr:
-        viewer = shutil.which("eog") or shutil.which("xdg-open")
-        if viewer:
+        if sys.platform.startswith("win"):
+            os.startfile(str(qr_path))  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
             subprocess.Popen(
-                [viewer, str(qr_path)],
+                ["open", str(qr_path)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
         else:
-            print(f"Откройте QR-код вручную: {qr_path}", flush=True)
+            viewer = shutil.which("eog") or shutil.which("xdg-open")
+            if viewer:
+                subprocess.Popen(
+                    [viewer, str(qr_path)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            else:
+                print(f"Откройте QR-код вручную: {qr_path}", flush=True)
     if open_browser:
-        opener = shutil.which("xdg-open")
-        if opener:
+        if sys.platform.startswith("win"):
+            os.startfile(url)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
             subprocess.Popen(
-                [opener, url],
+                ["open", url],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
         else:
-            print(f"Откройте пульт на ноутбуке: {url}", flush=True)
+            opener = shutil.which("xdg-open")
+            if opener:
+                subprocess.Popen(
+                    [opener, url],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            else:
+                print(f"Откройте пульт на ноутбуке: {url}", flush=True)
 
 
 def print_operator_qr(url: str) -> None:
@@ -564,6 +585,7 @@ def start_server_thread(
     decision_callback=None,
     open_qr: bool = False,
     open_browser: bool = False,
+    print_qr: bool = False,
 ) -> ThreadingHTTPServer:
     reset_operator_state(decision_callback)
     server = ThreadingHTTPServer((host, port), SlideHandler)
@@ -576,9 +598,10 @@ def start_server_thread(
         qr_path = save_operator_qr_png(url)
         print(f"Пульт подтверждения: {url}", flush=True)
         print(f"Пульт на ноутбуке: {desktop_url}", flush=True)
-        print(f"QR PNG: {qr_path}", flush=True)
-        print(f"QR-код: {url.rsplit('/operator', 1)[0]}/operator-qr.svg", flush=True)
-        print_operator_qr(url)
+        if print_qr:
+            print(f"QR PNG: {qr_path}", flush=True)
+            print(f"QR-код: {url.rsplit('/operator', 1)[0]}/operator-qr.svg", flush=True)
+            print_operator_qr(url)
         open_operator_windows(
             desktop_url,
             qr_path,

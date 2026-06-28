@@ -1,6 +1,7 @@
 PYTHON ?= python3
 VENV ?= .venv
 ARGS ?=
+LIVERSE_ARGS ?= --require-approval --slide-output holyrics --open-operator-qr
 ifeq ($(OS),Windows_NT)
 BIN_DIR := $(VENV)\Scripts
 PY := $(BIN_DIR)\python.exe
@@ -21,9 +22,9 @@ install:
 
 liverse:
 	@if [ -x "$(PY)" ]; then \
-		"$(PY)" tools/vosk_grammar_probe.py $(ARGS); \
+		"$(PY)" tools/vosk_grammar_probe.py $(LIVERSE_ARGS) $(ARGS); \
 	else \
-		$(PYTHON) tools/vosk_grammar_probe.py $(ARGS); \
+		$(PYTHON) tools/vosk_grammar_probe.py $(LIVERSE_ARGS) $(ARGS); \
 	fi
 
 analyze:

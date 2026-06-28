@@ -8,11 +8,13 @@ import json
 import queue
 import re
 import sys
+import webbrowser
 import wave
 from collections import deque
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +41,11 @@ from tools.holyrics import (
 
 DEFAULT_MODEL_PATH = Path.cwd() / "models" / "vosk-model-small-ru-0.22"
 DEFAULT_LOG_DIR = Path.cwd() / ".cache" / "liverse" / "vosk_probe"
+WELCOME_TEXT = (
+    "LiVerse принимает на себя техническую задачу поиска и отображения "
+    "библейских ссылок, чтобы вся церковь могла сосредоточиться на слушании, "
+    "чтении и размышлении над Словом Божиим."
+)
 REFERENCE_WORDS = {
     "апостол",
     "богослова",
@@ -188,6 +195,156 @@ class JsonlLogger:
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+
+
+class ConsoleStatus:
+    def __init__(self, *, debug: bool = False) -> None:
+        self.debug = debug
+        self.last = ""
+
+    def status(self, message: str) -> None:
+        if self.debug or message == self.last:
+            return
+        self.last = message
+        print(f"Статус: {message}", flush=True)
+
+    def debug_json(self, payload: dict) -> None:
+        if self.debug:
+            print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
+
+
+def session_reference_record(payload: dict, action: str = "recognized") -> dict | None:
+    slide = payload.get("slide") or {}
+    ref = str(slide.get("ref") or "").strip()
+    if not ref:
+        return None
+    return {
+        "ref": ref,
+        "action": action,
+        "asr": str(payload.get("vosk_text") or payload.get("text") or "").strip(),
+        "detected_text": str(slide.get("detected_text") or "").strip(),
+    }
+
+
+def append_session_reference(records: list[dict], payload: dict, action: str = "recognized") -> None:
+    record = session_reference_record(payload, action=action)
+    if not record:
+        return
+    if records and records[-1].get("ref") == record["ref"] and records[-1].get("action") == record["action"]:
+        return
+    records.append(record)
+
+
+def session_references_text(records: list[dict]) -> str:
+    refs: list[str] = []
+    for record in records:
+        ref = str(record.get("ref") or "").strip()
+        if ref and ref not in refs:
+            refs.append(ref)
+    if not refs:
+        return ""
+    lines = ["Цитаты из проповеди:"]
+    lines.extend(f"{index}. {ref}" for index, ref in enumerate(refs, start=1))
+    return "\n".join(lines)
+
+
+def show_session_summary_popup(records: list[dict]) -> None:
+    try:
+        import tkinter as tk
+        from tkinter import font as tkfont
+    except Exception as exc:
+        print(f"Итоговое окно недоступно: {exc}", flush=True)
+        text = session_references_text(records)
+        if text:
+            print(text, flush=True)
+        return
+
+    text = session_references_text(records)
+    whatsapp_url = f"https://wa.me/?text={quote(text)}" if text else ""
+
+    root = tk.Tk()
+    root.title("LiVerse — итоги сеанса")
+    root.attributes("-topmost", True)
+    root.configure(bg="#101820")
+    root.resizable(True, True)
+
+    width, height = 760, 560
+    screen_width = root.winfo_screenwidth()
+    screen_height = root.winfo_screenheight()
+    x = max(0, (screen_width - width) // 2)
+    y = max(0, (screen_height - height) // 2)
+    root.geometry(f"{width}x{height}+{x}+{y}")
+
+    title_font = tkfont.Font(family="Segoe UI", size=28, weight="bold")
+    body_font = tkfont.Font(family="Segoe UI", size=18)
+    button_font = tkfont.Font(family="Segoe UI", size=18, weight="bold")
+
+    tk.Label(
+        root,
+        text="Распознанные ссылки",
+        bg="#101820",
+        fg="#ffd166",
+        font=title_font,
+    ).pack(fill="x", padx=28, pady=(24, 10))
+
+    body = tk.Text(
+        root,
+        bg="#0f1720",
+        fg="#f5f7fa",
+        insertbackground="#f5f7fa",
+        font=body_font,
+        relief="flat",
+        wrap="word",
+        padx=16,
+        pady=16,
+        height=12,
+    )
+    body.pack(fill="both", expand=True, padx=28, pady=(0, 18))
+    body.insert("1.0", text or "За этот сеанс ссылки не были распознаны.")
+    body.configure(state="disabled")
+
+    buttons = tk.Frame(root, bg="#101820")
+    buttons.pack(fill="x", padx=28, pady=(0, 24))
+
+    def share_whatsapp() -> None:
+        if whatsapp_url:
+            webbrowser.open(whatsapp_url)
+
+    share = tk.Button(
+        buttons,
+        text="Поделиться в WhatsApp",
+        command=share_whatsapp,
+        bg="#148447",
+        fg="white",
+        activebackground="#1aa158",
+        activeforeground="white",
+        disabledforeground="#9aa4ad",
+        font=button_font,
+        relief="flat",
+        padx=20,
+        pady=14,
+        state="normal" if whatsapp_url else "disabled",
+    )
+    close = tk.Button(
+        buttons,
+        text="Закрыть",
+        command=root.destroy,
+        bg="#334155",
+        fg="white",
+        activebackground="#475569",
+        activeforeground="white",
+        font=button_font,
+        relief="flat",
+        padx=20,
+        pady=14,
+    )
+    share.pack(side="left", fill="x", expand=True, padx=(0, 10))
+    close.pack(side="left", fill="x", expand=True, padx=(10, 0))
+
+    root.bind("<Escape>", lambda _event: root.destroy())
+    root.after(100, root.focus_force)
+    root.after(150, root.lift)
+    root.mainloop()
 
 
 def usable_grammar_phrase(phrase: str) -> bool:
@@ -596,6 +753,7 @@ def start_slide_server_if_needed(args: argparse.Namespace):
         decision_callback=decision_callback if web_approval else None,
         open_qr=args.open_operator_qr and web_approval,
         open_browser=args.open_operator_browser,
+        print_qr=args.print_operator_qr,
     )
 
 
@@ -620,11 +778,25 @@ def publish_payload(args: argparse.Namespace, payload: dict) -> dict:
     }
 
 
+def approval_action(output: dict) -> str:
+    approval = output.get("approval") or {}
+    action = str(approval.get("action") or "")
+    if action in {"approve", "reject"}:
+        return action
+    if approval.get("reason") == "waiting_for_approval" or output.get("holyrics", {}).get("reason") == "waiting_for_approval":
+        return "waiting"
+    if output.get("holyrics", {}).get("ok") or output.get("web", {}).get("ok"):
+        return "sent"
+    return "recognized"
+
+
 def run_microphone(args: argparse.Namespace) -> int:
     import sounddevice as sd
     from vosk import KaldiRecognizer, Model, SetLogLevel
 
     audio_queue: queue.Queue[bytes] = queue.Queue()
+    console = ConsoleStatus(debug=args.debug_console)
+    session_refs: list[dict] = []
     grammar = None if args.open_vocabulary else build_grammar()
     logger = JsonlLogger(Path(args.log_dir), enabled=not args.no_log)
     logger.write_session(
@@ -650,7 +822,8 @@ def run_microphone(args: argparse.Namespace) -> int:
             "grammar": None if grammar is None else grammar_diagnostics(grammar),
         }
     )
-    if logger.run_dir:
+    print(WELCOME_TEXT, flush=True)
+    if logger.run_dir and args.print_log_path:
         print(f"Vosk log: {logger.run_dir / 'events.jsonl'}")
     start_slide_server_if_needed(args)
 
@@ -687,7 +860,7 @@ def run_microphone(args: argparse.Namespace) -> int:
     if args.device is not None:
         stream_kwargs["device"] = args.device
 
-    print("Слушаю Vosk. Ctrl+C для выхода.")
+    console.status("слушаю")
     with sd.RawInputStream(**stream_kwargs):
         try:
             while True:
@@ -699,6 +872,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                     text = result.get("text", "").strip()
                     logger.write("final_raw", {"result": result, "text": text})
                     if text:
+                        console.status("распознаю")
                         text_buffer.add(text)
                         candidate_texts = same_place_candidates(text_buffer.candidates(), last_parsed)
                         candidate_texts = expand_nehemiah_confusable_candidates(
@@ -715,6 +889,20 @@ def run_microphone(args: argparse.Namespace) -> int:
                         payload["vosk_text"] = text
                         payload["vosk_buffer"] = list(text_buffer.parts)
                         payload["output"] = publish_payload(args, payload)
+                        if payload.get("slide"):
+                            action = approval_action(payload["output"])
+                            append_session_reference(session_refs, payload, action=action)
+                            ref = str((payload.get("parsed") or {}).get("ref") or payload["slide"].get("ref"))
+                            if action == "waiting":
+                                console.status(f"найдена ссылка {ref}, ожидает подтверждения")
+                            elif action == "approve":
+                                console.status(f"отправлено в Holyrics: {ref}")
+                            elif action == "reject":
+                                console.status(f"отклонено: {ref}")
+                            else:
+                                console.status(f"найдена ссылка: {ref}")
+                        else:
+                            console.status("слушаю")
                         if payload.get("parsed"):
                             last_parsed = payload["parsed"]
                         logger.write(
@@ -727,16 +915,19 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 "output": payload["output"],
                             },
                         )
-                        print(json.dumps(payload, ensure_ascii=False, indent=2))
+                        console.debug_json(payload)
                 else:
                     partial_result = json.loads(recognizer.PartialResult())
                     partial = partial_result.get("partial", "")
                     if partial:
                         if args.log_partials:
                             logger.write("partial", {"result": partial_result, "partial": partial})
-                        print("...", partial)
+                        if args.debug_console:
+                            print("...", partial, flush=True)
         except KeyboardInterrupt:
-            print("\nОстановлено.")
+            print("\nОстановлено.", flush=True)
+            if args.session_summary_popup:
+                show_session_summary_popup(session_refs)
             return 0
         finally:
             if audio_log:
@@ -759,6 +950,8 @@ def main() -> int:
     )
     parser.add_argument("--vosk-log-level", type=int, default=-1, help="Vosk log level. Use 0 to show Vosk warnings.")
     parser.add_argument("--show-candidates", action="store_true", help="Print resolver candidate list.")
+    parser.add_argument("--debug-console", action="store_true", help="Print full JSON payloads and Vosk partials.")
+    parser.add_argument("--print-log-path", action="store_true", help="Print JSONL log path on startup.")
     parser.add_argument("--text", nargs="+", help="Resolve text without opening the microphone.")
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR)
     parser.add_argument("--no-log", action="store_true", help="Disable JSONL logging.")
@@ -797,7 +990,14 @@ def main() -> int:
         action="store_false",
         help="Do not open the generated operator QR PNG.",
     )
+    parser.add_argument("--print-operator-qr", action="store_true", help="Print QR as ASCII in the console.")
     parser.add_argument("--open-operator-browser", action="store_true", help="Open operator UI on this computer.")
+    parser.add_argument(
+        "--no-session-summary-popup",
+        dest="session_summary_popup",
+        action="store_false",
+        help="Do not show recognized references popup when LiVerse stops.",
+    )
     parser.add_argument(
         "--holyrics-url",
         default=default_holyrics_url(),
@@ -809,6 +1009,7 @@ def main() -> int:
         help="Holyrics API token. Can also be set via HOLYRICS_TOKEN or .env.",
     )
     parser.add_argument("--holyrics-timeout", type=float, default=float(env_setting("HOLYRICS_TIMEOUT", "1.5")))
+    parser.set_defaults(session_summary_popup=True)
     args = parser.parse_args()
 
     if args.text:
@@ -847,9 +1048,12 @@ def main() -> int:
                 "output": payload["output"],
             },
         )
-        if logger.run_dir:
+        if logger.run_dir and args.print_log_path:
             print(f"Vosk log: {logger.run_dir / 'events.jsonl'}")
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        ConsoleStatus(debug=args.debug_console).debug_json(payload)
+        if not args.debug_console:
+            ref = (payload.get("parsed") or {}).get("ref")
+            print(f"Результат: {ref or 'ссылка не найдена'}", flush=True)
         return 0 if payload["parsed"] else 1
 
     return run_microphone(args)
