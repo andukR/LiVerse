@@ -227,6 +227,8 @@ def nehemiah_confusable_text(
 ) -> str | None:
     if not re.search(r"\bиереми[яи]\b", text, flags=re.IGNORECASE):
         return None
+    if re.search(r"\bпророк[а-я]*\s+иереми[яи]\b", text, flags=re.IGNORECASE):
+        return None
 
     replacement = re.sub(r"\bиеремии\b", "неемии", text, flags=re.IGNORECASE)
     replacement = re.sub(r"\bиеремия\b", "неемия", replacement, flags=re.IGNORECASE)
@@ -256,6 +258,43 @@ def expand_nehemiah_confusable_candidates(
             expanded.append(replacement)
         if candidate not in expanded:
             expanded.append(candidate)
+    return expanded
+
+
+def joel_confusable_texts(text: str) -> list[str]:
+    replacements: list[str] = []
+    patterns = (
+        (r"\b((?:книга|книги)\s+пророка\s+)иов\b", r"\1иоиля", True),
+        (r"\b(пророка\s+)иов\b", r"\1иоиля", True),
+        (r"\b((?:книга|книги)\s+пророка\s+)иеремии\b", r"\1иоиля", False),
+        (r"\b(пророка\s+)иеремии\b", r"\1иоиля", False),
+    )
+    for pattern, replacement, prefer_replacement in patterns:
+        candidate = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+        if candidate == text or candidate in replacements:
+            continue
+        if prefer_replacement:
+            replacements.insert(0, candidate)
+        else:
+            replacements.append(candidate)
+    return replacements
+
+
+def expand_joel_confusable_candidates(candidates: list[str]) -> list[str]:
+    expanded: list[str] = []
+    for candidate in candidates:
+        replacements = joel_confusable_texts(candidate)
+        prefer_first = bool(re.search(r"\bпророк[а-я]*\s+иов\b", candidate, flags=re.IGNORECASE))
+        if prefer_first:
+            for replacement in replacements:
+                if replacement not in expanded:
+                    expanded.append(replacement)
+        if candidate not in expanded:
+            expanded.append(candidate)
+        if not prefer_first:
+            for replacement in replacements:
+                if replacement not in expanded:
+                    expanded.append(replacement)
     return expanded
 
 
@@ -374,6 +413,7 @@ class LiveReferencePipeline:
 
         self.text_buffer.add(text)
         candidate_texts = same_place_candidates(self.text_buffer.candidates(), self.last_parsed)
+        candidate_texts = expand_joel_confusable_candidates(candidate_texts)
         candidate_texts = expand_nehemiah_confusable_candidates(
             candidate_texts,
             bible_path=self.bible_path,

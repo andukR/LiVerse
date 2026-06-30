@@ -27,6 +27,7 @@ from bible_parser_core.live_pipeline import (
     VoskTextBuffer,
     build_grammar,
     expand_nehemiah_confusable_candidates,
+    expand_joel_confusable_candidates,
     grammar_diagnostics,
     parsed_payload_from_candidates as core_parsed_payload_from_candidates,
     same_place_candidates,
@@ -811,6 +812,7 @@ def main() -> int:
             [" ".join(args.text)],
             bible_path=args.bible,
         )
+        candidate_texts = expand_joel_confusable_candidates(candidate_texts)
         payload = parsed_payload_from_candidates(
             candidate_texts,
             bible_path=args.bible,
