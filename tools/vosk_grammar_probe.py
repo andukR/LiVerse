@@ -11,8 +11,6 @@ import re
 import sys
 import webbrowser
 import wave
-from collections import deque
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -25,17 +23,19 @@ CORE_SRC = PROJECT_ROOT / "packages" / "bible_parser_core" / "src"
 if str(CORE_SRC) not in sys.path:
     sys.path.insert(0, str(CORE_SRC))
 
-from bible_parser_core.book_aliases import book_synonyms
-from bible_parser_core.parser import DEFAULT_BIBLE, NUMBER_WORDS, parse_live_reference
-from bible_parser_core.reference_resolver import (
-    resolve_best_reference_candidate,
-    resolve_reference_candidates,
+from bible_parser_core.live_pipeline import (
+    VoskTextBuffer,
+    build_grammar,
+    expand_nehemiah_confusable_candidates,
+    grammar_diagnostics,
+    parsed_payload_from_candidates as core_parsed_payload_from_candidates,
+    same_place_candidates,
 )
+from bible_parser_core.parser import DEFAULT_BIBLE
 from tools.holyrics import (
     default_holyrics_url,
     describe_holyrics_target,
     env_setting,
-    live_parsed_ref_to_slide_payload_with_source_text,
     post_holyrics_update,
 )
 
@@ -49,124 +49,6 @@ WELCOME_TEXT = (
 )
 ENTER_KEYS = {"\r", "\n"}
 SPACE_KEYS = {" "}
-REFERENCE_WORDS = {
-    "апостол",
-    "богослова",
-    "глава",
-    "главы",
-    "главе",
-    "до",
-    "евангелие",
-    "из",
-    "книга",
-    "книги",
-    "от",
-    "откровение",
-    "откройте",
-    "откроем",
-    "послание",
-    "послания",
-    "пророк",
-    "пророка",
-    "псалом",
-    "с",
-    "стих",
-    "стиха",
-    "стихи",
-    "стихов",
-    "там",
-    "же",
-    "конец",
-    "конца",
-    "читаем",
-}
-VOSK_SMALL_RU_MISSING_WORDS = {
-    "авакум",
-    "авдия",
-    "авдя",
-    "аггея",
-    "агей",
-    "адия",
-    "бытиев",
-    "бытья",
-    "восемнадцатые",
-    "восьмидесятая",
-    "восьмые",
-    "девятнадцатые",
-    "девяностая",
-    "диания",
-    "дияни",
-    "ёны",
-    "эмии",
-    "езекиля",
-    "еклесиаста",
-    "есфири",
-    "иана",
-    "ианна",
-    "иезекиля",
-    "иоиль",
-    "иоиля",
-    "иоля",
-    "иранно",
-    "иссаии",
-    "иссайи",
-    "иуд",
-    "калася",
-    "каласянам",
-    "колоссянам",
-    "колосянам",
-    "кохелет",
-    "малахии",
-    "моса",
-    "немии",
-    "немия",
-    "неемии",
-    "неемия",
-    "ниемии",
-    "одиннадцатые",
-    "оиля",
-    "парапоменон",
-    "римлиным",
-    "семнадцатые",
-    "софонии",
-    "софония",
-    "сотого",
-    "тринадцатые",
-    "фесалоникийцам",
-    "фессалоникийцам",
-    "филимону",
-    "филипийцам",
-    "филиппийцам",
-    "цартвтретья",
-    "четвертая",
-    "четвертого",
-    "четвертое",
-    "четвертой",
-    "четвертую",
-    "четвертые",
-    "четвертый",
-    "четырнадцатые",
-    "шестнадцатые",
-}
-
-
-class VoskTextBuffer:
-    def __init__(self, max_parts: int = 3) -> None:
-        self.parts: deque[str] = deque(maxlen=max(1, max_parts))
-
-    def add(self, text: str) -> None:
-        text = re.sub(r"\s+", " ", text).strip()
-        if text:
-            self.parts.append(text)
-
-    def candidates(self) -> list[str]:
-        values = list(self.parts)
-        candidates: list[str] = []
-        for size in range(1, len(values) + 1):
-            candidate = " ".join(values[-size:]).strip()
-            if candidate and candidate not in candidates:
-                candidates.append(candidate)
-        return candidates
 
 
 class JsonlLogger:
@@ -405,185 +287,26 @@ def configure_interactive_approval_mode(args: argparse.Namespace) -> None:
     args.approval_ui = "web" if use_web else "popup"
 
 
-def usable_grammar_phrase(phrase: str) -> bool:
-    if not phrase or re.search(r"\d", phrase):
-        return False
-    return not any(token in VOSK_SMALL_RU_MISSING_WORDS for token in phrase.split())
-
-
-def build_grammar() -> list[str]:
-    phrases: set[str] = set()
-
-    def add_phrase(phrase: str) -> None:
-        phrase = phrase.lower()
-        if usable_grammar_phrase(phrase):
-            phrases.add(phrase)
-
-    for canonical, aliases in book_synonyms.items():
-        add_phrase(canonical)
-        for alias in aliases:
-            add_phrase(alias)
-    for word in REFERENCE_WORDS:
-        add_phrase(word)
-    for word in NUMBER_WORDS:
-        add_phrase(word)
-    phrases.add("[unk]")
-    return sorted(phrases)
-
-
-def grammar_diagnostics(grammar: list[str]) -> dict:
-    return {
-        "size": len(grammar),
-        "contains": {
-            "ефесянам": "ефесянам" in grammar,
-            "бытие": "бытие" in grammar,
-            "псалом": "псалом" in grammar,
-            "двадцать": "двадцать" in grammar,
-            "четыре": "четыре" in grammar,
-            "седьмой": "седьмой" in grammar,
-        },
-        "filtered_missing_words_count": len(VOSK_SMALL_RU_MISSING_WORDS),
+def add_slide_payload(payload: dict) -> dict:
+    parsed = payload.get("parsed") or {}
+    if not parsed:
+        payload["slide"] = None
+        return payload
+    source = payload.get("source") or "parser"
+    source_text = str(payload.get("text") or "")
+    payload["slide"] = {
+        "ref": parsed.get("ref"),
+        "verse": parsed.get("verse_text"),
+        "book": parsed.get("book"),
+        "chapter": parsed.get("chapter"),
+        "start_verse": parsed.get("start_verse"),
+        "end_verse": parsed.get("end_verse"),
+        "end_chapter": parsed.get("end_chapter"),
+        "source": f"vosk:{source}",
+        "asr": source_text,
+        "detected_text": source_text,
     }
-
-
-def parsed_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, show_candidates: bool = False) -> dict:
-    parsed = parse_live_reference(text, bible_path=bible_path)
-    source = "parser"
-    resolved = None
-    if parsed is None:
-        resolved = resolve_best_reference_candidate(text, bible_path=bible_path)
-        if resolved:
-            parsed = parse_live_reference(resolved.ref, bible_path=bible_path)
-            source = "resolver"
-
-    slide = None
-    if parsed:
-        slide = live_parsed_ref_to_slide_payload_with_source_text(parsed, f"vosk:{source}", text)
-
-    payload = {
-        "text": text,
-        "source": source if parsed else None,
-        "resolved": asdict(resolved) if resolved else None,
-        "parsed": asdict(parsed) if parsed else None,
-        "slide": slide,
-    }
-    if show_candidates:
-        payload["candidates"] = [
-            asdict(candidate)
-            for candidate in resolve_reference_candidates(text, bible_path=bible_path)
-        ]
     return payload
-
-
-def low_confidence_jeremiah(asr_result: dict | None, *, threshold: float = 0.76) -> bool:
-    if not asr_result:
-        return False
-    for item in asr_result.get("result") or []:
-        word = str(item.get("word") or "").lower()
-        if not re.fullmatch(r"иереми[яи]", word):
-            continue
-        try:
-            confidence = float(item.get("conf"))
-        except (TypeError, ValueError):
-            continue
-        if confidence <= threshold:
-            return True
-    return False
-
-
-def nehemiah_confusable_text(
-    text: str,
-    bible_path: Path = DEFAULT_BIBLE,
-    *,
-    asr_result: dict | None = None,
-) -> str | None:
-    if not re.search(r"\bиереми[яи]\b", text, flags=re.IGNORECASE):
-        return None
-
-    replacement = re.sub(r"\bиеремии\b", "неемии", text, flags=re.IGNORECASE)
-    replacement = re.sub(r"\bиеремия\b", "неемия", replacement, flags=re.IGNORECASE)
-    if replacement == text:
-        return None
-
-    nehemiah = parse_live_reference(replacement, bible_path=bible_path)
-    if not nehemiah or nehemiah.book != "Неемия":
-        return None
-
-    original = parse_live_reference(text, bible_path=bible_path)
-    if original is None or low_confidence_jeremiah(asr_result):
-        return replacement
-    return None
-
-
-def expand_nehemiah_confusable_candidates(
-    candidates: list[str],
-    bible_path: Path = DEFAULT_BIBLE,
-    *,
-    asr_result: dict | None = None,
-) -> list[str]:
-    expanded: list[str] = []
-    for candidate in candidates:
-        replacement = nehemiah_confusable_text(candidate, bible_path=bible_path, asr_result=asr_result)
-        if replacement and replacement not in expanded:
-            expanded.append(replacement)
-        if candidate not in expanded:
-            expanded.append(candidate)
-    return expanded
-
-
-def likely_explicit_reference(text: str) -> bool:
-    lowered = text.lower().replace("ё", "е")
-    if not re.search(r"\b(глава|стих|псалом)\b", lowered):
-        return False
-    for canonical, aliases in book_synonyms.items():
-        names = [canonical, *aliases]
-        for name in names:
-            normalized_name = name.lower().replace("ё", "е")
-            if normalized_name and re.search(rf"\b{re.escape(normalized_name)}\b", lowered):
-                return True
-    return False
-
-
-def likely_book_only_fragment(text: str) -> bool:
-    lowered = text.lower().replace("ё", "е").strip()
-    if not lowered or re.search(r"\b(глава|стих|псалом)\b", lowered):
-        return False
-    words = lowered.split()
-    if len(words) > 4:
-        return False
-    forms = {lowered}
-    if len(words) == 1 and lowered.endswith("а") and len(lowered) > 3:
-        forms.add(lowered[:-1])
-    for canonical, aliases in book_synonyms.items():
-        names = [canonical, *aliases]
-        for name in names:
-            normalized_name = name.lower().replace("ё", "е")
-            if normalized_name in forms:
-                return True
-    return False
-
-
-def same_place_only_fragment(text: str) -> bool:
-    return re.fullmatch(r"\s*там\s+же\s*", text.lower().replace("ё", "е")) is not None
-
-
-def same_place_candidates(candidates: list[str], last_parsed: dict | None) -> list[str]:
-    if not last_parsed:
-        return candidates
-    book = last_parsed.get("book")
-    chapter = last_parsed.get("chapter")
-    if not book or not chapter:
-        return candidates
-
-    expanded: list[str] = []
-    for candidate in candidates:
-        expanded.append(candidate)
-        if not re.search(r"\bтам\s+же\b", candidate.lower().replace("ё", "е")):
-            continue
-        suffix = re.sub(r"\bтам\s+же\b", "", candidate, flags=re.IGNORECASE).strip()
-        if suffix:
-            expanded.append(f"{book} {chapter} глава {suffix}")
-    return expanded
 
 
 def parsed_payload_from_candidates(
@@ -592,40 +315,12 @@ def parsed_payload_from_candidates(
     *,
     show_candidates: bool = False,
 ) -> dict:
-    attempts = [
-        parsed_payload(candidate, bible_path=bible_path, show_candidates=show_candidates)
-        for candidate in candidates
-    ]
-    attempt_summaries = [
-        {
-            "text": attempt.get("text"),
-            "ref": (attempt.get("parsed") or {}).get("ref"),
-            "source": attempt.get("source"),
-            "matched": bool(attempt.get("slide")),
-        }
-        for attempt in attempts
-    ]
-    for index, payload in enumerate(attempts):
-        if payload.get("slide"):
-            first_text = str(attempts[0].get("text") or "") if attempts else ""
-            if index > 0 and (
-                likely_explicit_reference(first_text)
-                or likely_book_only_fragment(first_text)
-                or same_place_only_fragment(first_text)
-            ):
-                first_payload = attempts[0]
-                first_payload["attempts"] = attempt_summaries[1:]
-                first_payload["blocked_stale_context"] = True
-                return first_payload
-            payload["attempts"] = [
-                summary
-                for summary_index, summary in enumerate(attempt_summaries)
-                if summary_index != index
-            ]
-            return payload
-    payload = attempts[0] if attempts else parsed_payload("", bible_path=bible_path, show_candidates=show_candidates)
-    payload["attempts"] = attempt_summaries[1:] if len(attempt_summaries) > 1 else []
-    return payload
+    payload = core_parsed_payload_from_candidates(
+        candidates,
+        bible_path=bible_path,
+        show_candidates=show_candidates,
+    )
+    return add_slide_payload(payload)
 
 
 def payload_summary(payload: dict) -> dict:
@@ -1021,6 +716,16 @@ def main() -> int:
     parser.add_argument("--log-partials", action="store_true", help="Log Vosk partial results too.")
     parser.add_argument("--log-audio", action="store_true", help="Save microphone audio to audio.wav in the run log.")
     parser.add_argument(
+        "--print-grammar-json",
+        action="store_true",
+        help="Print generated Vosk grammar JSON and exit.",
+    )
+    parser.add_argument(
+        "--grammar-output",
+        type=Path,
+        help="Write generated Vosk grammar JSON to this file when --print-grammar-json is used.",
+    )
+    parser.add_argument(
         "--slide-output",
         choices=["holyrics", "web", "both", "none"],
         default="holyrics",
@@ -1074,6 +779,14 @@ def main() -> int:
     parser.add_argument("--holyrics-timeout", type=float, default=float(env_setting("HOLYRICS_TIMEOUT", "1.5")))
     parser.set_defaults(session_summary_popup=True)
     args = parser.parse_args()
+    if args.print_grammar_json:
+        grammar_json = json.dumps(build_grammar(), ensure_ascii=False)
+        if args.grammar_output:
+            args.grammar_output.parent.mkdir(parents=True, exist_ok=True)
+            args.grammar_output.write_text(grammar_json + "\n", encoding="utf-8")
+        else:
+            print(grammar_json, flush=True)
+        return 0
     configure_interactive_approval_mode(args)
 
     if args.text:

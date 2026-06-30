@@ -12,7 +12,7 @@ PY := $(BIN_DIR)/python
 PIP := $(BIN_DIR)/pip
 endif
 
-.PHONY: install liverse analyze slides clean
+.PHONY: install liverse analyze slides sword-russinodal check-sword-russinodal clean
 
 install:
 	$(PYTHON) -m venv $(VENV)
@@ -39,6 +39,20 @@ slides:
 		"$(PY)" tools/slide_server.py $(ARGS); \
 	else \
 		$(PYTHON) tools/slide_server.py $(ARGS); \
+	fi
+
+sword-russinodal:
+	@if [ -x "$(PY)" ]; then \
+		"$(PY)" tools/build_sword_russynodal.py $(ARGS); \
+	else \
+		$(PYTHON) tools/build_sword_russynodal.py $(ARGS); \
+	fi
+
+check-sword-russinodal:
+	@if [ -x "$(PY)" ]; then \
+		"$(PY)" tools/build_sword_russynodal.py --check $(ARGS); \
+	else \
+		$(PYTHON) tools/build_sword_russynodal.py --check $(ARGS); \
 	fi
 
 clean:

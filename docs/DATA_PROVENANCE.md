@@ -76,3 +76,61 @@ git -C external_sources/bibleonline-rst checkout \
 В этом standalone Vosk-репозитории сборщик пока не перенесён. До его переноса
 `rst.json` и `rst_overrides.json` должны рассматриваться как данные,
 скопированные из полного LiVerse-проекта с описанным выше происхождением.
+
+## Альтернативная сборка из CrossWire SWORD
+
+Более проверяемый источник для Android/LiVerse:
+
+```text
+packages/bible_parser_core/src/bible_parser_core/data/sword_russinodal.json
+```
+
+Файл собирается из модуля CrossWire SWORD:
+
+```text
+Module=RusSynodal
+Version=1.9.1
+SwordVersionDate=2020-12-21
+DistributionLicense=Public Domain
+TextSource=http://www.rbo.ru/reading/articles/show/?4&start=0 or http://www.patriarchia.ru/bible/mf
+DownloadUrl=https://www.crosswire.org/ftpmirror/pub/sword/packages/rawzip/RusSynodal.zip
+ArchiveSha256=b802570e1783c326552b9e810786efe3df4efcd615f28ccf3a86bae27dbc5022
+```
+
+Сборка:
+
+```bash
+.venv/bin/python tools/build_sword_russynodal.py
+```
+
+Проверка без изменения файла:
+
+```bash
+.venv/bin/python tools/build_sword_russynodal.py --check
+```
+
+Скрипт проверяет зафиксированный SHA256 архива и ключевые поля SWORD-конфига:
+версию, дату, лицензию, источник текста, кодировку и versification. Если
+CrossWire обновит модуль, скрипт остановится с ошибкой, пока новая версия не
+будет вручную просмотрена и зафиксирована.
+
+В отличие от старого `rst.json`, SWORD-модуль использует
+`Versification=Synodal`. Поэтому ожидаемая структура:
+
+- 66 книг;
+- 1192 главы;
+- 31 350 стихов.
+
+Это не совпадает с прежними 1189 главами и 31 162 стихами, потому что
+SWORD-разметка Synodal включает дополнительные главы/стихи внутри некоторых
+книг. Скрипт не подгоняет данные под старую структуру, а сохраняет структуру
+проверенного источника.
+
+Известная особенность чтения модуля через `pysword`: `Пс. 114:9` возвращается
+пустым, потому что его текст присоединён к `Пс. 114:8`. Сборщик явно делит
+эти два стиха по уже имеющемуся в SWORD тексту:
+
+- `Пс. 114:8`: `Ты избавил душу мою от смерти, очи мои от слез и ноги мои от преткновения.`
+- `Пс. 114:9`: `Буду ходить пред лицем Господним на земле живых.`
+
+Это исправление меняет только границу стиха, а не текст.

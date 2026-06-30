@@ -6,7 +6,29 @@
 
 - `tools/vosk_grammar_probe.py` - основной скрипт.
 - `tools/analyze_vosk_probe_logs.py` - разбор логов распознавания.
-- `packages/bible_parser_core` - парсер библейских ссылок и данные `rst.json`.
+- `packages/bible_parser_core` - парсер библейских ссылок, общий live-pipeline
+  и данные Библии.
+
+## Общий live-pipeline
+
+`packages/bible_parser_core/src/bible_parser_core/live_pipeline.py` - общий
+"мозг" LiVerse для desktop-версии и Android-версии. Pipeline здесь означает
+цепочку обработки: взять очередной кусок текста от Vosk, помнить несколько
+последних кусков, собрать возможные варианты полной ссылки, отфильтровать
+старый контекст и вернуть найденную библейскую ссылку.
+
+В этом модуле живут:
+
+- генерация грамматики Vosk;
+- буфер последних фраз Vosk;
+- сборка кандидатов из нескольких фраз;
+- защита от прилипания старой ссылки к новой;
+- распознавание ссылок через `bible_parser_core.parser`.
+
+`tools/vosk_grammar_probe.py` оставляет за собой desktop-части: микрофон,
+логи, подтверждение оператором, web-экран и Holyrics. Android-приложение
+использует тот же `live_pipeline.py` через Chaquopy, а микрофон и экран
+оставляет Android-коду.
 
 ## Происхождение `rst.json`
 
