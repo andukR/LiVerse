@@ -264,6 +264,8 @@ def expand_nehemiah_confusable_candidates(
 def joel_confusable_texts(text: str) -> list[str]:
     replacements: list[str] = []
     patterns = (
+        (r"\b((?:книга|книги)\s+пророка\s+)ион[аы]\s+иереми[яи]\b", r"\1иоиля", True),
+        (r"\b(пророка\s+)ион[аы]\s+иереми[яи]\b", r"\1иоиля", True),
         (r"\b((?:книга|книги)\s+пророка\s+)иов\b", r"\1иоиля", True),
         (r"\b(пророка\s+)иов\b", r"\1иоиля", True),
         (r"\b((?:книга|книги)\s+пророка\s+)иеремии\b", r"\1иоиля", False),
@@ -284,7 +286,10 @@ def expand_joel_confusable_candidates(candidates: list[str]) -> list[str]:
     expanded: list[str] = []
     for candidate in candidates:
         replacements = joel_confusable_texts(candidate)
-        prefer_first = bool(re.search(r"\bпророк[а-я]*\s+иов\b", candidate, flags=re.IGNORECASE))
+        prefer_first = bool(
+            re.search(r"\bпророк[а-я]*\s+иов\b", candidate, flags=re.IGNORECASE)
+            or re.search(r"\bпророк[а-я]*\s+ион[аы]\s+иереми[яи]\b", candidate, flags=re.IGNORECASE)
+        )
         if prefer_first:
             for replacement in replacements:
                 if replacement not in expanded:
@@ -414,6 +419,9 @@ class LiveReferencePipeline:
             return resolve_reference_payload("", bible_path=self.bible_path, show_candidates=show_candidates)
 
         self.text_buffer.add(text)
+        if likely_book_only_fragment(text) and len(self.text_buffer.parts) > 1:
+            self.text_buffer.parts.clear()
+            self.text_buffer.add(text)
         candidate_texts = same_place_candidates(self.text_buffer.candidates(), self.last_parsed)
         candidate_texts = expand_joel_confusable_candidates(candidate_texts)
         candidate_texts = expand_nehemiah_confusable_candidates(
