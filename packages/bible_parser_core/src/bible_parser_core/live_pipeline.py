@@ -394,6 +394,7 @@ def parsed_payload_from_candidates(
     candidates: list[str],
     bible_path: Path = DEFAULT_BIBLE,
     *,
+    last_parsed: dict | ParsedReference | None = None,
     show_candidates: bool = False,
 ) -> dict:
     attempts = [
@@ -412,6 +413,17 @@ def parsed_payload_from_candidates(
     for index, payload in enumerate(attempts):
         if payload.get("matched"):
             first_text = str(attempts[0].get("text") or "") if attempts else ""
+            parsed = payload.get("parsed") or {}
+            previous_ref = (
+                last_parsed.ref
+                if isinstance(last_parsed, ParsedReference)
+                else (last_parsed or {}).get("ref")
+            )
+            if index > 0 and previous_ref and parsed.get("ref") == previous_ref:
+                first_payload = attempts[0]
+                first_payload["attempts"] = attempt_summaries[1:]
+                first_payload["blocked_stale_repeat"] = True
+                return first_payload
             if index > 0 and (
                 likely_explicit_reference(first_text)
                 or likely_book_only_fragment(first_text)
@@ -457,6 +469,7 @@ class LiveReferencePipeline:
         payload = parsed_payload_from_candidates(
             candidate_texts,
             bible_path=self.bible_path,
+            last_parsed=self.last_parsed,
             show_candidates=show_candidates,
         )
         payload["vosk_text"] = text
