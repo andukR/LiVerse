@@ -46,6 +46,15 @@ class LiveReferencePipelineTest(unittest.TestCase):
         second = pipeline.process_text("четырнадцать двадцать восемь тридцать")
         self.assertEqual("Лука 14:28-30", second.get("parsed", {}).get("ref"))
 
+    def test_gospel_phrase_in_noisy_context_can_start_next_reference(self):
+        pipeline = LiveReferencePipeline()
+
+        first = pipeline.process_text("числа откроем евангелие от матфея")
+        self.assertFalse(first.get("matched"))
+
+        second = pipeline.process_text("восьмая глава первого пятые стих")
+        self.assertEqual("Матфей 8:1-5", second.get("parsed", {}).get("ref"))
+
     def test_stale_buffer_does_not_repeat_previous_reference(self):
         pipeline = LiveReferencePipeline()
 
@@ -85,6 +94,22 @@ class LiveReferencePipelineTest(unittest.TestCase):
         third = pipeline.process_text("восьмого")
         self.assertFalse(third.get("matched"))
         self.assertTrue(third.get("blocked_no_book_context"))
+
+    def test_non_gospel_noise_suffix_does_not_create_reference(self):
+        pipeline = LiveReferencePipeline()
+
+        self.assertFalse(pipeline.process_text("с главы даниил").get("matched"))
+
+        second = pipeline.process_text("шестого")
+        self.assertFalse(second.get("matched"))
+
+    def test_noisy_book_phrase_suffix_does_not_create_reference(self):
+        pipeline = LiveReferencePipeline()
+
+        self.assertFalse(pipeline.process_text("от шесть пророка ионы иакова книга амоса").get("matched"))
+
+        second = pipeline.process_text("послание евр")
+        self.assertFalse(second.get("matched"))
 
 
 if __name__ == "__main__":

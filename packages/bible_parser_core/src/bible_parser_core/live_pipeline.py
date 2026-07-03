@@ -206,6 +206,9 @@ def build_book_only_forms() -> set[str]:
 
 
 BOOK_ONLY_FORMS = build_book_only_forms()
+EXPLICIT_GOSPEL_FORMS = {
+    form for form in BOOK_ONLY_FORMS if form.startswith("евангелие от ")
+}
 
 
 def resolve_reference_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, show_candidates: bool = False) -> dict:
@@ -378,7 +381,10 @@ def acceptable_buffer_context(candidate: str, current_text: str) -> bool:
     prefix = context_prefix(candidate, current_text)
     if not prefix:
         return False
-    return likely_book_only_fragment(prefix)
+    if likely_book_only_fragment(prefix):
+        return True
+    normalized_prefix = normalize_book_form(prefix)
+    return any(normalized_prefix.endswith(form) for form in EXPLICIT_GOSPEL_FORMS)
 
 
 def same_place_candidates(candidates: list[str], last_parsed: dict | ParsedReference | None) -> list[str]:
