@@ -320,6 +320,8 @@ def likely_book_only_fragment(text: str) -> bool:
     lowered = text.lower().replace("ё", "е").strip()
     if not lowered or re.search(r"\b(глава|стих|псалом)\b", lowered):
         return False
+    if lowered in {"паралипоменон", "паралипоминон", "паралипомином"}:
+        return True
     if re.fullmatch(r"(?:книг[аи]\s+)?пророка\s+\S+", lowered):
         return True
     words = lowered.split()
