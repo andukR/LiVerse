@@ -366,6 +366,21 @@ def same_place_only_fragment(text: str) -> bool:
     return re.fullmatch(r"\s*там\s+же\s*", text.lower().replace("ё", "е")) is not None
 
 
+def context_prefix(candidate: str, current_text: str) -> str:
+    candidate = re.sub(r"\s+", " ", candidate).strip()
+    current_text = re.sub(r"\s+", " ", current_text).strip()
+    if not current_text or not candidate.endswith(current_text):
+        return ""
+    return candidate[: -len(current_text)].strip()
+
+
+def acceptable_buffer_context(candidate: str, current_text: str) -> bool:
+    prefix = context_prefix(candidate, current_text)
+    if not prefix:
+        return False
+    return likely_book_only_fragment(prefix)
+
+
 def same_place_candidates(candidates: list[str], last_parsed: dict | ParsedReference | None) -> list[str]:
     if isinstance(last_parsed, ParsedReference):
         book = last_parsed.book
@@ -423,6 +438,11 @@ def parsed_payload_from_candidates(
                 first_payload = attempts[0]
                 first_payload["attempts"] = attempt_summaries[1:]
                 first_payload["blocked_stale_repeat"] = True
+                return first_payload
+            if index > 0 and not acceptable_buffer_context(str(payload.get("text") or ""), first_text):
+                first_payload = attempts[0]
+                first_payload["attempts"] = attempt_summaries[1:]
+                first_payload["blocked_no_book_context"] = True
                 return first_payload
             if index > 0 and (
                 likely_explicit_reference(first_text)
