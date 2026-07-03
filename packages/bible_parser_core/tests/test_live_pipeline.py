@@ -55,6 +55,33 @@ class LiveReferencePipelineTest(unittest.TestCase):
         second = pipeline.process_text("восьмая глава первого пятые стих")
         self.assertEqual("Матфей 8:1-5", second.get("parsed", {}).get("ref"))
 
+    def test_slow_split_reference_accumulates_inside_time_window(self):
+        pipeline = LiveReferencePipeline()
+
+        self.assertFalse(
+            pipeline.process_text("давайте откроем евангелие от матфея", now_ms=1_000).get("matched")
+        )
+        self.assertFalse(pipeline.process_text("восьмая глава", now_ms=2_100).get("matched"))
+        third = pipeline.process_text("с первого", now_ms=3_000)
+        self.assertEqual("Матфей 8:1", third.get("parsed", {}).get("ref"))
+        self.assertTrue(third.get("buffer_kept_for_open_range"))
+
+        fourth = pipeline.process_text("по пятый стих", now_ms=4_000)
+        self.assertEqual("Матфей 8:1-5", fourth.get("parsed", {}).get("ref"))
+        self.assertFalse(fourth.get("buffer_reset_by_gap"))
+
+    def test_split_reference_resets_after_long_pause(self):
+        pipeline = LiveReferencePipeline()
+
+        self.assertFalse(
+            pipeline.process_text("давайте откроем евангелие от матфея", now_ms=1_000).get("matched")
+        )
+
+        second = pipeline.process_text("восьмая глава с первого по пятый стих", now_ms=4_500)
+        self.assertFalse(second.get("matched"))
+        self.assertTrue(second.get("buffer_reset_by_gap"))
+        self.assertEqual(["восьмая глава с первого по пятый стих"], second.get("vosk_buffer"))
+
     def test_stale_buffer_does_not_repeat_previous_reference(self):
         pipeline = LiveReferencePipeline()
 
@@ -63,7 +90,7 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         second = pipeline.process_text("мих от до с ины")
         self.assertFalse(second.get("matched"))
-        self.assertTrue(second.get("blocked_stale_repeat"))
+        self.assertEqual(["мих от до с ины"], second.get("vosk_buffer"))
 
     def test_stale_buffer_does_not_cascade_false_reference(self):
         pipeline = LiveReferencePipeline()
@@ -73,7 +100,7 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         second = pipeline.process_text("четвертая из")
         self.assertFalse(second.get("matched"))
-        self.assertTrue(second.get("blocked_stale_repeat"))
+        self.assertEqual(["четвертая из"], second.get("vosk_buffer"))
 
     def test_noise_context_does_not_create_new_reference(self):
         pipeline = LiveReferencePipeline()
@@ -83,7 +110,7 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         second = pipeline.process_text("оны сто")
         self.assertFalse(second.get("matched"))
-        self.assertTrue(second.get("blocked_no_book_context"))
+        self.assertEqual(["оны сто"], second.get("vosk_buffer"))
 
     def test_noise_context_does_not_create_daniel_reference(self):
         pipeline = LiveReferencePipeline()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from collections import deque
 from dataclasses import asdict
 from pathlib import Path
@@ -125,6 +126,9 @@ class VoskTextBuffer:
         text = re.sub(r"\s+", " ", text).strip()
         if text:
             self.parts.append(text)
+
+    def clear(self) -> None:
+        self.parts.clear()
 
     def candidates(self) -> list[str]:
         values = list(self.parts)
@@ -369,6 +373,11 @@ def same_place_only_fragment(text: str) -> bool:
     return re.fullmatch(r"\s*там\s+же\s*", text.lower().replace("ё", "е")) is not None
 
 
+def open_range_start_fragment(text: str) -> bool:
+    lowered = text.lower().replace("ё", "е")
+    return bool(re.search(r"\bс\s+\S+", lowered)) and not bool(re.search(r"\bпо\b", lowered))
+
+
 def context_prefix(candidate: str, current_text: str) -> str:
     candidate = re.sub(r"\s+", " ", candidate).strip()
     current_text = re.sub(r"\s+", " ", current_text).strip()
@@ -384,7 +393,7 @@ def acceptable_buffer_context(candidate: str, current_text: str) -> bool:
     if likely_book_only_fragment(prefix):
         return True
     normalized_prefix = normalize_book_form(prefix)
-    return any(normalized_prefix.endswith(form) for form in EXPLICIT_GOSPEL_FORMS)
+    return any(re.search(rf"\b{re.escape(form)}\b", normalized_prefix) for form in EXPLICIT_GOSPEL_FORMS)
 
 
 def same_place_candidates(candidates: list[str], last_parsed: dict | ParsedReference | None) -> list[str]:
@@ -471,19 +480,42 @@ def parsed_payload_from_candidates(
 
 
 class LiveReferencePipeline:
-    def __init__(self, bible_path: Path = DEFAULT_BIBLE, *, buffer_parts: int = 3) -> None:
+    def __init__(
+        self,
+        bible_path: Path = DEFAULT_BIBLE,
+        *,
+        buffer_parts: int = 5,
+        buffer_window_ms: int = 2000,
+    ) -> None:
         self.bible_path = bible_path
         self.text_buffer = VoskTextBuffer(buffer_parts)
+        self.buffer_window_ms = max(0, buffer_window_ms)
+        self.last_text_ms: int | None = None
         self.last_parsed: dict | None = None
 
-    def process_text(self, text: str, *, asr_result: dict | None = None, show_candidates: bool = False) -> dict:
+    def process_text(
+        self,
+        text: str,
+        *,
+        asr_result: dict | None = None,
+        show_candidates: bool = False,
+        now_ms: int | float | None = None,
+    ) -> dict:
         text = re.sub(r"\s+", " ", (text or "")).strip()
         if not text:
             return resolve_reference_payload("", bible_path=self.bible_path, show_candidates=show_candidates)
 
+        current_ms = int(now_ms if now_ms is not None else time.monotonic() * 1000)
+        delta_ms = None if self.last_text_ms is None else current_ms - self.last_text_ms
+        buffer_reset_by_gap = False
+        if delta_ms is not None and delta_ms > self.buffer_window_ms:
+            self.text_buffer.clear()
+            buffer_reset_by_gap = True
+        self.last_text_ms = current_ms
+
         self.text_buffer.add(text)
         if likely_book_only_fragment(text) and len(self.text_buffer.parts) > 1:
-            self.text_buffer.parts.clear()
+            self.text_buffer.clear()
             self.text_buffer.add(text)
         candidate_texts = same_place_candidates(self.text_buffer.candidates(), self.last_parsed)
         candidate_texts = expand_joel_confusable_candidates(candidate_texts)
@@ -501,6 +533,14 @@ class LiveReferencePipeline:
         payload["vosk_text"] = text
         payload["vosk_buffer"] = list(self.text_buffer.parts)
         payload["candidate_texts"] = candidate_texts
+        payload["delta_ms"] = delta_ms
+        payload["buffer_window_ms"] = self.buffer_window_ms
+        payload["buffer_reset_by_gap"] = buffer_reset_by_gap
         if payload.get("parsed"):
             self.last_parsed = payload["parsed"]
+            if open_range_start_fragment(str(payload.get("text") or "")):
+                payload["buffer_kept_for_open_range"] = True
+            else:
+                self.text_buffer.clear()
+                payload["buffer_cleared_after_match"] = True
         return payload
