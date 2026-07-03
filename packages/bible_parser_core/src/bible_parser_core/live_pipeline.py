@@ -177,6 +177,37 @@ def grammar_diagnostics(grammar: list[str]) -> dict[str, Any]:
     }
 
 
+def normalize_book_form(text: str) -> str:
+    return re.sub(r"\s+", " ", text.lower().replace("ё", "е")).strip()
+
+
+def strip_leading_book_number(text: str) -> str:
+    return re.sub(
+        r"^(?:[1-4]|перв\w*|втор\w*|трет\w*|четверт\w*)\s+",
+        "",
+        text,
+    ).strip()
+
+
+def build_book_only_forms() -> set[str]:
+    forms: set[str] = {
+        "паралипоминон",
+        "паралипомином",
+    }
+    for canonical, aliases in book_synonyms.items():
+        for name in (canonical, *aliases):
+            normalized_name = normalize_book_form(name)
+            if normalized_name:
+                forms.add(normalized_name)
+            without_number = strip_leading_book_number(normalized_name)
+            if without_number and without_number != normalized_name:
+                forms.add(without_number)
+    return forms
+
+
+BOOK_ONLY_FORMS = build_book_only_forms()
+
+
 def resolve_reference_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, show_candidates: bool = False) -> dict:
     parsed = parse_live_reference(text, bible_path=bible_path)
     source = "parser"
@@ -320,8 +351,6 @@ def likely_book_only_fragment(text: str) -> bool:
     lowered = text.lower().replace("ё", "е").strip()
     if not lowered or re.search(r"\b(глава|стих|псалом)\b", lowered):
         return False
-    if lowered in {"паралипоменон", "паралипоминон", "паралипомином"}:
-        return True
     if re.fullmatch(r"(?:книг[аи]\s+)?пророка\s+\S+", lowered):
         return True
     words = lowered.split()
@@ -330,13 +359,7 @@ def likely_book_only_fragment(text: str) -> bool:
     forms = {lowered}
     if len(words) == 1 and lowered.endswith("а") and len(lowered) > 3:
         forms.add(lowered[:-1])
-    for canonical, aliases in book_synonyms.items():
-        names = [canonical, *aliases]
-        for name in names:
-            normalized_name = name.lower().replace("ё", "е")
-            if normalized_name in forms:
-                return True
-    return False
+    return any(form in BOOK_ONLY_FORMS for form in forms)
 
 
 def same_place_only_fragment(text: str) -> bool:
