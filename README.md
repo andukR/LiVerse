@@ -147,6 +147,36 @@ LiVerse больше не отправляет собственный текст
 3. Запустите `install-windows.ps1`.
 4. Запускайте `run-liverse.cmd`.
 
+### Установка Windows 10 с нуля из консоли
+
+Если браузер на старом компьютере сильно тормозит, можно поставить Git,
+скачать последнюю версию LiVerse и создать виртуальное окружение одной
+командой PowerShell:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/andukR/LiVerse/main/bootstrap-windows.ps1 -UseBasicParsing | iex"
+```
+
+Скрипт делает следующее:
+
+1. ищет `git`; если Git не найден, пробует поставить Git for Windows через
+   `winget`, затем через официальный релиз Git for Windows на GitHub;
+2. скачивает или обновляет репозиторий `https://github.com/andukR/LiVerse.git`
+   из ветки `main`;
+3. проверяет Python 3.10+;
+4. создаёт `.venv`;
+5. устанавливает зависимости и сам LiVerse.
+
+По умолчанию проект будет лежать в `%USERPROFILE%\LiVerse`. Запуск:
+
+```powershell
+cd $HOME\LiVerse
+.\run-liverse.cmd
+```
+
+Если LiVerse уже скачан через Git, эта же команда обновит его до последней
+версии ветки `main`.
+
 Если запустить `run-liverse.cmd` без параметров, он включает тот же рабочий
 режим, что и `make liverse`: подтверждение через телефон, вывод в Holyrics и
 QR-код в отдельном окне. Если передать свои параметры, они используются вместо
