@@ -46,6 +46,20 @@ class LiveReferencePipelineTest(unittest.TestCase):
         second = pipeline.process_text("четырнадцать двадцать восемь тридцать")
         self.assertEqual("Лука 14:28-30", second.get("parsed", {}).get("ref"))
 
+    def test_spoken_first_corinthians_reference(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("первое коринфянам вторая глава шестнадцатый стих")
+
+        self.assertEqual("1 Коринфянам 2:16", result.get("parsed", {}).get("ref"))
+
+    def test_nonexistent_first_corinthians_verse_does_not_match(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("первое коринфянам вторая глава двадцать пятый стих")
+
+        self.assertFalse(result.get("matched"))
+
     def test_gospel_phrase_in_noisy_context_can_start_next_reference(self):
         pipeline = LiveReferencePipeline()
 
