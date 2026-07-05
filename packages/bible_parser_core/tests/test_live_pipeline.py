@@ -59,6 +59,17 @@ class LiveReferencePipelineTest(unittest.TestCase):
         result = pipeline.process_text("первое коринфянам вторая глава двадцать пятый стих")
 
         self.assertFalse(result.get("matched"))
+        self.assertEqual("invalid_verse", result.get("invalid_reference", {}).get("reason"))
+        self.assertEqual("1 Коринфянам 2:25", result.get("invalid_reference", {}).get("ref"))
+        self.assertIn("Такого стиха нет", result.get("message", ""))
+
+    def test_noise_does_not_report_invalid_reference(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("коринфянам просто параллельно")
+
+        self.assertFalse(result.get("matched"))
+        self.assertIsNone(result.get("invalid_reference"))
 
     def test_gospel_phrase_in_noisy_context_can_start_next_reference(self):
         pipeline = LiveReferencePipeline()

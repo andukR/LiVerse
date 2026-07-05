@@ -327,6 +327,7 @@ def parsed_payload_from_candidates(
 def payload_summary(payload: dict) -> dict:
     parsed = payload.get("parsed") or {}
     slide = payload.get("slide") or {}
+    invalid_reference = payload.get("invalid_reference") or {}
     return {
         "text": payload.get("text"),
         "ref": parsed.get("ref"),
@@ -336,6 +337,8 @@ def payload_summary(payload: dict) -> dict:
         "end_verse": parsed.get("end_verse"),
         "source": payload.get("source"),
         "has_slide": bool(slide),
+        "invalid_reference": invalid_reference,
+        "message": payload.get("message"),
         "attempts": payload.get("attempts") or [],
     }
 
@@ -655,6 +658,8 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 console.status(f"отклонено: {ref}")
                             else:
                                 console.status(f"найдена ссылка: {ref}")
+                        elif payload.get("message"):
+                            console.status(str(payload["message"]))
                         else:
                             console.status("слушаю")
                         if payload.get("parsed"):
@@ -832,7 +837,7 @@ def main() -> int:
         ConsoleStatus(debug=args.debug_console).debug_json(payload)
         if not args.debug_console:
             ref = (payload.get("parsed") or {}).get("ref")
-            print(f"Результат: {ref or 'ссылка не найдена'}", flush=True)
+            print(f"Результат: {ref or payload.get('message') or 'ссылка не найдена'}", flush=True)
         return 0 if payload["parsed"] else 1
 
     return run_microphone(args)

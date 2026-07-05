@@ -75,6 +75,20 @@ class RefCandidate:
     end_verse: int | None = None
 
 
+@dataclass(frozen=True)
+class InvalidReference:
+    book: str
+    chapter: int
+    start_verse: int | None
+    end_verse: int | None
+    ref: str
+    message: str
+    reason: str
+    source_text: str
+    max_chapter: int | None = None
+    max_verse: int | None = None
+
+
 ORDINALS = {
     "первый": 1,
     "первая": 1,
@@ -1173,6 +1187,81 @@ def compact_range(values: list[int]) -> tuple[int, int] | None:
     if len(clean) == 2 and clean[0] < clean[1]:
         return clean[0], clean[1]
     return clean[0], clean[-1]
+
+
+def diagnose_invalid_reference(text: str, bible_path: Path = DEFAULT_BIBLE) -> InvalidReference | None:
+    normalized = normalize_text(text)
+    if not re.search(r"\b(глава|стих)\b", normalized):
+        return None
+
+    bible = bible_map(bible_path)
+    books = book_candidates(normalized)
+    if not books:
+        return None
+
+    for book_candidate in books:
+        book = book_candidate.book
+        chapters = bible.get(book, {})
+        if not chapters:
+            continue
+
+        chapter, verses = infer_chapter_and_verses(normalized, book, bible)
+        if chapter is None or not verses:
+            continue
+
+        start_verse, end_verse = compact_range(verses) or (None, None)
+        if chapter not in chapters:
+            max_chapter = max(chapters) if chapters else None
+            ref = f"{book} {chapter}"
+            message = (
+                f"Такой главы нет: {ref}. "
+                f"В книге {book} глав: {max_chapter}."
+                if max_chapter
+                else f"Такой главы нет: {ref}."
+            )
+            return InvalidReference(
+                book=book,
+                chapter=chapter,
+                start_verse=start_verse,
+                end_verse=end_verse,
+                ref=ref,
+                message=message,
+                reason="invalid_chapter",
+                source_text=text,
+                max_chapter=max_chapter,
+            )
+
+        chapter_map = chapters[chapter]
+        missing = [verse for verse in verses if verse not in chapter_map]
+        if not missing:
+            continue
+
+        max_verse = max(chapter_map) if chapter_map else None
+        if start_verse is None or end_verse is None:
+            ref = f"{book} {chapter}"
+        elif start_verse == end_verse:
+            ref = f"{book} {chapter}:{start_verse}"
+        else:
+            ref = f"{book} {chapter}:{start_verse}-{end_verse}"
+        message = (
+            f"Такого стиха нет: {ref}. "
+            f"В {book} {chapter} главе стихов: {max_verse}."
+            if max_verse
+            else f"Такого стиха нет: {ref}."
+        )
+        return InvalidReference(
+            book=book,
+            chapter=chapter,
+            start_verse=start_verse,
+            end_verse=end_verse,
+            ref=ref,
+            message=message,
+            reason="invalid_verse",
+            source_text=text,
+            max_verse=max_verse,
+        )
+
+    return None
 
 
 def cross_chapter_verse_text(

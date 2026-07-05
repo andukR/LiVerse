@@ -11,6 +11,7 @@ from typing import Any
 
 from bible_parser_core.book_aliases import book_synonyms
 from bible_parser_core.parser import DEFAULT_BIBLE, NUMBER_WORDS, ParsedReference, parse_live_reference
+from bible_parser_core.parser import diagnose_invalid_reference
 from bible_parser_core.reference_resolver import (
     resolve_best_reference_candidate,
     resolve_reference_candidates,
@@ -219,17 +220,22 @@ def resolve_reference_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, sh
     parsed = parse_live_reference(text, bible_path=bible_path)
     source = "parser"
     resolved = None
+    invalid_reference = None
     if parsed is None:
         resolved = resolve_best_reference_candidate(text, bible_path=bible_path)
         if resolved:
             parsed = parse_live_reference(resolved.ref, bible_path=bible_path)
             source = "resolver"
+        if parsed is None:
+            invalid_reference = diagnose_invalid_reference(text, bible_path=bible_path)
 
     payload = {
         "text": text,
         "source": source if parsed else None,
         "resolved": asdict(resolved) if resolved else None,
         "parsed": asdict(parsed) if parsed else None,
+        "invalid_reference": asdict(invalid_reference) if invalid_reference else None,
+        "message": invalid_reference.message if invalid_reference else None,
         "matched": parsed is not None,
         "bible_path": str(bible_path),
     }
