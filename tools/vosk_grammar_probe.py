@@ -97,6 +97,8 @@ def print_holyrics_setup_notice_once(args: argparse.Namespace) -> None:
 
     print("", flush=True)
     print("Первичная настройка Holyrics для LiVerse", flush=True)
+    print("Включите Holyrics API Server Local. Порт по умолчанию: 8091.", flush=True)
+    print("Если в Holyrics указан другой порт, запишите его в .env как HOLYRICS_PORT.", flush=True)
     print("Откройте Holyrics -> Settings -> API Server -> Manage permissions.", flush=True)
     print("Для API token, указанного в HOLYRICS_TOKEN, включите разрешения:", flush=True)
     for permission in REQUIRED_HOLYRICS_PERMISSIONS:
@@ -128,6 +130,20 @@ def check_holyrics_startup(args: argparse.Namespace, logger: JsonlLogger | None 
         logger.write("holyrics_startup_check", result)
 
     if result.get("ok"):
+        if not result.get("token_info_ok"):
+            print("Holyrics: API Server доступен.", flush=True)
+            print("Holyrics: автоматически проверить версию и разрешения token не удалось.", flush=True)
+            print(
+                f"Проверьте версию Holyrics вручную. Если версия ниже {MIN_RECOMMENDED_HOLYRICS_VERSION}, "
+                "обновите Holyrics.",
+                flush=True,
+            )
+            print("Также проверьте, что API token имеет разрешения:", flush=True)
+            for permission in REQUIRED_HOLYRICS_PERMISSIONS:
+                print(f"  - {permission}", flush=True)
+            print(f"Техническая причина: {result.get('token_info_reason')}", flush=True)
+            return
+
         version = str(result.get("version") or "").strip()
         if version:
             print(f"Holyrics: API Server доступен, версия {version}.", flush=True)
@@ -148,7 +164,9 @@ def check_holyrics_startup(args: argparse.Namespace, logger: JsonlLogger | None 
 
     print("", flush=True)
     print("Holyrics: API Server сейчас недоступен.", flush=True)
-    print("Проверьте, что Holyrics запущен, API Server включён, порт 8091 доступен, а token имеет разрешения:", flush=True)
+    print("Проверьте, что Holyrics запущен, API Server Local включён, а порт совпадает с .env.", flush=True)
+    print("По умолчанию LiVerse пробует порт 8091. Если в Holyrics указан другой порт, задайте HOLYRICS_PORT в .env.", flush=True)
+    print("Также проверьте, что API token имеет разрешения:", flush=True)
     for permission in REQUIRED_HOLYRICS_PERMISSIONS:
         print(f"  - {permission}", flush=True)
     print(f"Техническая причина: {result.get('reason')}", flush=True)

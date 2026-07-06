@@ -193,6 +193,11 @@ function Install-LiVerse {
         if ($LASTEXITCODE -ne 0) { throw "editable install failed." }
         & $venvPython -c "import vosk, sounddevice, bible_parser_core; print('Import check OK')"
         if ($LASTEXITCODE -ne 0) { throw "Import check failed." }
+
+        if ((-not (Test-Path ".env")) -and (Test-Path ".env.example")) {
+            Copy-Item ".env.example" ".env"
+            Write-Host ".env created from .env.example. Put HOLYRICS_TOKEN into .env and check HOLYRICS_PORT."
+        }
     } finally {
         Pop-Location
     }

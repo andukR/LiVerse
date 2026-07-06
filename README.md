@@ -121,6 +121,8 @@ HOLYRICS_PORT=8091
 
 `HOLYRICS_TOKEN` - это token из `Holyrics -> Settings -> API Server -> Manage permissions`.
 Это не Web `API_KEY`. Для Local API token передаётся в URL.
+`HOLYRICS_PORT=8091` - порт Holyrics API Server по умолчанию. Если в настройках
+Holyrics API Server указан другой порт, запишите его в `.env`.
 
 В Holyrics API Server Local должны быть разрешены:
 
@@ -130,7 +132,9 @@ HOLYRICS_PORT=8091
 
 LiVerse также вызывает служебный запрос `GetTokenInfo`, чтобы проверить версию
 Holyrics и список разрешений текущего token. Отдельно включать `GetTokenInfo`
-в `Manage permissions` обычно не нужно.
+в `Manage permissions` обычно не нужно. Эта проверка не заменяет первичную
+настройку Holyrics: API Server должен быть включён, token должен быть создан и
+записан в `.env`.
 
 LiVerse больше не отправляет собственный текст Библии в Holyrics через
 `ShowQuickPresentation` для распознанных библейских ссылок. Вместо этого он:
@@ -149,7 +153,8 @@ LiVerse больше не отправляет собственный текст
 1. Установите Python 3.10+.
 2. Распакуйте проект.
 3. Запустите `install-windows.ps1`.
-4. Запускайте `run-liverse.cmd`.
+4. Откройте `.env`, вставьте `HOLYRICS_TOKEN` и проверьте `HOLYRICS_PORT`.
+5. Запускайте `run-liverse.cmd`.
 
 ### Установка Windows 10 с нуля из консоли
 
