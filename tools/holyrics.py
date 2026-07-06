@@ -19,6 +19,13 @@ DEFAULT_HOST = "http://localhost"
 DEFAULT_PORT = 8091
 DEFAULT_TIMEOUT = 5.0
 DEFAULT_HOLYRICS_ACTION = "ShowQuickPresentation"
+MIN_RECOMMENDED_HOLYRICS_VERSION = "2.28.1"
+HOLYRICS_JSLIB_DOC_URL = "https://github.com/holyrics/jslib/blob/main/README-en.md"
+REQUIRED_HOLYRICS_PERMISSIONS = (
+    "GetAPIServerInfo",
+    "SetBibleSettings",
+    "ShowVerse",
+)
 HOLYRICS_BOOKS = (
     "Бытие",
     "Исход",
@@ -283,6 +290,108 @@ def post_holyrics_api(args: Any, base_url: str, endpoint: str, body: dict) -> tu
         return False, f"holyrics_http_{exc.code}", body
     except URLError as exc:
         return False, f"holyrics_unavailable:{exc.reason}", ""
+
+
+def get_holyrics_api_server_info(args: Any, base_url: str) -> tuple[bool, str, dict[str, Any] | None]:
+    ok, reason, body = post_holyrics_api(args, base_url, "GetAPIServerInfo", {})
+    if not ok:
+        return False, reason, None
+    if not body:
+        return True, "", {}
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return True, "non_json_response", {"raw": body}
+    return True, "", parsed
+
+
+def get_holyrics_token_info(args: Any, base_url: str) -> tuple[bool, str, dict[str, Any] | None]:
+    ok, reason, body = post_holyrics_api(args, base_url, "GetTokenInfo", {})
+    if not ok:
+        return False, reason, None
+    if not body:
+        return True, "", {}
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return True, "non_json_response", {"raw": body}
+    return True, "", parsed
+
+
+def extract_holyrics_version(info: dict[str, Any] | None) -> str:
+    if not isinstance(info, dict):
+        return ""
+
+    stack: list[Any] = [info]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if str(key).lower() in {"version", "app_version", "program_version", "holyrics_version"}:
+                    text = str(nested or "").strip()
+                    if text:
+                        return text
+                if isinstance(nested, (dict, list)):
+                    stack.append(nested)
+        elif isinstance(value, list):
+            stack.extend(item for item in value if isinstance(item, (dict, list)))
+    return ""
+
+
+def extract_holyrics_permissions(info: dict[str, Any] | None) -> set[str]:
+    if not isinstance(info, dict):
+        return set()
+
+    permissions = info.get("permissions")
+    if isinstance(permissions, str):
+        return {item.strip() for item in permissions.split(",") if item.strip()}
+    if isinstance(permissions, list):
+        return {str(item).strip() for item in permissions if str(item).strip()}
+
+    data = info.get("data")
+    if isinstance(data, dict) and data is not info:
+        return extract_holyrics_permissions(data)
+    return set()
+
+
+def check_holyrics_api_server(args: Any) -> dict[str, Any]:
+    reasons: list[str] = []
+    auto_target = str(getattr(args, "holyrics_url", "auto")).strip().lower() == "auto"
+    for url in holyrics_candidate_urls(getattr(args, "holyrics_url", "auto")):
+        ok, reason, api_server_info = get_holyrics_api_server_info(args, url)
+        if ok:
+            token_ok, token_reason, token_info = get_holyrics_token_info(args, url)
+            permissions = extract_holyrics_permissions(token_info)
+            missing_permissions = [
+                permission for permission in REQUIRED_HOLYRICS_PERMISSIONS if permission not in permissions
+            ] if permissions else []
+            if auto_target:
+                setattr(args, "holyrics_url", url)
+            return {
+                "ok": True,
+                "url": url,
+                "version": extract_holyrics_version(token_info) or extract_holyrics_version(api_server_info),
+                "api_server_info": api_server_info,
+                "token_info": token_info,
+                "token_info_ok": token_ok,
+                "token_info_reason": token_reason,
+                "permissions": sorted(permissions),
+                "missing_permissions": missing_permissions,
+                "reason": reason,
+            }
+        reasons.append(f"{url}={reason}")
+    return {
+        "ok": False,
+        "url": "",
+        "version": "",
+        "api_server_info": None,
+        "token_info": None,
+        "token_info_ok": False,
+        "token_info_reason": "",
+        "permissions": [],
+        "missing_permissions": [],
+        "reason": ";".join(reasons) or "holyrics_unavailable",
+    }
 
 
 def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, str]:

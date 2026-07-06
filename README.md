@@ -124,9 +124,13 @@ HOLYRICS_PORT=8091
 
 В Holyrics API Server Local должны быть разрешены:
 
+- `GetAPIServerInfo` - стартовая проверка, что Holyrics API Server доступен
 - `ShowVerse`
 - `SetBibleSettings`
-- `GetBibleSettings` - желательно для диагностики
+
+LiVerse также вызывает служебный запрос `GetTokenInfo`, чтобы проверить версию
+Holyrics и список разрешений текущего token. Отдельно включать `GetTokenInfo`
+в `Manage permissions` обычно не нужно.
 
 LiVerse больше не отправляет собственный текст Библии в Holyrics через
 `ShowQuickPresentation` для распознанных библейских ссылок. Вместо этого он:

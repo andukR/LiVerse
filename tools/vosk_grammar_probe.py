@@ -34,6 +34,9 @@ from bible_parser_core.live_pipeline import (
 )
 from bible_parser_core.parser import DEFAULT_BIBLE
 from tools.holyrics import (
+    MIN_RECOMMENDED_HOLYRICS_VERSION,
+    REQUIRED_HOLYRICS_PERMISSIONS,
+    check_holyrics_api_server,
     default_holyrics_url,
     describe_holyrics_target,
     env_setting,
@@ -43,6 +46,7 @@ from tools.holyrics import (
 
 DEFAULT_MODEL_PATH = Path.cwd() / "models" / "vosk-model-small-ru-0.22"
 DEFAULT_LOG_DIR = Path.cwd() / ".cache" / "liverse" / "vosk_probe"
+HOLYRICS_SETUP_NOTICE_MARKER = Path.cwd() / ".cache" / "liverse" / "holyrics_setup_notice_shown"
 WELCOME_TEXT = (
     "LiVerse принимает на себя техническую задачу поиска и отображения "
     "библейских ссылок, чтобы вся церковь могла сосредоточиться на слушании, "
@@ -81,6 +85,73 @@ class JsonlLogger:
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+
+
+def holyrics_output_enabled(args: argparse.Namespace) -> bool:
+    return args.slide_output in {"holyrics", "both"}
+
+
+def print_holyrics_setup_notice_once(args: argparse.Namespace) -> None:
+    if not holyrics_output_enabled(args) or HOLYRICS_SETUP_NOTICE_MARKER.exists():
+        return
+
+    print("", flush=True)
+    print("Первичная настройка Holyrics для LiVerse", flush=True)
+    print("Откройте Holyrics -> Settings -> API Server -> Manage permissions.", flush=True)
+    print("Для API token, указанного в HOLYRICS_TOKEN, включите разрешения:", flush=True)
+    for permission in REQUIRED_HOLYRICS_PERMISSIONS:
+        print(f"  - {permission}", flush=True)
+    print("", flush=True)
+    print(
+        f"Проверьте версию Holyrics. Если версия ниже {MIN_RECOMMENDED_HOLYRICS_VERSION}, "
+        "обновите Holyrics с официальной страницы загрузки: https://holyrics.com.br/download.html",
+        flush=True,
+    )
+    print("После проверки нажмите Enter.", flush=True)
+    input()
+    HOLYRICS_SETUP_NOTICE_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    HOLYRICS_SETUP_NOTICE_MARKER.write_text("shown\n", encoding="utf-8")
+
+
+def check_holyrics_startup(args: argparse.Namespace, logger: JsonlLogger | None = None) -> None:
+    if not holyrics_output_enabled(args):
+        return
+
+    if not args.holyrics_token:
+        print("", flush=True)
+        print("Holyrics: HOLYRICS_TOKEN не задан. Вывод в Holyrics работать не будет.", flush=True)
+        print("Укажите token из Holyrics -> Settings -> API Server -> Manage permissions в файле .env.", flush=True)
+        return
+
+    result = check_holyrics_api_server(args)
+    if logger:
+        logger.write("holyrics_startup_check", result)
+
+    if result.get("ok"):
+        version = str(result.get("version") or "").strip()
+        if version:
+            print(f"Holyrics: API Server доступен, версия {version}.", flush=True)
+        else:
+            print("Holyrics: API Server доступен. Версию автоматически определить не удалось.", flush=True)
+            print(
+                f"Проверьте версию Holyrics вручную. Если версия ниже {MIN_RECOMMENDED_HOLYRICS_VERSION}, "
+                "обновите Holyrics.",
+                flush=True,
+            )
+        missing_permissions = result.get("missing_permissions") or []
+        if missing_permissions:
+            print("Holyrics: в API token не хватает разрешений:", flush=True)
+            for permission in missing_permissions:
+                print(f"  - {permission}", flush=True)
+            print("Откройте Holyrics -> Settings -> API Server -> Manage permissions.", flush=True)
+        return
+
+    print("", flush=True)
+    print("Holyrics: API Server сейчас недоступен.", flush=True)
+    print("Проверьте, что Holyrics запущен, API Server включён, порт 8091 доступен, а token имеет разрешения:", flush=True)
+    for permission in REQUIRED_HOLYRICS_PERMISSIONS:
+        print(f"  - {permission}", flush=True)
+    print(f"Техническая причина: {result.get('reason')}", flush=True)
 
 
 class ConsoleStatus:
@@ -579,6 +650,7 @@ def run_microphone(args: argparse.Namespace) -> int:
             "grammar": None if grammar is None else grammar_diagnostics(grammar),
         }
     )
+    check_holyrics_startup(args, logger)
     print(WELCOME_TEXT, flush=True)
     if logger.run_dir and args.print_log_path:
         print(f"Vosk log: {logger.run_dir / 'events.jsonl'}")
@@ -592,50 +664,154 @@ def run_microphone(args: argparse.Namespace) -> int:
 
     SetLogLevel(args.vosk_log_level)
     model = Model(str(args.model))
-    recognizer_args = [model, args.samplerate]
-    if grammar is not None:
-        recognizer_args.append(json.dumps(grammar, ensure_ascii=False))
-    recognizer = KaldiRecognizer(*recognizer_args)
-    recognizer.SetWords(True)
     text_buffer = VoskTextBuffer(args.vosk_buffer_parts)
     last_parsed: dict | None = None
-    audio_log = None
-    if args.log_audio and logger.run_dir:
-        audio_log = wave.open(str(logger.run_dir / "audio.wav"), "wb")
-        audio_log.setnchannels(1)
-        audio_log.setsampwidth(2)
-        audio_log.setframerate(args.samplerate)
-        logger.write("audio_log", {"path": str(logger.run_dir / "audio.wav")})
 
-    stream_kwargs = {
-        "samplerate": args.samplerate,
-        "blocksize": args.blocksize,
-        "dtype": "int16",
-        "channels": 1,
-        "callback": callback,
-    }
-    if args.device is not None:
-        stream_kwargs["device"] = args.device
+    def sample_rate_candidates() -> list[int]:
+        values = [args.samplerate, 16000, 48000, 44100]
+        result: list[int] = []
+        for value in values:
+            if value > 0 and value not in result:
+                result.append(value)
+        return result
+
+    def audio_device_name(device: dict, index: int) -> str:
+        name = str(device.get("name") or f"device {index}")
+        hostapi = device.get("hostapi")
+        return f"{index}: {name} (hostapi {hostapi})"
+
+    def input_device_candidates() -> tuple[list[int], list[dict]]:
+        devices = list(sd.query_devices())
+        result: list[int] = []
+
+        def add(index: object) -> None:
+            if not isinstance(index, int) or index < 0 or index >= len(devices):
+                return
+            if index not in result:
+                result.append(index)
+
+        add(args.device)
+        default_device = sd.default.device
+        if isinstance(default_device, (list, tuple)):
+            add(default_device[0])
+        else:
+            add(default_device)
+
+        for index, device in enumerate(devices):
+            try:
+                input_channels = int(device.get("max_input_channels") or 0)
+            except (TypeError, ValueError):
+                input_channels = 0
+            if input_channels > 0:
+                add(index)
+        return result, devices
+
+    def find_working_audio_input() -> tuple[dict | None, list[dict], list[str]]:
+        errors: list[str] = []
+        try:
+            devices, all_devices = input_device_candidates()
+        except Exception as exc:
+            return None, [], [f"Не удалось получить список аудиоустройств: {exc}"]
+
+        for device_index in devices:
+            device = all_devices[device_index]
+            try:
+                input_channels = int(device.get("max_input_channels") or 0)
+            except (TypeError, ValueError):
+                input_channels = 0
+            if input_channels < 1:
+                errors.append(f"{audio_device_name(device, device_index)}: нет входных каналов")
+                continue
+
+            for samplerate in sample_rate_candidates():
+                try:
+                    sd.check_input_settings(
+                        device=device_index,
+                        channels=1,
+                        samplerate=samplerate,
+                        dtype="int16",
+                    )
+                except Exception as exc:
+                    errors.append(f"{audio_device_name(device, device_index)}, {samplerate} Hz: {exc}")
+                    continue
+                return (
+                    {
+                        "device": device_index,
+                        "samplerate": samplerate,
+                        "name": audio_device_name(device, device_index),
+                    },
+                    all_devices,
+                    errors,
+                )
+        return None, all_devices, errors
 
     def wait_for_audio_device(error: Exception) -> None:
         print("", flush=True)
         print("Не удалось открыть микрофон.", flush=True)
-        print("Проверьте: если микрофон к компьютеру не подключен, подключите его, и нажмите Enter.", flush=True)
-        print("Если микрофон подключен, проверьте номер аудиоустройства --device.", flush=True)
+        print(
+            "Проверьте, подключен ли микрофон к компьютеру, если не подключен, "
+            "подключите микрофон, для продолжения нажмите Enter.",
+            flush=True,
+        )
         print(f"Техническая ошибка: {error}", flush=True)
         input()
 
     console.status("слушаю")
     while True:
+        audio_log = None
+        audio_input, all_devices, audio_errors = find_working_audio_input()
+        if audio_input is None:
+            logger.write(
+                "audio_input_not_found",
+                {
+                    "device": args.device,
+                    "samplerates": sample_rate_candidates(),
+                    "errors": audio_errors,
+                    "devices": [
+                        {
+                            "index": index,
+                            "name": device.get("name"),
+                            "max_input_channels": device.get("max_input_channels"),
+                            "max_output_channels": device.get("max_output_channels"),
+                        }
+                        for index, device in enumerate(all_devices)
+                    ],
+                },
+            )
+            wait_for_audio_device(RuntimeError("рабочий микрофон не найден"))
+            continue
+
+        stream_kwargs = {
+            "samplerate": audio_input["samplerate"],
+            "blocksize": args.blocksize,
+            "dtype": "int16",
+            "channels": 1,
+            "callback": callback,
+            "device": audio_input["device"],
+        }
         try:
             stream = sd.RawInputStream(**stream_kwargs)
         except Exception as exc:
             logger.write(
                 "audio_open_error",
-                {"error": str(exc), "device": args.device, "samplerate": args.samplerate},
+                {"error": str(exc), "audio_input": audio_input, "errors": audio_errors},
             )
             wait_for_audio_device(exc)
             continue
+
+        logger.write("audio_input_selected", audio_input)
+        print(f"Микрофон: {audio_input['name']}, {audio_input['samplerate']} Hz", flush=True)
+        recognizer_args = [model, audio_input["samplerate"]]
+        if grammar is not None:
+            recognizer_args.append(json.dumps(grammar, ensure_ascii=False))
+        recognizer = KaldiRecognizer(*recognizer_args)
+        recognizer.SetWords(True)
+        if args.log_audio and logger.run_dir:
+            audio_log = wave.open(str(logger.run_dir / "audio.wav"), "wb")
+            audio_log.setnchannels(1)
+            audio_log.setsampwidth(2)
+            audio_log.setframerate(audio_input["samplerate"])
+            logger.write("audio_log", {"path": str(logger.run_dir / "audio.wav")})
 
         try:
             with stream:
@@ -813,6 +989,7 @@ def main() -> int:
             print(grammar_json, flush=True)
         return 0
     configure_interactive_approval_mode(args)
+    print_holyrics_setup_notice_once(args)
 
     if args.text:
         grammar = None if args.open_vocabulary else build_grammar()
@@ -831,6 +1008,7 @@ def main() -> int:
                 "grammar": None if grammar is None else grammar_diagnostics(grammar),
             }
         )
+        check_holyrics_startup(args, logger)
         start_slide_server_if_needed(args)
         candidate_texts = expand_nehemiah_confusable_candidates(
             [" ".join(args.text)],
