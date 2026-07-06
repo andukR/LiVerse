@@ -617,72 +617,91 @@ def run_microphone(args: argparse.Namespace) -> int:
     if args.device is not None:
         stream_kwargs["device"] = args.device
 
+    def wait_for_audio_device(error: Exception) -> None:
+        print("", flush=True)
+        print("Не удалось открыть микрофон.", flush=True)
+        print("Проверьте: если микрофон к компьютеру не подключен, подключите его, и нажмите Enter.", flush=True)
+        print("Если микрофон подключен, проверьте номер аудиоустройства --device.", flush=True)
+        print(f"Техническая ошибка: {error}", flush=True)
+        input()
+
     console.status("слушаю")
-    with sd.RawInputStream(**stream_kwargs):
+    while True:
         try:
-            while True:
-                data = audio_queue.get()
-                if audio_log:
-                    audio_log.writeframes(data)
-                if recognizer.AcceptWaveform(data):
-                    result = json.loads(recognizer.Result())
-                    text = result.get("text", "").strip()
-                    logger.write("final_raw", {"result": result, "text": text})
-                    if text:
-                        console.status("распознаю")
-                        text_buffer.add(text)
-                        candidate_texts = same_place_candidates(text_buffer.candidates(), last_parsed)
-                        candidate_texts = expand_nehemiah_confusable_candidates(
-                            candidate_texts,
-                            bible_path=args.bible,
-                            asr_result=result,
-                        )
-                        payload = parsed_payload_from_candidates(
-                            candidate_texts,
-                            bible_path=args.bible,
-                            show_candidates=args.show_candidates,
-                        )
-                        payload["asr"] = result
-                        payload["vosk_text"] = text
-                        payload["vosk_buffer"] = list(text_buffer.parts)
-                        payload["output"] = publish_payload(args, payload)
-                        if payload.get("slide"):
-                            action = approval_action(payload["output"])
-                            append_session_reference(session_refs, payload, action=action)
-                            ref = str((payload.get("parsed") or {}).get("ref") or payload["slide"].get("ref"))
-                            if action == "waiting":
-                                console.status(f"найдена ссылка {ref}, ожидает подтверждения")
-                            elif action == "approve":
-                                console.status(f"отправлено в Holyrics: {ref}")
-                            elif action == "reject":
-                                console.status(f"отклонено: {ref}")
+            stream = sd.RawInputStream(**stream_kwargs)
+        except Exception as exc:
+            logger.write(
+                "audio_open_error",
+                {"error": str(exc), "device": args.device, "samplerate": args.samplerate},
+            )
+            wait_for_audio_device(exc)
+            continue
+
+        try:
+            with stream:
+                while True:
+                    data = audio_queue.get()
+                    if audio_log:
+                        audio_log.writeframes(data)
+                    if recognizer.AcceptWaveform(data):
+                        result = json.loads(recognizer.Result())
+                        text = result.get("text", "").strip()
+                        logger.write("final_raw", {"result": result, "text": text})
+                        if text:
+                            console.status("распознаю")
+                            text_buffer.add(text)
+                            candidate_texts = same_place_candidates(text_buffer.candidates(), last_parsed)
+                            candidate_texts = expand_nehemiah_confusable_candidates(
+                                candidate_texts,
+                                bible_path=args.bible,
+                                asr_result=result,
+                            )
+                            payload = parsed_payload_from_candidates(
+                                candidate_texts,
+                                bible_path=args.bible,
+                                show_candidates=args.show_candidates,
+                            )
+                            payload["asr"] = result
+                            payload["vosk_text"] = text
+                            payload["vosk_buffer"] = list(text_buffer.parts)
+                            payload["output"] = publish_payload(args, payload)
+                            if payload.get("slide"):
+                                action = approval_action(payload["output"])
+                                append_session_reference(session_refs, payload, action=action)
+                                ref = str((payload.get("parsed") or {}).get("ref") or payload["slide"].get("ref"))
+                                if action == "waiting":
+                                    console.status(f"найдена ссылка {ref}, ожидает подтверждения")
+                                elif action == "approve":
+                                    console.status(f"отправлено в Holyrics: {ref}")
+                                elif action == "reject":
+                                    console.status(f"отклонено: {ref}")
+                                else:
+                                    console.status(f"найдена ссылка: {ref}")
+                            elif payload.get("message"):
+                                console.status(str(payload["message"]))
                             else:
-                                console.status(f"найдена ссылка: {ref}")
-                        elif payload.get("message"):
-                            console.status(str(payload["message"]))
-                        else:
-                            console.status("слушаю")
-                        if payload.get("parsed"):
-                            last_parsed = payload["parsed"]
-                        logger.write(
-                            "parsed",
-                            {
-                                "vosk_text": text,
-                                "vosk_buffer": list(text_buffer.parts),
-                                "candidate_texts": candidate_texts,
-                                "payload": payload_summary(payload),
-                                "output": payload["output"],
-                            },
-                        )
-                        console.debug_json(payload)
-                else:
-                    partial_result = json.loads(recognizer.PartialResult())
-                    partial = partial_result.get("partial", "")
-                    if partial:
-                        if args.log_partials:
-                            logger.write("partial", {"result": partial_result, "partial": partial})
-                        if args.debug_console:
-                            print("...", partial, flush=True)
+                                console.status("слушаю")
+                            if payload.get("parsed"):
+                                last_parsed = payload["parsed"]
+                            logger.write(
+                                "parsed",
+                                {
+                                    "vosk_text": text,
+                                    "vosk_buffer": list(text_buffer.parts),
+                                    "candidate_texts": candidate_texts,
+                                    "payload": payload_summary(payload),
+                                    "output": payload["output"],
+                                },
+                            )
+                            console.debug_json(payload)
+                    else:
+                        partial_result = json.loads(recognizer.PartialResult())
+                        partial = partial_result.get("partial", "")
+                        if partial:
+                            if args.log_partials:
+                                logger.write("partial", {"result": partial_result, "partial": partial})
+                            if args.debug_console:
+                                print("...", partial, flush=True)
         except KeyboardInterrupt:
             print("\nОстановлено.", flush=True)
             if args.session_summary_popup:
