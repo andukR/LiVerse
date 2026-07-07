@@ -36,10 +36,12 @@ from bible_parser_core.parser import DEFAULT_BIBLE
 from tools.holyrics import (
     MIN_RECOMMENDED_HOLYRICS_VERSION,
     REQUIRED_HOLYRICS_PERMISSIONS,
+    THEME_HOLYRICS_PERMISSIONS,
     check_holyrics_api_server,
     default_holyrics_url,
     describe_holyrics_target,
     env_setting,
+    get_holyrics_theme_options,
     post_holyrics_update,
 )
 
@@ -94,6 +96,8 @@ def holyrics_output_enabled(args: argparse.Namespace) -> bool:
 def print_holyrics_setup_notice_once(args: argparse.Namespace) -> None:
     if not holyrics_output_enabled(args) or HOLYRICS_SETUP_NOTICE_MARKER.exists():
         return
+    if os.name != "nt":
+        return
 
     print("", flush=True)
     print("Первичная настройка Holyrics для LiVerse", flush=True)
@@ -113,6 +117,73 @@ def print_holyrics_setup_notice_once(args: argparse.Namespace) -> None:
     input()
     HOLYRICS_SETUP_NOTICE_MARKER.parent.mkdir(parents=True, exist_ok=True)
     HOLYRICS_SETUP_NOTICE_MARKER.write_text("shown\n", encoding="utf-8")
+
+
+def ask_holyrics_theme_name(args: argparse.Namespace) -> None:
+    if not holyrics_output_enabled(args) or args.text or not sys.stdin.isatty():
+        return
+
+    print("", flush=True)
+    print("Выбор темы Holyrics", flush=True)
+    if not args.holyrics_token:
+        print("Holyrics: HOLYRICS_TOKEN не задан, список тем получить нельзя.", flush=True)
+        args.holyrics_theme = ""
+        setattr(args, "_holyrics_theme_id", "")
+        return
+
+    result = get_holyrics_theme_options(args)
+    if not result.get("ok"):
+        if result.get("permission_missing"):
+            print(
+                "Holyrics: в API token не хватает разрешения GetThemes, "
+                "поэтому список тем получить нельзя.",
+                flush=True,
+            )
+            print(
+                "Откройте Holyrics -> Settings -> API Server -> Manage permissions "
+                "и включите GetThemes, если хотите выбирать тему при запуске.",
+                flush=True,
+            )
+        else:
+            print("Holyrics: список тем получить не удалось.", flush=True)
+            print(f"Техническая причина: {result.get('reason')}", flush=True)
+        args.holyrics_theme = ""
+        setattr(args, "_holyrics_theme_id", "")
+        print("Holyrics: будет использована тема Bible module по умолчанию.", flush=True)
+        return
+
+    themes = list(result.get("themes") or [])
+    if not themes:
+        print("Holyrics: сохранённые темы не найдены.", flush=True)
+        args.holyrics_theme = ""
+        setattr(args, "_holyrics_theme_id", "")
+        print("Holyrics: будет использована тема Bible module по умолчанию.", flush=True)
+        return
+
+    print("0. Тема Bible module по умолчанию", flush=True)
+    for index, theme in enumerate(themes, start=1):
+        print(f"{index}. {theme['name']}", flush=True)
+    print("Введите номер темы. Enter - тема Bible module по умолчанию.", flush=True)
+
+    while True:
+        choice = input("> ").strip()
+        if not choice or choice == "0":
+            args.holyrics_theme = ""
+            setattr(args, "_holyrics_theme_id", "")
+            print("Holyrics: будет использована тема Bible module по умолчанию.", flush=True)
+            return
+        try:
+            index = int(choice)
+        except ValueError:
+            print("Введите номер из списка или нажмите Enter для темы по умолчанию.", flush=True)
+            continue
+        if 1 <= index <= len(themes):
+            theme = themes[index - 1]
+            args.holyrics_theme = theme["name"]
+            setattr(args, "_holyrics_theme_id", theme["id"])
+            print(f"Holyrics: выбрана тема: {theme['name']}", flush=True)
+            return
+        print("Введите номер из списка или нажмите Enter для темы по умолчанию.", flush=True)
 
 
 def check_holyrics_startup(args: argparse.Namespace, logger: JsonlLogger | None = None) -> None:
@@ -141,6 +212,9 @@ def check_holyrics_startup(args: argparse.Namespace, logger: JsonlLogger | None 
             print("Также проверьте, что API token имеет разрешения:", flush=True)
             for permission in REQUIRED_HOLYRICS_PERMISSIONS:
                 print(f"  - {permission}", flush=True)
+            if str(getattr(args, "holyrics_theme", "") or "").strip():
+                for permission in THEME_HOLYRICS_PERMISSIONS:
+                    print(f"  - {permission}", flush=True)
             print(f"Техническая причина: {result.get('token_info_reason')}", flush=True)
             return
 
@@ -169,6 +243,9 @@ def check_holyrics_startup(args: argparse.Namespace, logger: JsonlLogger | None 
     print("Также проверьте, что API token имеет разрешения:", flush=True)
     for permission in REQUIRED_HOLYRICS_PERMISSIONS:
         print(f"  - {permission}", flush=True)
+    if str(getattr(args, "holyrics_theme", "") or "").strip():
+        for permission in THEME_HOLYRICS_PERMISSIONS:
+            print(f"  - {permission}", flush=True)
     print(f"Техническая причина: {result.get('reason')}", flush=True)
 
 
@@ -627,13 +704,47 @@ def publish_payload(args: argparse.Namespace, payload: dict) -> dict:
 def approval_action(output: dict) -> str:
     approval = output.get("approval") or {}
     action = str(approval.get("action") or "")
-    if action in {"approve", "reject"}:
-        return action
+    if action == "reject":
+        return "reject"
+    if action == "approve":
+        if output.get("holyrics", {}).get("ok") or output.get("web", {}).get("ok"):
+            return "approve"
+        return "output_failed"
     if approval.get("reason") == "waiting_for_approval" or output.get("holyrics", {}).get("reason") == "waiting_for_approval":
         return "waiting"
     if output.get("holyrics", {}).get("ok") or output.get("web", {}).get("ok"):
         return "sent"
     return "recognized"
+
+
+def output_failure_reason(output: dict) -> str:
+    for key in ("holyrics", "web", "approval"):
+        value = output.get(key) or {}
+        reason = str(value.get("reason") or "").strip()
+        if reason and reason not in {"rejected_or_no_slide", "waiting_for_approval"}:
+            return reason
+    return "неизвестная ошибка"
+
+
+def list_audio_devices() -> int:
+    import sounddevice as sd
+
+    devices = list(sd.query_devices())
+    default_device = sd.default.device
+    default_input = default_device[0] if isinstance(default_device, (list, tuple)) else default_device
+    print("Аудиоустройства:", flush=True)
+    for index, device in enumerate(devices):
+        input_channels = int(device.get("max_input_channels") or 0)
+        output_channels = int(device.get("max_output_channels") or 0)
+        marker = " *" if index == default_input else ""
+        print(
+            f"{index}{marker}: {device.get('name')} "
+            f"(входов: {input_channels}, выходов: {output_channels})",
+            flush=True,
+        )
+    print("", flush=True)
+    print("* - вход по умолчанию. Для выбора микрофона запустите: make liverse ARGS=\"--device N\"", flush=True)
+    return 0
 
 
 def run_microphone(args: argparse.Namespace) -> int:
@@ -678,12 +789,23 @@ def run_microphone(args: argparse.Namespace) -> int:
         if status:
             print(status, file=sys.stderr)
             logger.write("audio_status", {"status": str(status)})
-        audio_queue.put(bytes(indata))
+        data = bytes(indata)
+        try:
+            samples = memoryview(data).cast("h")
+            peak = max((abs(sample) for sample in samples), default=0)
+            if peak > audio_stats["peak"]:
+                audio_stats["peak"] = peak
+            audio_stats["chunks"] += 1
+        except Exception:
+            pass
+        audio_queue.put(data)
 
     SetLogLevel(args.vosk_log_level)
     model = Model(str(args.model))
     text_buffer = VoskTextBuffer(args.vosk_buffer_parts)
     last_parsed: dict | None = None
+    audio_stats = {"chunks": 0, "peak": 0}
+    empty_final_count = 0
 
     def sample_rate_candidates() -> list[int]:
         values = [args.samplerate, 16000, 48000, 44100]
@@ -774,30 +896,49 @@ def run_microphone(args: argparse.Namespace) -> int:
         print(f"Техническая ошибка: {error}", flush=True)
         input()
 
+    def legacy_audio_input() -> dict:
+        name = "системный вход по умолчанию"
+        if args.device is not None:
+            try:
+                devices = list(sd.query_devices())
+                name = audio_device_name(devices[args.device], args.device)
+            except Exception:
+                name = f"устройство {args.device}"
+        return {
+            "device": args.device,
+            "samplerate": args.samplerate,
+            "name": name,
+            "mode": "system-default",
+        }
+
     console.status("слушаю")
     while True:
         audio_log = None
-        audio_input, all_devices, audio_errors = find_working_audio_input()
-        if audio_input is None:
-            logger.write(
-                "audio_input_not_found",
-                {
-                    "device": args.device,
-                    "samplerates": sample_rate_candidates(),
-                    "errors": audio_errors,
-                    "devices": [
-                        {
-                            "index": index,
-                            "name": device.get("name"),
-                            "max_input_channels": device.get("max_input_channels"),
-                            "max_output_channels": device.get("max_output_channels"),
-                        }
-                        for index, device in enumerate(all_devices)
-                    ],
-                },
-            )
-            wait_for_audio_device(RuntimeError("рабочий микрофон не найден"))
-            continue
+        audio_errors: list[str] = []
+        if os.name == "nt":
+            audio_input, all_devices, audio_errors = find_working_audio_input()
+            if audio_input is None:
+                logger.write(
+                    "audio_input_not_found",
+                    {
+                        "device": args.device,
+                        "samplerates": sample_rate_candidates(),
+                        "errors": audio_errors,
+                        "devices": [
+                            {
+                                "index": index,
+                                "name": device.get("name"),
+                                "max_input_channels": device.get("max_input_channels"),
+                                "max_output_channels": device.get("max_output_channels"),
+                            }
+                            for index, device in enumerate(all_devices)
+                        ],
+                    },
+                )
+                wait_for_audio_device(RuntimeError("рабочий микрофон не найден"))
+                continue
+        else:
+            audio_input = legacy_audio_input()
 
         stream_kwargs = {
             "samplerate": audio_input["samplerate"],
@@ -805,8 +946,9 @@ def run_microphone(args: argparse.Namespace) -> int:
             "dtype": "int16",
             "channels": 1,
             "callback": callback,
-            "device": audio_input["device"],
         }
+        if audio_input["device"] is not None:
+            stream_kwargs["device"] = audio_input["device"]
         try:
             stream = sd.RawInputStream(**stream_kwargs)
         except Exception as exc:
@@ -840,8 +982,15 @@ def run_microphone(args: argparse.Namespace) -> int:
                     if recognizer.AcceptWaveform(data):
                         result = json.loads(recognizer.Result())
                         text = result.get("text", "").strip()
-                        logger.write("final_raw", {"result": result, "text": text})
+                        final_audio_stats = dict(audio_stats)
+                        audio_stats["chunks"] = 0
+                        audio_stats["peak"] = 0
+                        logger.write(
+                            "final_raw",
+                            {"result": result, "text": text, "audio": final_audio_stats},
+                        )
                         if text:
+                            empty_final_count = 0
                             console.status("распознаю")
                             text_buffer.add(text)
                             candidate_texts = same_place_candidates(text_buffer.candidates(), last_parsed)
@@ -867,6 +1016,8 @@ def run_microphone(args: argparse.Namespace) -> int:
                                     console.status(f"найдена ссылка {ref}, ожидает подтверждения")
                                 elif action == "approve":
                                     console.status(f"отправлено в Holyrics: {ref}")
+                                elif action == "output_failed":
+                                    console.status(f"ошибка Holyrics: {output_failure_reason(payload['output'])}")
                                 elif action == "reject":
                                     console.status(f"отклонено: {ref}")
                                 else:
@@ -888,6 +1039,17 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 },
                             )
                             console.debug_json(payload)
+                        else:
+                            empty_final_count += 1
+                            if empty_final_count >= 3:
+                                if final_audio_stats.get("peak", 0) < 200:
+                                    console.status(
+                                        "микрофон открыт, но звук почти не поступает"
+                                    )
+                                else:
+                                    console.status(
+                                        "звук поступает, но Vosk пока не распознал речь"
+                                    )
                     else:
                         partial_result = json.loads(recognizer.PartialResult())
                         partial = partial_result.get("partial", "")
@@ -913,6 +1075,7 @@ def main() -> int:
     parser.add_argument("--samplerate", type=int, default=16000)
     parser.add_argument("--blocksize", type=int, default=8000)
     parser.add_argument("--device", type=int)
+    parser.add_argument("--list-audio-devices", action="store_true", help="Print microphone/input device list and exit.")
     parser.add_argument("--open-vocabulary", action="store_true", help="Run Vosk without generated grammar.")
     parser.add_argument(
         "--vosk-buffer-parts",
@@ -995,9 +1158,16 @@ def main() -> int:
         default=env_setting("HOLYRICS_TOKEN"),
         help="Holyrics API token. Can also be set via HOLYRICS_TOKEN or .env.",
     )
+    parser.add_argument(
+        "--holyrics-theme",
+        default=env_setting("HOLYRICS_THEME"),
+        help="Holyrics theme name for Bible verse display. Empty uses Holyrics Bible module default.",
+    )
     parser.add_argument("--holyrics-timeout", type=float, default=float(env_setting("HOLYRICS_TIMEOUT", "1.5")))
     parser.set_defaults(session_summary_popup=True)
     args = parser.parse_args()
+    if args.list_audio_devices:
+        return list_audio_devices()
     if args.print_grammar_json:
         grammar_json = json.dumps(build_grammar(), ensure_ascii=False)
         if args.grammar_output:
@@ -1008,6 +1178,7 @@ def main() -> int:
         return 0
     configure_interactive_approval_mode(args)
     print_holyrics_setup_notice_once(args)
+    ask_holyrics_theme_name(args)
 
     if args.text:
         grammar = None if args.open_vocabulary else build_grammar()

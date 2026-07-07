@@ -53,6 +53,17 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertEqual("1 Коринфянам 2:16", result.get("parsed", {}).get("ref"))
 
+    def test_short_first_john_with_single_n_asr_variant(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("первое иоана три два")
+
+        self.assertEqual("1 Иоанна 3:2", result.get("parsed", {}).get("ref"))
+
+        result = pipeline.process_text("первое иоана четыре восемнадцать")
+
+        self.assertEqual("1 Иоанна 4:18", result.get("parsed", {}).get("ref"))
+
     def test_nonexistent_first_corinthians_verse_does_not_match(self):
         pipeline = LiveReferencePipeline()
 

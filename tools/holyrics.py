@@ -26,6 +26,9 @@ REQUIRED_HOLYRICS_PERMISSIONS = (
     "SetBibleSettings",
     "ShowVerse",
 )
+THEME_HOLYRICS_PERMISSIONS = (
+    "GetThemes",
+)
 HOLYRICS_BOOKS = (
     "Бытие",
     "Исход",
@@ -354,6 +357,13 @@ def extract_holyrics_permissions(info: dict[str, Any] | None) -> set[str]:
     return set()
 
 
+def required_holyrics_permissions(args: Any) -> tuple[str, ...]:
+    permissions = list(REQUIRED_HOLYRICS_PERMISSIONS)
+    if str(getattr(args, "holyrics_theme", "") or "").strip():
+        permissions.extend(THEME_HOLYRICS_PERMISSIONS)
+    return tuple(dict.fromkeys(permissions))
+
+
 def check_holyrics_api_server(args: Any) -> dict[str, Any]:
     reasons: list[str] = []
     auto_target = str(getattr(args, "holyrics_url", "auto")).strip().lower() == "auto"
@@ -363,7 +373,7 @@ def check_holyrics_api_server(args: Any) -> dict[str, Any]:
             token_ok, token_reason, token_info = get_holyrics_token_info(args, url)
             permissions = extract_holyrics_permissions(token_info)
             missing_permissions = [
-                permission for permission in REQUIRED_HOLYRICS_PERMISSIONS if permission not in permissions
+                permission for permission in required_holyrics_permissions(args) if permission not in permissions
             ] if permissions else []
             if auto_target:
                 setattr(args, "holyrics_url", url)
@@ -394,6 +404,108 @@ def check_holyrics_api_server(args: Any) -> dict[str, Any]:
     }
 
 
+def extract_holyrics_data_list(body: str) -> list[dict[str, Any]]:
+    if not body:
+        return []
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return []
+    data = parsed.get("data") if isinstance(parsed, dict) else None
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict)]
+
+
+def get_holyrics_theme_options(args: Any) -> dict[str, Any]:
+    reasons: list[str] = []
+    auto_target = str(getattr(args, "holyrics_url", "auto")).strip().lower() == "auto"
+    for url in holyrics_candidate_urls(getattr(args, "holyrics_url", "auto")):
+        api_ok, api_reason, _api_info = get_holyrics_api_server_info(args, url)
+        if not api_ok:
+            reasons.append(f"{url}={api_reason}")
+            continue
+
+        token_ok, token_reason, token_info = get_holyrics_token_info(args, url)
+        if not token_ok:
+            return {
+                "ok": False,
+                "url": url,
+                "reason": token_reason,
+                "permission_missing": False,
+                "themes": [],
+            }
+
+        permissions = extract_holyrics_permissions(token_info)
+        if "GetThemes" not in permissions:
+            return {
+                "ok": False,
+                "url": url,
+                "reason": "permission_missing:GetThemes",
+                "permission_missing": True,
+                "themes": [],
+            }
+
+        themes_ok, themes_reason, body = post_holyrics_api(args, url, "GetThemes", {})
+        if not themes_ok:
+            return {
+                "ok": False,
+                "url": url,
+                "reason": themes_reason,
+                "permission_missing": themes_reason == "holyrics_http_401",
+                "themes": [],
+            }
+
+        themes = [
+            {
+                "id": str(theme.get("id") or "").strip(),
+                "name": str(theme.get("name") or "").strip(),
+            }
+            for theme in extract_holyrics_data_list(body)
+        ]
+        themes = [theme for theme in themes if theme["id"] and theme["name"]]
+        if auto_target:
+            setattr(args, "holyrics_url", url)
+        return {"ok": True, "url": url, "reason": "", "permission_missing": False, "themes": themes}
+
+    return {
+        "ok": False,
+        "url": "",
+        "reason": ";".join(reasons) or "holyrics_unavailable",
+        "permission_missing": False,
+        "themes": [],
+    }
+
+
+def resolve_holyrics_theme_id(args: Any, base_url: str, theme_name: str) -> tuple[str | None, str]:
+    requested = theme_name.strip()
+    if not requested:
+        return None, ""
+
+    ok, reason, body = post_holyrics_api(args, base_url, "GetThemes", {})
+    if not ok:
+        holyrics_log(f"GetThemes response={body or reason or 'error'}")
+        if reason == "holyrics_http_401":
+            return None, "holyrics_theme_permission_missing:GetThemes"
+        return None, reason
+
+    themes = extract_holyrics_data_list(body)
+    requested_key = requested.casefold()
+    for theme in themes:
+        name = str(theme.get("name") or "").strip()
+        if name.casefold() == requested_key:
+            theme_id = str(theme.get("id") or "").strip()
+            if theme_id:
+                return theme_id, ""
+
+    names = sorted(str(theme.get("name") or "").strip() for theme in themes if str(theme.get("name") or "").strip())
+    if names:
+        preview = ", ".join(names[:12])
+        suffix = "" if len(names) <= 12 else ", ..."
+        return None, f"holyrics_theme_not_found:{requested};available:{preview}{suffix}"
+    return None, f"holyrics_theme_not_found:{requested}"
+
+
 def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, str]:
     verse_id, reason = holyrics_verse_id(payload)
     ref = str(payload.get("ref") or "").strip()
@@ -405,11 +517,29 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
     show_x_verses = holyrics_show_verse_count(payload)
     holyrics_log(f"show_x_verses={show_x_verses}")
 
+    settings_payload: dict[str, Any] = {"show_x_verses": show_x_verses}
+    theme_name = str(getattr(args, "holyrics_theme", "") or "").strip()
+    if theme_name:
+        theme_id = str(getattr(args, "_holyrics_theme_id", "") or "").strip()
+        if not theme_id:
+            theme_id, theme_reason = resolve_holyrics_theme_id(args, base_url, theme_name)
+            if not theme_id:
+                if theme_reason == "holyrics_theme_permission_missing:GetThemes":
+                    holyrics_log(
+                        "не удалось выбрать тему: нет разрешения GetThemes; "
+                        "использую тему Bible module по умолчанию"
+                    )
+                else:
+                    return False, theme_reason
+        if theme_id:
+            setattr(args, "_holyrics_theme_id", theme_id)
+            settings_payload["theme"] = {"public": theme_id}
+
     settings_ok, settings_reason, settings_body = post_holyrics_api(
         args,
         base_url,
         "SetBibleSettings",
-        {"show_x_verses": show_x_verses},
+        settings_payload,
     )
     holyrics_log(f"SetBibleSettings response={settings_body or settings_reason or 'ok'}")
     if not settings_ok:

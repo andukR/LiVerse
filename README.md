@@ -117,18 +117,26 @@ python3 tools/vosk_grammar_probe.py --log-audio
 HOLYRICS_TOKEN=...
 HOLYRICS_HOST=http://localhost
 HOLYRICS_PORT=8091
+HOLYRICS_THEME=
 ```
 
 `HOLYRICS_TOKEN` - это token из `Holyrics -> Settings -> API Server -> Manage permissions`.
 Это не Web `API_KEY`. Для Local API token передаётся в URL.
 `HOLYRICS_PORT=8091` - порт Holyrics API Server по умолчанию. Если в настройках
 Holyrics API Server указан другой порт, запишите его в `.env`.
+`HOLYRICS_THEME` - запасной параметр для неинтерактивного запуска. При обычном
+запуске LiVerse спрашивает тему после выбора режима работы и способа
+подтверждения. Если в API token есть разрешение `GetThemes`, LiVerse покажет
+список тем Holyrics. Enter или `0` оставляет тему Bible module по умолчанию.
+Если `GetThemes` не включён, LiVerse сообщит об этом и продолжит с темой по
+умолчанию.
 
 В Holyrics API Server Local должны быть разрешены:
 
 - `GetAPIServerInfo` - стартовая проверка, что Holyrics API Server доступен
 - `ShowVerse`
 - `SetBibleSettings`
+- `GetThemes` - для показа списка тем при запуске
 
 LiVerse также вызывает служебный запрос `GetTokenInfo`, чтобы проверить версию
 Holyrics и список разрешений текущего token. Отдельно включать `GetTokenInfo`
