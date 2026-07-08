@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from bible_parser_core.book_aliases import book_synonyms
-from bible_parser_core.parser import DEFAULT_BIBLE, NUMBER_WORDS, ParsedReference, parse_live_reference
+from bible_parser_core.parser import DEFAULT_BIBLE, NUMBER_WORDS, ParsedReference, normalize_text, parse_live_reference
 from bible_parser_core.parser import diagnose_invalid_reference
 from bible_parser_core.reference_resolver import (
     resolve_best_reference_candidate,
@@ -33,6 +33,7 @@ REFERENCE_WORDS = {
     "откровение",
     "откройте",
     "откроем",
+    "по",
     "послание",
     "послания",
     "пророк",
@@ -48,6 +49,15 @@ REFERENCE_WORDS = {
     "конец",
     "конца",
     "читаем",
+}
+VOSK_GRAMMAR_EXTRA_WORDS = {
+    "четвёртая",
+    "четвёртого",
+    "четвёртое",
+    "четвёртой",
+    "четвёртую",
+    "четвёртые",
+    "четвёртый",
 }
 VOSK_SMALL_RU_MISSING_WORDS = {
     "авакум",
@@ -163,6 +173,8 @@ def build_grammar() -> list[str]:
         add_phrase(word)
     for word in NUMBER_WORDS:
         add_phrase(word)
+    for word in VOSK_GRAMMAR_EXTRA_WORDS:
+        add_phrase(word)
     phrases.add("[unk]")
     return sorted(phrases)
 
@@ -176,6 +188,8 @@ def grammar_diagnostics(grammar: list[str]) -> dict[str, Any]:
             "псалом": "псалом" in grammar,
             "двадцать": "двадцать" in grammar,
             "четыре": "четыре" in grammar,
+            "четвёртого": "четвёртого" in grammar,
+            "по": "по" in grammar,
             "седьмой": "седьмой" in grammar,
         },
         "filtered_missing_words_count": len(VOSK_SMALL_RU_MISSING_WORDS),
@@ -216,9 +230,75 @@ EXPLICIT_GOSPEL_FORMS = {
 }
 
 
+def incomplete_reference_prefix(prefix: str) -> bool:
+    normalized = normalize_book_form(prefix)
+    return bool(
+        re.search(
+            r"(?:^|\s)(?:[1-4]\s+|перв\w*\s+|втор\w*\s+|трет\w*\s+|четверт\w*\s+)?послани[ея]\s+к\s*$",
+            normalized,
+        )
+    )
+
+
+def explicit_book_reference_text(text: str) -> bool:
+    normalized = normalize_book_form(text)
+    if not re.search(r"\b(?:глава|главы|главе|стих|стиха|стихи|стихов|псалом)\b", normalized):
+        return False
+    return any(re.search(rf"\b{re.escape(form)}\b", normalized) for form in BOOK_ONLY_FORMS)
+
+
+def command_suffix_reference(text: str, bible_path: Path = DEFAULT_BIBLE) -> ParsedReference | None:
+    normalized = normalize_book_form(text)
+    for match in re.finditer(r"\b(?:читаем|прочитаем|откройте|откроем|открываем)\b", normalized):
+        prefix = normalized[: match.start()].strip()
+        suffix = normalized[match.start() :].strip()
+        if not prefix or not suffix:
+            continue
+        if not incomplete_reference_prefix(prefix):
+            continue
+        if not explicit_book_reference_text(suffix):
+            continue
+        parsed = parse_live_reference(suffix, bible_path=bible_path)
+        if parsed:
+            return parsed
+    return None
+
+
+def missing_twenty_range_reference(
+    text: str,
+    parsed: ParsedReference,
+    bible_path: Path = DEFAULT_BIBLE,
+) -> ParsedReference | None:
+    normalized = normalize_text(text)
+    for match in re.finditer(r"\b(1[1-9]|20)\s+([1-9])\s+стих\b", normalized):
+        start_verse = int(match.group(1))
+        end_verse = 20 + int(match.group(2))
+        if start_verse != parsed.start_verse or end_verse <= start_verse:
+            continue
+        repaired_text = f"{normalized[:match.start()]}{start_verse} {end_verse} стих{normalized[match.end():]}"
+        repaired = parse_live_reference(repaired_text, bible_path=bible_path)
+        if not repaired:
+            continue
+        if (
+            repaired.book == parsed.book
+            and repaired.start_verse == start_verse
+            and repaired.end_verse == end_verse
+        ):
+            return repaired
+    return None
+
+
 def resolve_reference_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, show_candidates: bool = False) -> dict:
     parsed = parse_live_reference(text, bible_path=bible_path)
     source = "parser"
+    suffix_parsed = command_suffix_reference(text, bible_path=bible_path) if parsed else None
+    if suffix_parsed and suffix_parsed.ref != parsed.ref:
+        parsed = suffix_parsed
+        source = "parser_suffix"
+    missing_twenty_parsed = missing_twenty_range_reference(text, parsed, bible_path=bible_path) if parsed else None
+    if missing_twenty_parsed and missing_twenty_parsed.ref != parsed.ref:
+        parsed = missing_twenty_parsed
+        source = "parser_missing_twenty_range"
     resolved = None
     invalid_reference = None
     if parsed is None:
@@ -392,14 +472,224 @@ def context_prefix(candidate: str, current_text: str) -> str:
     return candidate[: -len(current_text)].strip()
 
 
+def explicit_reference_context(prefix: str) -> bool:
+    normalized_prefix = normalize_book_form(prefix)
+    if not normalized_prefix:
+        return False
+    words = normalized_prefix.split()
+    if len(words) > 8:
+        return False
+    if not re.search(
+        r"\b(?:читаем|откроем|откройте|книг[аи]?|евангелие|послани[ея]|пророка|глава|главы)\b",
+        normalized_prefix,
+    ):
+        return False
+    book_hits = [
+        form
+        for form in BOOK_ONLY_FORMS
+        if form and re.search(rf"\b{re.escape(form)}\b", normalized_prefix)
+    ]
+    return 1 <= len(book_hits) <= 2
+
+
+def explicit_reference_suffix(text: str) -> bool:
+    normalized = normalize_book_form(text)
+    return bool(re.search(r"\b(?:глава|главы|стих|стиха|стихи|стихов|с|по)\b", normalized))
+
+
 def acceptable_buffer_context(candidate: str, current_text: str) -> bool:
     prefix = context_prefix(candidate, current_text)
     if not prefix:
         return False
     if likely_book_only_fragment(prefix):
         return True
+    if explicit_reference_context(prefix) and explicit_reference_suffix(current_text):
+        return True
     normalized_prefix = normalize_book_form(prefix)
     return any(re.search(rf"\b{re.escape(form)}\b", normalized_prefix) for form in EXPLICIT_GOSPEL_FORMS)
+
+
+def has_reference_marker(text: str) -> bool:
+    normalized = normalize_book_form(text)
+    return bool(
+        re.search(
+            r"\b(?:глава|главы|главе|стих|стиха|стихи|стихов|книга|книги|евангелие|послани[ея]|пророка|псалом)\b",
+            normalized,
+        )
+    )
+
+
+def should_block_matched_payload(payload: dict) -> str | None:
+    parsed = payload.get("parsed") or {}
+    if not parsed:
+        return None
+
+    text = str(payload.get("text") or "")
+    normalized = normalize_text(text)
+    words = normalized.split()
+    ref = str(parsed.get("ref") or "")
+    source = str(payload.get("source") or "")
+
+    if (
+        re.search(r"\bевангелие\s+от\b", normalized)
+        and not re.search(r"\b(?:матфея|марка|луки|иоанна)\b", normalized)
+    ):
+        return "gospel_without_book_name"
+
+    if (
+        re.search(r"\b(?:книга\s+)?пророка\s+\S+\s+\d+\s+глава\b", normalized)
+        and not re.search(r"\bстих", normalized)
+    ):
+        return "prophet_book_chapter_without_verse"
+
+    if (
+        ref in {"1 Тимофею", "2 Тимофею"} or re.match(r"^[12]\s+Тимофею\b", ref)
+    ) and re.search(r"\bтимофе[яю]\b", normalized):
+        if not re.search(r"\b[12]\s+тимофе[яю]\b", normalized):
+            return "ambiguous_numbered_timothy"
+
+    if (
+        source == "resolver"
+        and len(words) <= 3
+        and not has_reference_marker(text)
+        and re.search(r"\bяна\b", normalized)
+    ):
+        return "weak_short_yana_context"
+
+    if (
+        re.search(r"\bunk\s+\d+\s+стих\w*\s+\d+\s+глав", normalized)
+        and re.search(r"\bкниг[аи]\b", normalized)
+    ):
+        return "unknown_prefix_before_reversed_verse"
+
+    if re.fullmatch(r"\d+\s+\d+\s+моисея", normalized):
+        return "weak_short_moses_context"
+
+    if (
+        re.search(r"\b[1234]\s+царств\b", ref, flags=re.IGNORECASE)
+        and re.search(r"\bс\b|\bпо\b", normalized)
+        and not re.search(r"\bглава|главы|главе\b", normalized)
+        and re.search(r"\b[1234]\s+книги\s+царств\b", normalized)
+    ):
+        return "numbered_kingdoms_range_without_chapter"
+
+    if (
+        re.search(r"\bглава\s*$", normalized)
+        and "стих" not in normalized
+        and ref == "Иисус Навин 14:14"
+    ):
+        return "joshua_chapter_suffix_without_verse"
+
+    return None
+
+
+def blocked_payload(payload: dict, reason: str) -> dict:
+    result = dict(payload)
+    result["matched"] = False
+    result["parsed"] = None
+    result["source"] = None
+    result["blocked_weak_context"] = reason
+    return result
+
+
+def score_reference_risk(payload: dict, asr_result: dict | None = None) -> dict:
+    text = str(payload.get("text") or "")
+    vosk_text = str(payload.get("vosk_text") or "")
+    normalized = normalize_text(f"{text} {vosk_text}")
+    words = asr_result.get("result") if isinstance(asr_result, dict) else []
+    word_items = [item for item in words if isinstance(item, dict)]
+    reasons: list[str] = []
+    score = 0.0
+    metrics: dict[str, Any] = {}
+
+    unknown_count = len(re.findall(r"\bunk\b", normalized))
+    if unknown_count:
+        score += min(0.4, 0.25 * unknown_count)
+        reasons.append("contains_unk")
+    metrics["unknown_words"] = unknown_count
+
+    confidences: list[float] = []
+    starts: list[float] = []
+    ends: list[float] = []
+    for item in word_items:
+        try:
+            confidences.append(float(item.get("conf")))
+        except (TypeError, ValueError):
+            pass
+        try:
+            starts.append(float(item.get("start")))
+            ends.append(float(item.get("end")))
+        except (TypeError, ValueError):
+            pass
+
+    if confidences:
+        min_confidence = min(confidences)
+        avg_confidence = sum(confidences) / len(confidences)
+        metrics["min_confidence"] = round(min_confidence, 3)
+        metrics["avg_confidence"] = round(avg_confidence, 3)
+        if min_confidence < 0.65:
+            score += 0.25
+            reasons.append("low_word_confidence")
+        if avg_confidence < 0.8:
+            score += 0.15
+            reasons.append("low_average_confidence")
+    elif payload.get("parsed"):
+        score += 0.15
+        reasons.append("missing_word_confidence")
+
+    if starts and ends and max(ends) > min(starts):
+        duration = max(ends) - min(starts)
+        words_per_second = len(word_items) / duration
+        metrics["speech_duration_seconds"] = round(duration, 3)
+        metrics["words_per_second"] = round(words_per_second, 3)
+        if words_per_second >= 4.8:
+            score += 0.3
+            reasons.append("very_fast_speech")
+        elif words_per_second >= 3.6:
+            score += 0.15
+            reasons.append("fast_speech")
+
+    if len(payload.get("vosk_buffer") or []) > 1 and text and vosk_text and text != vosk_text:
+        score += 0.1
+        reasons.append("assembled_from_buffer")
+
+    if re.search(r"\b(?:данила|яков|яна)\b", normalized):
+        score += 0.15
+        reasons.append("confusable_book_form")
+
+    if payload.get("source") == "resolver":
+        score += 0.15
+        reasons.append("resolved_by_fuzzy_match")
+    if payload.get("source") == "parser_missing_twenty_range":
+        score += 0.2
+        reasons.append("missing_twenty_range_repair")
+    if payload.get("blocked_weak_context"):
+        score += 0.2
+        reasons.append("blocked_weak_context")
+
+    score = min(1.0, round(score, 3))
+    if score >= 0.6:
+        level = "high"
+    elif score >= 0.3:
+        level = "medium"
+    else:
+        level = "low"
+
+    return {
+        "score": score,
+        "level": level,
+        "reasons": reasons,
+        "metrics": metrics,
+    }
+
+
+def add_risk_score(payload: dict, asr_result: dict | None = None) -> dict:
+    risk = score_reference_risk(payload, asr_result=asr_result)
+    payload["risk"] = risk
+    payload["risk_score"] = risk["score"]
+    payload["risk_level"] = risk["level"]
+    payload["risk_reasons"] = risk["reasons"]
+    return payload
 
 
 def same_place_candidates(candidates: list[str], last_parsed: dict | ParsedReference | None) -> list[str]:
@@ -448,6 +738,11 @@ def parsed_payload_from_candidates(
     ]
     for index, payload in enumerate(attempts):
         if payload.get("matched"):
+            weak_context_reason = should_block_matched_payload(payload)
+            if weak_context_reason:
+                first_payload = attempts[0]
+                first_payload["attempts"] = attempt_summaries[1:]
+                return blocked_payload(first_payload, weak_context_reason)
             first_text = str(attempts[0].get("text") or "") if attempts else ""
             parsed = payload.get("parsed") or {}
             previous_ref = (
@@ -542,6 +837,7 @@ class LiveReferencePipeline:
         payload["delta_ms"] = delta_ms
         payload["buffer_window_ms"] = self.buffer_window_ms
         payload["buffer_reset_by_gap"] = buffer_reset_by_gap
+        add_risk_score(payload, asr_result=asr_result)
         if payload.get("parsed"):
             self.last_parsed = payload["parsed"]
             if open_range_start_fragment(str(payload.get("text") or "")):

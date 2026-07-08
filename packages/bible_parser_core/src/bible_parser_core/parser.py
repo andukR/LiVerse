@@ -440,6 +440,10 @@ def normalize_text(text: str) -> str:
     normalized = " ".join(tokens)
     normalized = re.sub(r"\b1\s+книг\w*\s+(?:пар|пара)липомин[а-я]*\b", "1 паралипоменон", normalized)
     normalized = re.sub(r"\b2\s+книг\w*\s+(?:пар|пара)липомин[а-я]*\b", "2 паралипоменон", normalized)
+    normalized = re.sub(r"\b([12])\s+послание\s+коринфянам\b", r"\1 коринфянам", normalized)
+    normalized = re.sub(r"\b([12])\s+послание\s+тимофею\b", r"\1 тимофею", normalized)
+    normalized = re.sub(r"\b([12])\s+послание\s+петра\b", r"\1 петра", normalized)
+    normalized = re.sub(r"\b([123])\s+послание\s+иоанна\b", r"\1 иоанна", normalized)
     normalized = re.sub(r"\b1\s+послание\s+(?:апостола\s+павл[аы]\s+)?фессалоникийцам\b", "1 фессалоникийцам", normalized)
     normalized = re.sub(r"\b2\s+послание\s+(?:апостола\s+павл[аы]\s+)?фессалоникийцам\b", "2 фессалоникийцам", normalized)
     normalized = re.sub(r"\b(\d+)\s+голова\b", r"\1 глава", normalized)
@@ -594,6 +598,10 @@ def fuzzy_range_before_stich(tokens: list[str], stich_index: int, chapter_map: d
                     adjusted = (first_value // 10) * 10 + second_value
                     if adjusted > first_value and adjusted in chapter_map:
                         second_value = adjusted
+                if first_value < 10 and second_value >= 20:
+                    adjusted_first = (second_value // 10) * 10 + first_value
+                    if first_value < adjusted_first < second_value and adjusted_first in chapter_map:
+                        first_value = adjusted_first
                 if first_value >= second_value:
                     continue
                 if first_value not in chapter_map or second_value not in chapter_map:
@@ -914,8 +922,16 @@ def ref_candidates(normalized: str, book: str, bible: dict[str, dict[int, dict[i
                     list(range(start_verse, end_verse + 1)),
                     match.start(),
                     match.end(),
-                    score,
-                )
+                        score,
+                    )
+
+    for match in re.finditer(r"(\d+)\s+глава\s+(?:с\s+)?(\d)\s+([2-9]\d)\s+стих", normalized):
+        chapter = int(match.group(1))
+        start_digit = int(match.group(2))
+        end_verse = int(match.group(3))
+        start_verse = (end_verse // 10) * 10 + start_digit
+        if start_digit < start_verse < end_verse:
+            add(chapter, list(range(start_verse, end_verse + 1)), match.start(), match.end(), 0.995)
 
     if book in ONE_CHAPTER_BOOKS:
         chapter_map = chapters.get(1, {})

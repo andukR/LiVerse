@@ -25,6 +25,7 @@ if str(CORE_SRC) not in sys.path:
 
 from bible_parser_core.live_pipeline import (
     VoskTextBuffer,
+    add_risk_score,
     build_grammar,
     expand_nehemiah_confusable_candidates,
     expand_joel_confusable_candidates,
@@ -58,6 +59,17 @@ ENTER_KEYS = {"\r", "\n"}
 SPACE_KEYS = {" "}
 
 
+def format_timecode(seconds: float) -> str:
+    total_milliseconds = max(0, int(round(seconds * 1000)))
+    milliseconds = total_milliseconds % 1000
+    total_seconds = total_milliseconds // 1000
+    seconds_part = total_seconds % 60
+    total_minutes = total_seconds // 60
+    minutes = total_minutes % 60
+    hours = total_minutes // 60
+    return f"{hours:02d}:{minutes:02d}:{seconds_part:02d}.{milliseconds:03d}"
+
+
 class JsonlLogger:
     def __init__(self, log_dir: Path, enabled: bool = True) -> None:
         self.enabled = enabled
@@ -87,6 +99,17 @@ class JsonlLogger:
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+
+    def write_trigger_case(self, payload: dict) -> None:
+        if not self.enabled or self.run_dir is None:
+            return
+        path = self.run_dir / "trigger_cases.jsonl"
+        row = {
+            "ts": datetime.now().isoformat(timespec="milliseconds"),
+            **payload,
+        }
+        with path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def holyrics_output_enabled(args: argparse.Namespace) -> bool:
@@ -506,6 +529,10 @@ def payload_summary(payload: dict) -> dict:
         "invalid_reference": invalid_reference,
         "message": payload.get("message"),
         "attempts": payload.get("attempts") or [],
+        "risk_score": payload.get("risk_score"),
+        "risk_level": payload.get("risk_level"),
+        "risk_reasons": payload.get("risk_reasons") or [],
+        "risk": payload.get("risk") or {},
     }
 
 
@@ -726,6 +753,38 @@ def output_failure_reason(output: dict) -> str:
     return "неизвестная ошибка"
 
 
+def trigger_time_info(asr_result: dict, fallback_seconds: float, preroll: float = 8.0, postroll: float = 3.0) -> dict:
+    words = asr_result.get("result") if isinstance(asr_result, dict) else None
+    if isinstance(words, list) and words:
+        starts = [
+            float(item.get("start"))
+            for item in words
+            if isinstance(item, dict) and isinstance(item.get("start"), (int, float))
+        ]
+        ends = [
+            float(item.get("end"))
+            for item in words
+            if isinstance(item, dict) and isinstance(item.get("end"), (int, float))
+        ]
+        start = min(starts) if starts else fallback_seconds
+        end = max(ends) if ends else fallback_seconds
+    else:
+        start = fallback_seconds
+        end = fallback_seconds
+
+    center = max(0.0, end)
+    window_start = max(0.0, start - preroll)
+    window_end = max(window_start, end + postroll)
+    return {
+        "timecode_seconds": round(center, 3),
+        "timecode": format_timecode(center),
+        "window_start_seconds": round(window_start, 3),
+        "window_start": format_timecode(window_start),
+        "window_end_seconds": round(window_end, 3),
+        "window_end": format_timecode(window_end),
+    }
+
+
 def list_audio_devices() -> int:
     import sounddevice as sd
 
@@ -767,6 +826,7 @@ def run_microphone(args: argparse.Namespace) -> int:
             "open_vocabulary": args.open_vocabulary,
             "vosk_buffer_parts": args.vosk_buffer_parts,
             "log_audio": args.log_audio,
+            "trigger_cases": "trigger_cases.jsonl",
             "slide_output": args.slide_output,
             "require_approval": args.require_approval,
             "approval_ui": args.approval_ui,
@@ -806,6 +866,7 @@ def run_microphone(args: argparse.Namespace) -> int:
     last_parsed: dict | None = None
     audio_stats = {"chunks": 0, "peak": 0}
     empty_final_count = 0
+    trigger_case_count = 0
 
     def sample_rate_candidates() -> list[int]:
         values = [args.samplerate, 16000, 48000, 44100]
@@ -966,12 +1027,15 @@ def run_microphone(args: argparse.Namespace) -> int:
             recognizer_args.append(json.dumps(grammar, ensure_ascii=False))
         recognizer = KaldiRecognizer(*recognizer_args)
         recognizer.SetWords(True)
+        audio_bytes_seen = 0
+        audio_path = ""
         if args.log_audio and logger.run_dir:
-            audio_log = wave.open(str(logger.run_dir / "audio.wav"), "wb")
+            audio_path = str(logger.run_dir / "audio.wav")
+            audio_log = wave.open(audio_path, "wb")
             audio_log.setnchannels(1)
             audio_log.setsampwidth(2)
             audio_log.setframerate(audio_input["samplerate"])
-            logger.write("audio_log", {"path": str(logger.run_dir / "audio.wav")})
+            logger.write("audio_log", {"path": audio_path})
 
         try:
             with stream:
@@ -979,6 +1043,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                     data = audio_queue.get()
                     if audio_log:
                         audio_log.writeframes(data)
+                    audio_bytes_seen += len(data)
                     if recognizer.AcceptWaveform(data):
                         result = json.loads(recognizer.Result())
                         text = result.get("text", "").strip()
@@ -1007,6 +1072,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                             payload["asr"] = result
                             payload["vosk_text"] = text
                             payload["vosk_buffer"] = list(text_buffer.parts)
+                            add_risk_score(payload, asr_result=result)
                             payload["output"] = publish_payload(args, payload)
                             if payload.get("slide"):
                                 action = approval_action(payload["output"])
@@ -1022,6 +1088,27 @@ def run_microphone(args: argparse.Namespace) -> int:
                                     console.status(f"отклонено: {ref}")
                                 else:
                                     console.status(f"найдена ссылка: {ref}")
+                                trigger_case_count += 1
+                                bytes_per_second = max(1, int(audio_input["samplerate"]) * 2)
+                                fallback_seconds = audio_bytes_seen / bytes_per_second
+                                time_info = trigger_time_info(result, fallback_seconds)
+                                logger.write_trigger_case(
+                                    {
+                                        "case_id": f"trigger_{trigger_case_count:04d}",
+                                        "status": "unreviewed",
+                                        "review_category": "",
+                                        "audio": audio_path,
+                                        **time_info,
+                                        "action": action,
+                                        "ref": ref,
+                                        "vosk_text": text,
+                                        "vosk_buffer": list(text_buffer.parts),
+                                        "payload": payload_summary(payload),
+                                        "output": payload["output"],
+                                        "asr": result,
+                                        "note": "",
+                                    }
+                                )
                             elif payload.get("message"):
                                 console.status(str(payload["message"]))
                             else:
@@ -1096,7 +1183,18 @@ def main() -> int:
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR)
     parser.add_argument("--no-log", action="store_true", help="Disable JSONL logging.")
     parser.add_argument("--log-partials", action="store_true", help="Log Vosk partial results too.")
-    parser.add_argument("--log-audio", action="store_true", help="Save microphone audio to audio.wav in the run log.")
+    parser.add_argument(
+        "--log-audio",
+        dest="log_audio",
+        action="store_true",
+        help="Save microphone audio to audio.wav in the run log. Enabled by default.",
+    )
+    parser.add_argument(
+        "--no-log-audio",
+        dest="log_audio",
+        action="store_false",
+        help="Do not save microphone audio for this run.",
+    )
     parser.add_argument(
         "--print-grammar-json",
         action="store_true",
@@ -1164,7 +1262,7 @@ def main() -> int:
         help="Holyrics theme name for Bible verse display. Empty uses Holyrics Bible module default.",
     )
     parser.add_argument("--holyrics-timeout", type=float, default=float(env_setting("HOLYRICS_TIMEOUT", "1.5")))
-    parser.set_defaults(session_summary_popup=True)
+    parser.set_defaults(session_summary_popup=True, log_audio=True)
     args = parser.parse_args()
     if args.list_audio_devices:
         return list_audio_devices()

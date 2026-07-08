@@ -103,13 +103,39 @@ python3 tools/slide_server.py --host 0.0.0.0 --port 8765
 
 Пульт подтверждения: `http://127.0.0.1:8765/operator`
 
-Чтобы вместе с JSONL-логом сохранить аудио последнего запуска:
+Звук каждого запуска микрофона автоматически пишется для диагностики:
 
 ```bash
-python3 tools/vosk_grammar_probe.py --log-audio
+.cache/liverse/vosk_probe/<run>/audio.wav
 ```
 
-Аудио пишется в `audio.wav` рядом с `events.jsonl`.
+Каждое срабатывание LiVerse дополнительно пишется в:
+
+```bash
+.cache/liverse/vosk_probe/<run>/trigger_cases.jsonl
+```
+
+В каждой строке есть `timecode`, `window_start`, `window_end`, `vosk_text`,
+`ref`, действие оператора и результат отправки. Это нужно для разбора ложных
+срабатываний второго типа: можно открыть `audio.wav`, перейти к `timecode` и
+решить, была ли ссылка названа на самом деле. Если аудио для отдельного запуска
+не нужно, запустите с `--no-log-audio`.
+
+Для разметки таких случаев используйте аннотатор:
+
+```bash
+python3 tools/review_trigger_cases.py
+```
+
+По умолчанию он берёт последний `trigger_cases.jsonl`, проигрывает нужный
+отрезок `audio.wav` через `ffplay` или `mpv` и записывает выбранную категорию
+обратно в `trigger_cases.jsonl`. Категории включают верную ссылку, неверно
+понятую ссылку, ложное срабатывание на пароним, омоним, обычную речь, шум и
+непонятный случай.
+
+Чтобы исправить уже размеченный случай, введите в аннотаторе `к N` или
+`исправить N`, где `N` - номер случая в списке. После перехода выберите новую
+категорию `1-7`; старая разметка будет перезаписана.
 
 Если нужен вывод в Holyrics, задайте переменные окружения в `.env`:
 
@@ -241,4 +267,56 @@ make liverse LIVERSE_ARGS= ARGS="--text 'Иоанн 3:16' --slide-output none"
 
 ```bash
 liverse
+```
+
+## Replay по записям проповедей
+
+`Replay` здесь означает повторный прогон записи: LiVerse читает готовый
+аудиофайл так, будто слушает микрофон на богослужении. Это нужно для массового
+тестирования и сбора логов без присутствия на реальном служении.
+
+Показать найденные аудиофайлы и примерную длительность:
+
+```bash
+.venv/bin/python tools/replay_audio_files.py
+```
+
+Запустить один найденный файл:
+
+```bash
+.venv/bin/python tools/replay_audio_files.py --limit 1 --run
+```
+
+Запустить конкретный файл:
+
+```bash
+.venv/bin/python tools/replay_audio_files.py --audio "/path/to/audio.wav" --run
+```
+
+Запустить все найденные файлы:
+
+```bash
+.venv/bin/python tools/replay_audio_files.py --run
+```
+
+Логи пишутся в тот же каталог, что и live-логи:
+
+```bash
+.cache/liverse/vosk_probe/<run>/
+```
+
+Внутри будут `session.json`, `events.jsonl`, `audio.wav` и, если были
+срабатывания, `trigger_cases.jsonl`.
+
+Если локальных аудиофайлов недостаточно, можно скачать новую запись с YouTube,
+если установлен `yt-dlp`:
+
+```bash
+.venv/bin/python tools/replay_audio_files.py --download-url "https://www.youtube.com/watch?v=VIDEO_ID"
+```
+
+А чтобы сразу скачать и прогнать:
+
+```bash
+.venv/bin/python tools/replay_audio_files.py --download-url "https://www.youtube.com/watch?v=VIDEO_ID" --run
 ```
