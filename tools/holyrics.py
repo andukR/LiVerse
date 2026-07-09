@@ -24,6 +24,7 @@ HOLYRICS_JSLIB_DOC_URL = "https://github.com/holyrics/jslib/blob/main/README-en.
 REQUIRED_HOLYRICS_PERMISSIONS = (
     "GetAPIServerInfo",
     "SetBibleSettings",
+    "ShowText",
     "ShowVerse",
 )
 THEME_HOLYRICS_PERMISSIONS = (
@@ -507,6 +508,21 @@ def resolve_holyrics_theme_id(args: Any, base_url: str, theme_name: str) -> tupl
 
 
 def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, str]:
+    if str(payload.get("slide_type") or "").strip() == "reference_list":
+        text = slide_payload_to_holyrics_text(payload)
+        if not text:
+            return False, "holyrics_reference_list_empty"
+        show_ok, show_reason, show_body = post_holyrics_api(
+            args,
+            base_url,
+            "ShowText",
+            {"text": text},
+        )
+        holyrics_log(f"ShowText response={show_body or show_reason or 'ok'}")
+        if not show_ok:
+            return False, show_reason
+        return True, "show_text:reference_list"
+
     verse_id, reason = holyrics_verse_id(payload)
     ref = str(payload.get("ref") or "").strip()
     if not verse_id:

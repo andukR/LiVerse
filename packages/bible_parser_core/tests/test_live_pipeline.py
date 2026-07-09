@@ -160,7 +160,8 @@ class LiveReferencePipelineTest(unittest.TestCase):
         )
         self.assertFalse(pipeline.process_text("восьмая глава", now_ms=2_100).get("matched"))
         third = pipeline.process_text("с первого", now_ms=3_000)
-        self.assertEqual("Матфей 8:1", third.get("parsed", {}).get("ref"))
+        self.assertFalse(third.get("matched"))
+        self.assertEqual("incomplete_first_verse_after_chapter", third.get("blocked_weak_context"))
         self.assertTrue(third.get("buffer_kept_for_open_range"))
 
         fourth = pipeline.process_text("по пятый стих", now_ms=4_000)
@@ -185,6 +186,16 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertEqual("2 Тимофею 2:19-21", result.get("parsed", {}).get("ref"))
 
+    def test_split_open_range_without_po_uses_explicit_context(self):
+        pipeline = LiveReferencePipeline()
+
+        self.assertFalse(
+            pipeline.process_text("первое послание коринфянам третья глава", now_ms=1_000).get("matched")
+        )
+        result = pipeline.process_text("девятого двадцатую стих", now_ms=2_000)
+
+        self.assertEqual("1 Коринфянам 3:9-20", result.get("parsed", {}).get("ref"))
+
     def test_ambiguous_timothy_without_number_does_not_auto_match(self):
         pipeline = LiveReferencePipeline()
 
@@ -192,6 +203,19 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertFalse(result.get("matched"))
         self.assertEqual("ambiguous_numbered_timothy", result.get("blocked_weak_context"))
+
+    def test_timothy_text_does_not_resolve_to_john(self):
+        pipeline = LiveReferencePipeline()
+
+        pipeline.process_text("первого послания тимофею", now_ms=1_000)
+        pipeline.process_text("восьмую стих", now_ms=2_000)
+        result = pipeline.process_text(
+            "откройте послания тимофею первое тимофею пятую",
+            now_ms=3_000,
+        )
+
+        self.assertFalse(result.get("matched"))
+        self.assertEqual("resolver_conflicts_with_timothy", result.get("blocked_weak_context"))
 
     def test_explicit_numbered_timothy_still_works(self):
         pipeline = LiveReferencePipeline()
@@ -208,6 +232,234 @@ class LiveReferencePipelineTest(unittest.TestCase):
         result = pipeline.process_text("второе послание коринфянам пятого восемнадцатый стих")
 
         self.assertEqual("2 Коринфянам 5:18", result.get("parsed", {}).get("ref"))
+
+    def test_numbered_corinthians_chapter_only_does_not_become_john(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("первого послания коринфянам шестая глава")
+
+        self.assertFalse(result.get("matched"))
+        self.assertIsNone(result.get("parsed"))
+
+    def test_split_reference_uses_asr_word_timestamps_for_buffer_gap(self):
+        pipeline = LiveReferencePipeline()
+
+        first = pipeline.process_text(
+            "первого послания коринфянам шестая глава",
+            now_ms=1_068_250,
+            asr_result={
+                "result": [
+                    {"start": 1066.03, "end": 1066.27, "word": "первого"},
+                    {"start": 1066.27, "end": 1066.66, "word": "послания"},
+                    {"start": 1066.66, "end": 1067.11, "word": "коринфянам"},
+                    {"start": 1067.11, "end": 1067.4279, "word": "шестая"},
+                    {"start": 1067.44, "end": 1067.8, "word": "глава"},
+                ],
+                "text": "первого послания коринфянам шестая глава",
+            },
+        )
+        self.assertFalse(first.get("matched"))
+
+        result = pipeline.process_text(
+            "девятнадцатый двадцатая стих",
+            now_ms=1_071_250,
+            asr_result={
+                "result": [
+                    {"start": 1069.36, "end": 1069.96, "word": "девятнадцатый"},
+                    {"start": 1069.96, "end": 1070.44, "word": "двадцатая"},
+                    {"start": 1070.44, "end": 1070.74, "word": "стих"},
+                ],
+                "text": "девятнадцатый двадцатая стих",
+            },
+        )
+
+        self.assertEqual("1 Коринфянам 6:19-20", result.get("parsed", {}).get("ref"))
+        self.assertEqual("asr_words", result.get("delta_source"))
+        self.assertLess(result.get("delta_ms"), 2_000)
+
+    def test_suspicious_feminine_first_stich_does_not_auto_match(self):
+        pipeline = LiveReferencePipeline()
+
+        self.assertFalse(pipeline.process_text("послание ефесянам третью", now_ms=1_000).get("matched"))
+        result = pipeline.process_text("первую стих", now_ms=2_000)
+
+        self.assertFalse(result.get("matched"))
+        self.assertEqual("suspicious_first_verse_form", result.get("blocked_weak_context"))
+
+    def test_incomplete_first_verse_after_chapter_waits_for_range(self):
+        pipeline = LiveReferencePipeline()
+
+        first = pipeline.process_text("откроем первая яна вторая глава первого", now_ms=1_000)
+        self.assertFalse(first.get("matched"))
+        self.assertEqual("incomplete_first_verse_after_chapter", first.get("blocked_weak_context"))
+
+        result = pipeline.process_text("по шестой стих", now_ms=2_000)
+        self.assertEqual("1 Иоанна 2:1-6", result.get("parsed", {}).get("ref"))
+
+    def test_compact_reference_without_markers_has_extra_risk(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text(
+            "римлянам четвёртого шестнадцать",
+            asr_result={
+                "result": [
+                    {"conf": 1.0, "start": 3538.08, "end": 3538.53, "word": "римлянам"},
+                    {"conf": 0.809894, "start": 3538.53, "end": 3539.165215, "word": "четвёртого"},
+                    {"conf": 0.642576, "start": 3539.19, "end": 3539.655645, "word": "шестнадцать"},
+                ],
+                "text": "римлянам четвёртого шестнадцать",
+            },
+        )
+
+        self.assertEqual("Римлянам 4:16", result.get("parsed", {}).get("ref"))
+        self.assertEqual("medium", result.get("risk_level"))
+        self.assertIn("compact_reference_without_markers", result.get("risk_reasons"))
+
+    def test_bare_numbers_first_verse_does_not_auto_match(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("числа первое первого стих")
+
+        self.assertFalse(result.get("matched"))
+        self.assertEqual("weak_bare_numbers_first_verse", result.get("blocked_weak_context"))
+
+        explicit = pipeline.process_text("книга числа первая глава первый стих")
+        self.assertEqual("Числа 1:1", explicit.get("parsed", {}).get("ref"))
+
+    def test_missing_chapter_word_after_ordinal_tens_does_not_merge_chapter_and_verse(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("исайя сороковая первого девятый стих")
+
+        self.assertEqual("Исаия 40:1-9", result.get("parsed", {}).get("ref"))
+
+    def test_cardinal_tens_can_still_form_compound_chapter_number(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("исайя сорок первого девятый стих")
+
+        self.assertEqual("Исаия 41:9", result.get("parsed", {}).get("ref"))
+
+    def test_descending_repeated_verse_is_treated_as_speaker_correction(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("бытие двадцать четвёртая глава пятьдесят вторую стих пятьдесят первое стих")
+
+        self.assertEqual("Бытие 24:51", result.get("parsed", {}).get("ref"))
+
+    def test_confusable_seventeen_eighteen_verse_adds_alternative(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("римлянам восьмая глава восемнадцатый стих")
+
+        self.assertEqual("Римлянам 8:18", result.get("parsed", {}).get("ref"))
+        refs = {item.get("ref") for item in result.get("ambiguous_alternatives") or []}
+        self.assertIn("Римлянам 8:17", refs)
+        self.assertIn("confusable_number_alternative", result.get("risk_reasons"))
+
+    def test_confusable_thirteen_thirty_chapter_adds_existing_alternative(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("бытие тридцатая глава первый стих")
+
+        self.assertEqual("Бытие 30:1", result.get("parsed", {}).get("ref"))
+        refs = {item.get("ref") for item in result.get("ambiguous_alternatives") or []}
+        self.assertIn("Бытие 13:1", refs)
+
+    def test_confusable_twelve_thirteen_verse_adds_alternative(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("римлянам восьмая глава тринадцатый стих")
+
+        self.assertEqual("Римлянам 8:13", result.get("parsed", {}).get("ref"))
+        refs = {item.get("ref") for item in result.get("ambiguous_alternatives") or []}
+        self.assertIn("Римлянам 8:12", refs)
+
+    def test_confusable_twelve_thirteen_chapter_adds_existing_alternative(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("бытие тринадцатая глава первый стих")
+
+        self.assertEqual("Бытие 13:1", result.get("parsed", {}).get("ref"))
+        refs = {item.get("ref") for item in result.get("ambiguous_alternatives") or []}
+        self.assertIn("Бытие 12:1", refs)
+
+    def test_unnumbered_corinthians_epistle_adds_colossians_alternative(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("послания коринфянам первого глава девятнадцать два второе стих")
+
+        self.assertEqual("2 Коринфянам 1:19-22", result.get("parsed", {}).get("ref"))
+        refs = {item.get("ref") for item in result.get("ambiguous_alternatives") or []}
+        self.assertIn("Колоссянам 1:19-22", refs)
+        self.assertIn("confusable_book_alternative", result.get("risk_reasons"))
+
+    def test_repeated_seventeen_or_eighteen_range_is_repaired(self):
+        pipeline = LiveReferencePipeline()
+
+        seventeen = pipeline.process_text("римлянам восьмая глава семнадцатый семнадцатый стих")
+        eighteen = pipeline.process_text("римлянам восьмая глава восемнадцатый восемнадцатый стих")
+
+        self.assertEqual("Римлянам 8:17-18", seventeen.get("parsed", {}).get("ref"))
+        self.assertEqual("parser_repeated_confusable_range", seventeen.get("source"))
+        self.assertEqual("Римлянам 8:17-18", eighteen.get("parsed", {}).get("ref"))
+        self.assertEqual("parser_repeated_confusable_range", eighteen.get("source"))
+
+    def test_repeated_psalm_references_are_returned_as_compact_list(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text(
+            "псалом девятый девятнадцатый стих "
+            "псалом тридцать восьмой восьмой стих "
+            "псалом тридцать девять пятой стих "
+            "псалом шестьдесят первый пятой стих "
+            "псалом семидесятый пятой стих седьмой стих псалом"
+        )
+
+        self.assertTrue(result.get("matched"))
+        self.assertIsNone(result.get("parsed"))
+        self.assertEqual("parser_reference_list", result.get("source"))
+        refs = [item.get("ref") for item in result.get("reference_list") or []]
+        self.assertEqual(
+            [
+                "Псалтирь 9:19",
+                "Псалтирь 38:8",
+                "Псалтирь 39:5",
+                "Псалтирь 61:5",
+                "Псалтирь 70:5-7",
+            ],
+            refs,
+        )
+
+    def test_split_psalm_range_before_psalm_title_uses_full_buffer(self):
+        pipeline = LiveReferencePipeline()
+
+        self.assertFalse(pipeline.process_text("первого по", now_ms=1_000).get("matched"))
+        self.assertFalse(pipeline.process_text("четырнадцатый стих", now_ms=2_000).get("matched"))
+        result = pipeline.process_text("псалом семьдесят второй", now_ms=3_000)
+
+        self.assertEqual("Псалтирь 72:1-14", result.get("parsed", {}).get("ref"))
+
+    def test_psalm_range_accepts_stih_misheard_as_seven_before_psalm_title(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("четвёртого по двенадцатые семь семьдесят второго псалмы")
+
+        self.assertEqual("Псалтирь 72:4-12", result.get("parsed", {}).get("ref"))
+
+    def test_psalm_without_stich_keeps_ordinal_tens_as_compound_psalm_number(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("псалом девяностый девять")
+
+        self.assertEqual("Псалтирь 99:1-5", result.get("parsed", {}).get("ref"))
+
+    def test_short_psalm_chapter_verse_without_stich_still_works(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("псалом двадцать два четыре")
+
+        self.assertEqual("Псалтирь 22:4", result.get("parsed", {}).get("ref"))
 
     def test_numbered_general_epistle_with_poslanie_still_works(self):
         pipeline = LiveReferencePipeline()

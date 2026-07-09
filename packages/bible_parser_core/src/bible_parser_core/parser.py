@@ -494,6 +494,16 @@ def number_word_value(token: str) -> tuple[int | None, bool]:
     return value, False
 
 
+def standalone_ordinal_tens(token: str) -> bool:
+    value = ORDINALS.get(token)
+    return (
+        value is not None
+        and value >= 20
+        and value % 10 == 0
+        and token not in CARDINALS
+    )
+
+
 def replace_number_words(tokens: list[str]) -> list[str]:
     result: list[str] = []
     index = 0
@@ -520,6 +530,7 @@ def replace_number_words(tokens: list[str]) -> list[str]:
             current is not None
             and following is not None
             and ((current >= 20 and following < 10) or (current >= 100 and following < 100))
+            and not standalone_ordinal_tens(tokens[index])
         ):
             result.append(str(current + following))
             index += 2
@@ -833,6 +844,17 @@ def ref_candidates(normalized: str, book: str, bible: dict[str, dict[int, dict[i
             )
         )
 
+    for match in re.finditer(r"(\d+)\s+глава\s+(\d+)\s+стих\s+(\d+)\s+стих", normalized):
+        first_verse = int(match.group(2))
+        corrected_verse = int(match.group(3))
+        if first_verse > corrected_verse:
+            add(int(match.group(1)), [corrected_verse], match.start(), match.end(), 1.5)
+
+    if book == "Псалтирь" and "стих" not in normalized:
+        for match in re.finditer(r"\bпсал\w*\s+(60|70|80|90)\s+([1-9])\b", normalized):
+            psalm = int(match.group(1)) + int(match.group(2))
+            add(psalm, [1], match.start(), match.end(), 1.04)
+
     explicit_patterns = (
         (r"(\d+)\s*:\s*(\d+)\s*-\s*(\d+)", 1, 2, 3, 1.0),
         (r"(\d+)\s*:\s*(\d+)", 1, 2, None, 1.0),
@@ -843,6 +865,8 @@ def ref_candidates(normalized: str, book: str, bible: dict[str, dict[int, dict[i
         (r"(\d+)\s+(?:из\s+тех|из|стих)\s+(\d+)\s+глава", 2, 1, None, 0.96),
         (r"с\s+(\d+)\s+(?:из\s+тех|из)\s+(\d+)\s+глава", 2, 1, None, 0.96),
         (r"(\d+)\s+псалом\s+(\d+)\s+стих", 1, 2, None, 0.98),
+        (r"(?:с\s+)?(\d+)\s+по\s+(\d+)\s+стих\s+псал\w*\s+(\d+)", 3, 1, 2, 1.02),
+        (r"(?:с\s+)?(\d+)\s+по\s+(\d+)\s+7\s+(\d+)\s+псал\w*", 3, 1, 2, 0.99),
         (r"(\d+)\s+(\d+)\s+стих\s+(\d+)\s+псал", 3, 1, 2, 0.985),
         (r"(\d+)\s+стих\s+(\d+)\s+псал", 2, 1, None, 0.98),
     )
@@ -1187,6 +1211,18 @@ def infer_chapter_and_verses(normalized: str, book: str, bible: dict[str, dict[i
         chapters = bible.get(book, {})
         if numbers[0] in chapters and 1 in chapters[numbers[0]]:
             return numbers[0], [1]
+    if (
+        chapter is None
+        and book == "Псалтирь"
+        and len(numbers) == 2
+        and "стих" not in normalized
+        and numbers[0] in {60, 70, 80, 90}
+        and 1 <= numbers[1] <= 9
+    ):
+        chapters = bible.get(book, {})
+        psalm = numbers[0] + numbers[1]
+        if psalm in chapters and 1 in chapters[psalm]:
+            return psalm, [1]
     if chapter is None and len(numbers) >= 2:
         chapters = bible.get(book, {})
         for first, second in ((numbers[0], numbers[1]), (numbers[-2], numbers[-1])):
@@ -1347,7 +1383,7 @@ def parse_live_reference(text: str, bible_path: Path = DEFAULT_BIBLE) -> ParsedR
         books = [
             candidate
             for candidate in books
-            if explicit_families.get(book_candidate_family(candidate.book), candidate.book) == candidate.book
+            if explicit_families.get(book_candidate_family(candidate.book)) == candidate.book
         ]
     book_bonuses = {id(candidate): book_candidate_specificity_bonus(candidate, books) for candidate in books}
     best: tuple[float, BookCandidate, RefCandidate] | None = None

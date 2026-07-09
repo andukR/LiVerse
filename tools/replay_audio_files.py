@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -36,11 +37,33 @@ from tools.vosk_grammar_probe import (
 
 
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".opus", ".ogg", ".flac", ".webm", ".mp4"}
+SUBTITLE_EXTENSIONS = {".srt", ".txt"}
+YOUTUBE_ID_RE = re.compile(r"(?<![A-Za-z0-9-])([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])")
+YOUTUBE_URL_RE = re.compile(
+    r"(?:youtube\.com/(?:watch\?v=|shorts/|embed/)|youtu\.be/)([A-Za-z0-9_-]{11})"
+)
+SKIP_DIR_NAMES = {
+    ".git",
+    ".gradle",
+    ".idea",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".tber",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "node_modules",
+    "site-packages",
+    "venv",
+}
 DEFAULT_SEARCH_ROOTS = (
     PROJECTS_ROOT / "bible_parser_cli" / ".cache" / "whisper_runs",
     PROJECTS_ROOT / "live_scripture_presenter" / ".cache" / "live_case_replay" / "audio",
     PROJECTS_ROOT / "liveverse-public-release" / ".cache" / "live_emulator" / "audio",
 )
+LATEST_REPLAY_BATCH = "latest_replay_batch.json"
+DEFAULT_TARGET_ANNOTATIONS = 200
 
 
 def audio_duration(path: Path) -> float | None:
@@ -102,6 +125,100 @@ def collect_audio_files(search_roots: list[Path], include_chunks: bool) -> list[
         return preferred, -path.stat().st_size, str(path)
 
     return sorted(files, key=sort_key)
+
+
+def collect_subtitle_youtube_ids(search_roots: list[Path]) -> dict[str, Path]:
+    ids: dict[str, Path] = {}
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for path in iter_subtitle_files(root):
+            for video_id in youtube_ids_from_text(path.stem):
+                ids.setdefault(video_id, path)
+            if path.name.lower().endswith(".url.txt"):
+                try:
+                    text = path.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    text = ""
+                for video_id in youtube_ids_from_text(text):
+                    ids.setdefault(video_id, path)
+    return ids
+
+
+def iter_subtitle_files(root: Path):
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = list(current.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.is_dir():
+                if entry.name in SKIP_DIR_NAMES:
+                    continue
+                stack.append(entry)
+            elif entry.is_file() and entry.suffix.lower() in SUBTITLE_EXTENSIONS:
+                yield entry
+
+
+def youtube_ids_from_text(text: str) -> list[str]:
+    ids: list[str] = []
+    seen: set[str] = set()
+    for match in YOUTUBE_URL_RE.finditer(text):
+        video_id = match.group(1)
+        if video_id not in seen:
+            ids.append(video_id)
+            seen.add(video_id)
+    for match in YOUTUBE_ID_RE.finditer(text):
+        video_id = match.group(1)
+        if not looks_like_youtube_id(video_id):
+            continue
+        if video_id not in seen:
+            ids.append(video_id)
+            seen.add(video_id)
+    return ids
+
+
+def looks_like_youtube_id(video_id: str) -> bool:
+    has_digit = any(char.isdigit() for char in video_id)
+    has_alpha = any(char.isalpha() for char in video_id)
+    has_lower = any(char.islower() for char in video_id)
+    has_upper = any(char.isupper() for char in video_id)
+    return has_alpha and (has_digit or (has_lower and has_upper))
+
+
+def collect_audio_youtube_ids(search_roots: list[Path], download_dir: Path, include_chunks: bool) -> set[str]:
+    audio_files = collect_audio_files([*search_roots, download_dir], include_chunks)
+    ids: set[str] = set()
+    for path in audio_files:
+        ids.update(youtube_ids_from_text(path.stem))
+    return ids
+
+
+def collect_audio_files_by_youtube_ids(root: Path, video_ids: list[str]) -> list[Path]:
+    if not root.exists() or not video_ids:
+        return []
+    by_id: dict[str, list[Path]] = {video_id: [] for video_id in video_ids}
+    for path in collect_audio_files([root], include_chunks=False):
+        for video_id in youtube_ids_from_text(path.stem):
+            if video_id in by_id:
+                by_id[video_id].append(path)
+    selected: list[Path] = []
+    seen: set[Path] = set()
+    for video_id in video_ids:
+        for path in by_id.get(video_id) or []:
+            resolved = resolved_path(path)
+            if resolved in seen:
+                continue
+            selected.append(path)
+            seen.add(resolved)
+            break
+    return selected
+
+
+def youtube_watch_url(video_id: str) -> str:
+    return f"https://www.youtube.com/watch?v={video_id}"
 
 
 def dedupe_audio_files(files: list[Path]) -> list[Path]:
@@ -196,16 +313,203 @@ def download_audio(urls: list[str], output_dir: Path) -> list[Path]:
         command = [
             "yt-dlp",
             "-f",
-            "bestaudio/best",
+            "bestaudio",
             "-o",
             str(output_dir / "%(title).120s_%(id)s.%(ext)s"),
             url,
         ]
-        subprocess.run(command, check=True)
+        try:
+            subprocess.run(command, check=True)
+        except subprocess.CalledProcessError as error:
+            print(
+                f"Не удалось скачать аудио: {url} "
+                f"(yt-dlp завершился с кодом {error.returncode}). Пропускаю.",
+                flush=True,
+            )
+            continue
         for path in output_dir.glob("*"):
             if path.is_file() and path.resolve() not in before and path.suffix.lower() in AUDIO_EXTENSIONS:
                 downloaded.append(path)
     return downloaded
+
+
+def write_latest_replay_batch(log_dir: Path, run_dirs: list[Path]) -> Path | None:
+    if not run_dirs:
+        return None
+    log_dir.mkdir(parents=True, exist_ok=True)
+    batch_path = log_dir / LATEST_REPLAY_BATCH
+    batch_path.write_text(
+        json.dumps(
+            {
+                "created_at": run_dirs[-1].name,
+                "runs": [str(path) for path in run_dirs],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return batch_path
+
+
+def load_jsonl(path: Path) -> list[dict]:
+    rows: list[dict] = []
+    if not path.exists():
+        return rows
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Повреждён JSONL: {path}:{line_number}: {exc}") from exc
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
+def is_unreviewed_case(case: dict) -> bool:
+    return str(case.get("status") or "unreviewed") == "unreviewed"
+
+
+def session_source_audio(cases_path: Path) -> str:
+    session_path = cases_path.parent / "session.json"
+    if not session_path.exists():
+        return ""
+    try:
+        session = json.loads(session_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    return str(session.get("source_audio") or "")
+
+
+def float_value(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def case_signature(case: dict, cases_path: Path) -> tuple[str, str, str, str, str]:
+    payload = case.get("payload") if isinstance(case.get("payload"), dict) else {}
+    source_audio = session_source_audio(cases_path) or str(case.get("audio") or "")
+    timecode = f"{float_value(case.get('timecode_seconds')):.2f}"
+    return (
+        source_audio,
+        timecode,
+        str(case.get("ref") or ""),
+        str(case.get("vosk_text") or ""),
+        str(payload.get("text") or ""),
+    )
+
+
+def trigger_case_files(log_dir: Path) -> list[Path]:
+    if not log_dir.exists():
+        return []
+    return sorted(log_dir.glob("*/trigger_cases.jsonl"), key=lambda path: path.parent.name)
+
+
+def annotation_stats(cases_paths: list[Path]) -> dict[str, int]:
+    total = 0
+    reviewed_signatures: set[tuple[str, str, str, str, str]] = set()
+    unreviewed_signatures: set[tuple[str, str, str, str, str]] = set()
+    files_with_cases = 0
+
+    loaded: list[tuple[Path, list[dict]]] = []
+    for cases_path in cases_paths:
+        cases = load_jsonl(cases_path)
+        if cases:
+            files_with_cases += 1
+        total += len(cases)
+        loaded.append((cases_path, cases))
+
+    for cases_path, cases in loaded:
+        for case in cases:
+            if not is_unreviewed_case(case):
+                reviewed_signatures.add(case_signature(case, cases_path))
+
+    for cases_path, cases in loaded:
+        for case in cases:
+            if not is_unreviewed_case(case):
+                continue
+            signature = case_signature(case, cases_path)
+            if signature not in reviewed_signatures:
+                unreviewed_signatures.add(signature)
+
+    return {
+        "files": files_with_cases,
+        "total": total,
+        "reviewed": len(reviewed_signatures),
+        "unreviewed": len(unreviewed_signatures),
+    }
+
+
+def print_annotation_summary(log_dir: Path, run_dirs: list[Path], *, target_annotations: int) -> None:
+    all_stats = annotation_stats(trigger_case_files(log_dir))
+    batch_paths = [path / "trigger_cases.jsonl" for path in run_dirs if (path / "trigger_cases.jsonl").exists()]
+    batch_stats = annotation_stats(batch_paths)
+    remaining_to_target = max(0, target_annotations - all_stats["reviewed"])
+    available_now = min(all_stats["unreviewed"], remaining_to_target) if remaining_to_target else 0
+    shortage_after_review = max(0, remaining_to_target - all_stats["unreviewed"])
+
+    print("", flush=True)
+    print("Статистика разметки:", flush=True)
+    print(
+        f"  Последняя пачка: файлов {batch_stats['files']}, "
+        f"срабатываний {batch_stats['total']}, неразмеченных {batch_stats['unreviewed']}",
+        flush=True,
+    )
+    print(
+        f"  Всего в логах: файлов {all_stats['files']}, "
+        f"срабатываний {all_stats['total']}, размечено {all_stats['reviewed']}, "
+        f"неразмечено {all_stats['unreviewed']}",
+        flush=True,
+    )
+    print(f"  Цель для оценки risk_score: {target_annotations} размеченных срабатываний", flush=True)
+    if remaining_to_target:
+        print(f"  Осталось до цели: {remaining_to_target}", flush=True)
+        print(f"  Можно разметить сейчас: {available_now}", flush=True)
+        if shortage_after_review:
+            print(
+                f"  После разметки текущих случаев нужно будет найти ещё примерно: {shortage_after_review}",
+                flush=True,
+            )
+    else:
+        print("  Цель уже достигнута.", flush=True)
+
+
+def print_discovered_youtube_ids(
+    ids_by_source: dict[str, Path],
+    existing_ids: set[str],
+    *,
+    limit: int = 0,
+    offset: int = 0,
+) -> list[str]:
+    if not ids_by_source:
+        print("YouTube ID в файлах субтитров не найдены.", flush=True)
+        return []
+    missing = [video_id for video_id in ids_by_source if video_id not in existing_ids]
+    print(f"Найдено YouTube ID в субтитрах: {len(ids_by_source)}", flush=True)
+    if existing_ids:
+        print(f"Из них уже есть в аудиофайлах: {len(ids_by_source) - len(missing)}", flush=True)
+    if missing:
+        selected = missing[offset:]
+        if limit:
+            selected = selected[:limit]
+        if offset or (limit and len(missing) > limit):
+            print(
+                f"Новые записи для скачивания: {offset + 1}..{offset + len(selected)} из {len(missing)}",
+                flush=True,
+            )
+        else:
+            print("Новые записи для скачивания:", flush=True)
+        for index, video_id in enumerate(selected, start=1):
+            print(f"{index:02d}. {video_id}  {ids_by_source[video_id]}", flush=True)
+    else:
+        print("Новых записей для скачивания нет.", flush=True)
+    return missing
 
 
 def pcm_chunks(path: Path, sample_rate: int, chunk_bytes: int):
@@ -351,7 +655,7 @@ def handle_result(
         show_candidates=args.show_candidates,
         now_ms=int(replay_seconds * 1000),
     ))
-    output = {"replay": {"enabled": True, "sent": bool(payload.get("parsed"))}}
+    output = {"replay": {"enabled": True, "sent": bool(payload.get("slide"))}}
     payload["output"] = output
     logger.write(
         "parsed",
@@ -363,12 +667,13 @@ def handle_result(
             "output": output,
         },
     )
-    if not payload.get("parsed"):
+    if not payload.get("slide"):
         return 0
 
     case_number = trigger_case_count + 1
     parsed = payload.get("parsed") or {}
-    ref = str(parsed.get("ref") or "")
+    slide = payload.get("slide") or {}
+    ref = str(parsed.get("ref") or slide.get("ref") or "")
     time_info = trigger_time_info(result, replay_seconds)
     logger.write_trigger_case(
         {
@@ -393,11 +698,23 @@ def handle_result(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Replay LiVerse over saved sermon audio files.")
     parser.add_argument("--search-root", action="append", type=Path, help="Directory to search for audio files.")
+    parser.add_argument(
+        "--subtitle-root",
+        action="append",
+        type=Path,
+        help="Directory to search for .srt/.txt files with YouTube IDs.",
+    )
     parser.add_argument("--audio", action="append", type=Path, help="Specific audio file to replay.")
     parser.add_argument("--include-chunks", action="store_true", help="Include *_chunks directories in auto search.")
     parser.add_argument("--limit", type=int, default=0, help="Limit auto-selected files.")
+    parser.add_argument("--offset", type=int, default=0, help="Skip this many auto-selected files before --limit.")
     parser.add_argument("--run", action="store_true", help="Actually run replay. Without this, only list files.")
     parser.add_argument("--download-url", action="append", default=[], help="YouTube URL to download before replay.")
+    parser.add_argument(
+        "--download-from-subtitles",
+        action="store_true",
+        help="Find YouTube IDs in .srt/.txt files and download missing audio before replay.",
+    )
     parser.add_argument(
         "--include-processed",
         action="store_true",
@@ -419,23 +736,64 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--show-candidates", action="store_true")
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR)
     parser.add_argument("--no-log", action="store_true")
+    parser.add_argument(
+        "--target-annotations",
+        type=int,
+        default=DEFAULT_TARGET_ANNOTATIONS,
+        help="Target number of reviewed trigger cases for risk_score analysis.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     search_roots = args.search_root or list(DEFAULT_SEARCH_ROOTS)
-    downloaded = download_audio(args.download_url, args.download_dir)
+    subtitle_roots = args.subtitle_root or [PROJECTS_ROOT]
+    download_urls = list(args.download_url)
+    download_video_ids: list[str] = []
+    if args.download_from_subtitles:
+        if args.download_dir not in search_roots:
+            search_roots = [*search_roots, args.download_dir]
+        ids_by_source = collect_subtitle_youtube_ids(subtitle_roots)
+        existing_ids = collect_audio_youtube_ids(search_roots, args.download_dir, args.include_chunks)
+        missing_ids = print_discovered_youtube_ids(
+            ids_by_source,
+            existing_ids,
+            limit=args.limit,
+            offset=args.offset,
+        )
+        if args.offset:
+            missing_ids = missing_ids[args.offset :]
+        if args.limit:
+            missing_ids = missing_ids[: args.limit]
+        if not args.run:
+            print("", flush=True)
+            print("Это был только список новых записей для скачивания. Для скачивания и replay добавьте --run.", flush=True)
+            return 0
+        if args.run:
+            download_video_ids = list(missing_ids)
+            download_urls.extend(youtube_watch_url(video_id) for video_id in missing_ids)
+    downloaded = download_audio(download_urls, args.download_dir)
+    if args.download_from_subtitles and args.run and download_video_ids:
+        downloaded = collect_audio_files_by_youtube_ids(args.download_dir, download_video_ids)
     explicit_audio = list(args.audio or [])
     files = [path for path in explicit_audio if path.exists()]
     auto_selected = not explicit_audio
+    selected_downloaded = False
     if not files:
-        files = collect_audio_files(search_roots, args.include_chunks)
-    files.extend(downloaded)
+        if args.download_from_subtitles and args.run and download_video_ids:
+            files = list(downloaded)
+            selected_downloaded = True
+        else:
+            files = collect_audio_files(search_roots, args.include_chunks)
+    if downloaded and not selected_downloaded:
+        files.extend(downloaded)
     skipped_processed: list[Path] = []
     if auto_selected and not args.include_processed:
         processed = collect_processed_audio_files(args.log_dir)
         files, skipped_processed = skip_processed_audio_files(files, processed)
+    if auto_selected and args.offset and not selected_downloaded:
+        files = files[args.offset :]
     if args.limit:
         files = files[: args.limit]
 
@@ -457,9 +815,25 @@ def main() -> int:
     SetLogLevel(args.vosk_log_level)
     model = Model(str(args.model))
     grammar = None if args.open_vocabulary else build_grammar()
+    run_dirs: list[Path] = []
     for index, path in enumerate(files, start=1):
         print(f"\nReplay {index}/{len(files)}: {path}", flush=True)
-        replay_audio_file(path, args, model, grammar)
+        run_dir = replay_audio_file(path, args, model, grammar)
+        if run_dir:
+            run_dirs.append(run_dir)
+    batch_path = write_latest_replay_batch(args.log_dir, run_dirs)
+    print_annotation_summary(
+        args.log_dir,
+        run_dirs,
+        target_annotations=max(0, args.target_annotations),
+    )
+    if batch_path:
+        print("", flush=True)
+        print(f"Последняя пачка replay: {batch_path}", flush=True)
+        print(
+            ".venv/bin/python tools/review_trigger_cases.py --latest-batch",
+            flush=True,
+        )
     return 0
 
 

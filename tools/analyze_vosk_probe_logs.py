@@ -8,8 +8,19 @@ import json
 from collections import Counter
 from pathlib import Path
 
+from tools.review_trigger_cases import CATEGORY_LABELS, case_signature, is_unreviewed, load_jsonl
+
 
 DEFAULT_LOG_DIR = Path(".cache/liverse/vosk_probe")
+ERROR_CATEGORIES = {
+    "vosk_distortion",
+    "false_paronym",
+    "false_homonym",
+    "false_plain_speech",
+    "false_noise",
+    "unclear",
+    "wrong_reference",
+}
 
 
 def event_paths(log_dir: Path) -> list[Path]:
@@ -34,6 +45,99 @@ def iter_events(paths: list[Path]):
                 yield path, line_number, {"event": "invalid_json", "raw": line}
                 continue
             yield path, line_number, event
+
+
+def trigger_case_paths(log_dir: Path) -> list[Path]:
+    if log_dir.is_file():
+        return [log_dir] if log_dir.name == "trigger_cases.jsonl" else []
+    if (log_dir / "trigger_cases.jsonl").is_file():
+        return [log_dir / "trigger_cases.jsonl"]
+    return sorted(log_dir.glob("*/trigger_cases.jsonl"), key=lambda path: path.parent.name)
+
+
+def reviewed_trigger_cases(log_dir: Path) -> list[tuple[Path, dict]]:
+    cases_by_signature: dict[tuple[str, str, str, str, str], tuple[Path, dict]] = {}
+    for cases_path in trigger_case_paths(log_dir):
+        for case in load_jsonl(cases_path):
+            if is_unreviewed(case):
+                continue
+            cases_by_signature[case_signature(case, cases_path)] = (cases_path, case)
+    return list(cases_by_signature.values())
+
+
+def is_error_category(category: str) -> bool:
+    return category in ERROR_CATEGORIES
+
+
+def risk_score(case: dict) -> float | None:
+    payload = case.get("payload") if isinstance(case.get("payload"), dict) else {}
+    value = payload.get("risk_score")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def risk_level(case: dict) -> str:
+    payload = case.get("payload") if isinstance(case.get("payload"), dict) else {}
+    return str(payload.get("risk_level") or "")
+
+
+def risk_reasons(case: dict) -> list[str]:
+    payload = case.get("payload") if isinstance(case.get("payload"), dict) else {}
+    reasons = payload.get("risk_reasons") or []
+    if not isinstance(reasons, list):
+        return []
+    return [str(reason) for reason in reasons]
+
+
+def threshold_report(cases: list[dict], threshold: float) -> dict:
+    true_auto = true_confirm = error_caught = error_missed = 0
+    for case in cases:
+        score = risk_score(case)
+        if score is None:
+            continue
+        category = str(case.get("review_category") or "")
+        needs_confirmation = score >= threshold
+        if is_error_category(category):
+            if needs_confirmation:
+                error_caught += 1
+            else:
+                error_missed += 1
+        elif category == "true_reference":
+            if needs_confirmation:
+                true_confirm += 1
+            else:
+                true_auto += 1
+    return {
+        "threshold": threshold,
+        "error_caught": error_caught,
+        "error_missed": error_missed,
+        "true_confirm": true_confirm,
+        "true_auto": true_auto,
+    }
+
+
+def summarize_risk_reviews(log_dir: Path) -> dict:
+    entries = reviewed_trigger_cases(log_dir)
+    cases = [case for _path, case in entries]
+    scored_cases = [case for case in cases if risk_score(case) is not None]
+    categories = Counter(str(case.get("review_category") or "") for case in cases)
+    levels = Counter(risk_level(case) or "unknown" for case in scored_cases)
+    reasons = Counter(reason for case in scored_cases for reason in risk_reasons(case))
+
+    return {
+        "reviewed_total": len(cases),
+        "reviewed_with_risk_score": len(scored_cases),
+        "categories": categories.most_common(),
+        "risk_levels": levels.most_common(),
+        "risk_reasons": reasons.most_common(20),
+        "thresholds": [
+            threshold_report(scored_cases, 0.2),
+            threshold_report(scored_cases, 0.3),
+            threshold_report(scored_cases, 0.6),
+        ],
+    }
 
 
 def summarize(log_dir: Path) -> dict:
@@ -80,6 +184,7 @@ def summarize(log_dir: Path) -> dict:
         "top_refs": refs.most_common(30),
         "top_books": books.most_common(30),
         "range_refs": range_refs.most_common(30),
+        "risk_reviews": summarize_risk_reviews(log_dir),
     }
 
 
@@ -106,6 +211,31 @@ def main() -> int:
         print(f"\n{title}:")
         for value, count in report[key]:
             print(f"  {count:>3}  {value}")
+    risk_reviews = report["risk_reviews"]
+    print("\nRisk score по размеченным случаям:")
+    print(
+        f"  Размечено всего: {risk_reviews['reviewed_total']}, "
+        f"с risk_score: {risk_reviews['reviewed_with_risk_score']}"
+    )
+    print("  Категории:")
+    for category, count in risk_reviews["categories"]:
+        label = CATEGORY_LABELS.get(category, category or "без категории")
+        print(f"    {count:>3}  {category} ({label})")
+    print("  Risk levels:")
+    for level, count in risk_reviews["risk_levels"]:
+        print(f"    {count:>3}  {level}")
+    print("  Пороги полуавтоматического режима:")
+    for item in risk_reviews["thresholds"]:
+        print(
+            f"    score >= {item['threshold']}: "
+            f"ошибок оператору {item['error_caught']}, "
+            f"ошибок пропущено {item['error_missed']}, "
+            f"верных оператору {item['true_confirm']}, "
+            f"верных автоматически {item['true_auto']}"
+        )
+    print("  Частые причины риска:")
+    for reason, count in risk_reviews["risk_reasons"]:
+        print(f"    {count:>3}  {reason}")
     return 0
 
 

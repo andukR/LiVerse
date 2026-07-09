@@ -479,6 +479,20 @@ def configure_interactive_approval_mode(args: argparse.Namespace) -> None:
 
 def add_slide_payload(payload: dict) -> dict:
     parsed = payload.get("parsed") or {}
+    reference_list = payload.get("reference_list") or []
+    if reference_list:
+        source_text = str(payload.get("text") or "")
+        refs = [str(item.get("ref") or "").strip() for item in reference_list if str(item.get("ref") or "").strip()]
+        payload["slide"] = {
+            "ref": "Ссылки для чтения",
+            "verse": "\n".join(refs),
+            "source": "vosk:parser_reference_list",
+            "asr": source_text,
+            "detected_text": source_text,
+            "slide_type": "reference_list",
+            "references": reference_list,
+        }
+        return payload
     if not parsed:
         payload["slide"] = None
         return payload
@@ -496,6 +510,24 @@ def add_slide_payload(payload: dict) -> dict:
         "asr": source_text,
         "detected_text": source_text,
     }
+    alternatives = []
+    for alternative in payload.get("ambiguous_alternatives") or []:
+        alternatives.append(
+            {
+                "ref": alternative.get("ref"),
+                "verse": alternative.get("verse_text"),
+                "book": alternative.get("book"),
+                "chapter": alternative.get("chapter"),
+                "start_verse": alternative.get("start_verse"),
+                "end_verse": alternative.get("end_verse"),
+                "end_chapter": alternative.get("end_chapter"),
+                "source": f"vosk:{source}:alternative",
+                "asr": source_text,
+                "detected_text": source_text,
+            }
+        )
+    if alternatives:
+        payload["slide"]["alternatives"] = alternatives
     return payload
 
 
@@ -529,10 +561,12 @@ def payload_summary(payload: dict) -> dict:
         "invalid_reference": invalid_reference,
         "message": payload.get("message"),
         "attempts": payload.get("attempts") or [],
+        "reference_list": payload.get("reference_list") or [],
         "risk_score": payload.get("risk_score"),
         "risk_level": payload.get("risk_level"),
         "risk_reasons": payload.get("risk_reasons") or [],
         "risk": payload.get("risk") or {},
+        "ambiguous_alternatives": payload.get("ambiguous_alternatives") or [],
     }
 
 
@@ -572,7 +606,8 @@ def popup_approval_decision(slide: dict) -> str:
     root.configure(bg="#101820")
     root.resizable(True, True)
 
-    width, height = 980, 360
+    alternatives = [item for item in slide.get("alternatives") or [] if isinstance(item, dict)]
+    width, height = 980, 430 if alternatives else 360
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
     x = max(0, (screen_width - width) // 2)
@@ -595,7 +630,11 @@ def popup_approval_decision(slide: dict) -> str:
 
     tk.Label(
         root,
-        text="Enter - принять     Esc или Space - отклонить",
+        text=(
+            "Enter - основной вариант     1/2/... - альтернативы     Esc или Space - отклонить"
+            if alternatives
+            else "Enter - принять     Esc или Space - отклонить"
+        ),
         bg="#101820",
         fg="#c8d2dc",
         font=hint_font,
@@ -610,7 +649,7 @@ def popup_approval_decision(slide: dict) -> str:
 
     approve = tk.Button(
         buttons,
-        text="Принять",
+        text=str(slide.get("ref") or "Принять"),
         command=lambda: close("approve"),
         bg="#148447",
         fg="white",
@@ -621,6 +660,24 @@ def popup_approval_decision(slide: dict) -> str:
         padx=24,
         pady=16,
     )
+    approve.pack(side="left", fill="x", expand=True, padx=(0, 10))
+
+    for index, alternative in enumerate(alternatives, start=1):
+        button = tk.Button(
+            buttons,
+            text=str(alternative.get("ref") or f"Вариант {index}"),
+            command=lambda choice=index - 1: close(f"alternative:{choice}"),
+            bg="#315a99",
+            fg="white",
+            activebackground="#3c6fbd",
+            activeforeground="white",
+            font=button_font,
+            relief="flat",
+            padx=24,
+            pady=16,
+        )
+        button.pack(side="left", fill="x", expand=True, padx=(0, 10))
+
     reject = tk.Button(
         buttons,
         text="Отклонить",
@@ -634,10 +691,11 @@ def popup_approval_decision(slide: dict) -> str:
         padx=24,
         pady=16,
     )
-    approve.pack(side="left", fill="x", expand=True, padx=(0, 10))
     reject.pack(side="left", fill="x", expand=True, padx=(10, 0))
 
     root.bind("<Return>", lambda _event: close("approve"))
+    for index, _alternative in enumerate(alternatives, start=1):
+        root.bind(str(index), lambda _event, choice=index - 1: close(f"alternative:{choice}"))
     root.bind("<Escape>", lambda _event: close("reject"))
     root.bind("<space>", lambda _event: close("reject"))
     root.protocol("WM_DELETE_WINDOW", lambda: close("reject"))
@@ -662,6 +720,14 @@ def approve_with_popup(args: argparse.Namespace, payload: dict) -> dict:
         action = popup_approval_decision(slide)
     except Exception as exc:
         return {"enabled": True, "ok": False, "reason": str(exc)}
+    if action.startswith("alternative:"):
+        try:
+            alternative_index = int(action.split(":", 1)[1])
+            payload["slide"] = (slide.get("alternatives") or [])[alternative_index]
+        except (ValueError, IndexError, TypeError):
+            return {"enabled": True, "ok": False, "reason": "invalid_alternative_selection"}
+        output = publish_after_approval(args, payload)
+        return {"enabled": True, "ok": True, "action": "approve_alternative", **output}
     if action != "approve":
         return {"enabled": True, "ok": True, "action": "reject"}
     output = publish_after_approval(args, payload)

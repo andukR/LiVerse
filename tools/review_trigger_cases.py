@@ -15,6 +15,7 @@ from typing import Any
 
 
 DEFAULT_RUNS_DIR = Path(".cache") / "liverse" / "vosk_probe"
+LATEST_REPLAY_BATCH = "latest_replay_batch.json"
 CATEGORIES = {
     "1": ("true_reference", "верная ссылка"),
     "2": ("vosk_distortion", "Vosk исказил произнесённую ссылку"),
@@ -57,7 +58,7 @@ def save_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
 def latest_cases_file(runs_dir: Path) -> Path:
     candidates = sorted(
         runs_dir.glob("*/trigger_cases.jsonl"),
-        key=lambda path: path.stat().st_mtime,
+        key=lambda path: path.parent.name,
         reverse=True,
     )
     if not candidates:
@@ -68,7 +69,7 @@ def latest_cases_file(runs_dir: Path) -> Path:
 def all_cases_files(runs_dir: Path) -> list[Path]:
     return sorted(
         runs_dir.glob("*/trigger_cases.jsonl"),
-        key=lambda path: path.stat().st_mtime,
+        key=lambda path: path.parent.name,
     )
 
 
@@ -292,7 +293,29 @@ def collect_unreviewed_entries(cases_paths: list[Path]) -> list[CaseEntry]:
     return entries
 
 
+def latest_batch_cases_files(runs_dir: Path) -> list[Path]:
+    batch_path = runs_dir / LATEST_REPLAY_BATCH
+    if not batch_path.exists():
+        raise RuntimeError(
+            f"Не найден файл последней пачки: {batch_path}. "
+            "Сначала запустите replay_audio_files.py с --run."
+        )
+    try:
+        batch = json.loads(batch_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Повреждён файл последней пачки: {batch_path}: {exc}") from exc
+    paths: list[Path] = []
+    for run_dir in batch.get("runs") or []:
+        cases_path = Path(str(run_dir)) / "trigger_cases.jsonl"
+        if cases_path.exists():
+            paths.append(cases_path.resolve())
+    return sorted(paths, key=lambda path: path.parent.name)
+
+
 def review(args: argparse.Namespace) -> None:
+    if args.latest_batch:
+        review_latest_batch(args)
+        return
     if not args.cases and not args.latest:
         review_unreviewed_queue(args, all_unreviewed=args.all_unreviewed)
         return
@@ -310,6 +333,8 @@ def review(args: argparse.Namespace) -> None:
 
     print(f"Файл случаев: {cases_path}")
     print(f"Файл состояния: {state_path}")
+    if args.latest:
+        print("Режим --latest размечает только один самый новый файл. Для последней пачки replay запустите без --latest.")
 
     while 0 <= position < len(cases):
         case = cases[position]
@@ -354,9 +379,74 @@ def review(args: argparse.Namespace) -> None:
     print(f"Готово. Размечено за этот запуск: {reviewed}")
 
 
+def review_latest_batch(args: argparse.Namespace) -> None:
+    runs_dir = Path(args.runs_dir)
+    cases_paths = latest_batch_cases_files(runs_dir)
+    if not cases_paths:
+        print(f"В последней пачке нет trigger_cases.jsonl: {runs_dir / LATEST_REPLAY_BATCH}")
+        return
+    entries = collect_unreviewed_entries(cases_paths)
+    if not entries:
+        print(f"Неразмеченных случаев в последней пачке не найдено: {runs_dir / LATEST_REPLAY_BATCH}")
+        return
+
+    position = 0
+    reviewed = 0
+    print(f"Файлов trigger_cases.jsonl в последней пачке: {len(cases_paths)}")
+    print(f"Неразмеченных случаев: {len(entries)}")
+
+    while 0 <= position < len(entries):
+        entry = entries[position]
+        case = entry.case
+        print_case(case, position, len(entries), cases_path=entry.cases_path)
+        command = input("> ").strip().lower()
+
+        if command in {"", "зв", "p", "play"}:
+            play_case(case, entry.cases_path)
+            continue
+        if command in {"зв+", "p+", "play+"}:
+            play_case(case, entry.cases_path, long=True)
+            continue
+        if command in {"п", "skip", "s"}:
+            position += 1
+            continue
+        if command in {"н", "note"}:
+            case["note"] = input("Заметка: ").strip()
+            save_jsonl(entry.cases_path, entry.cases)
+            continue
+        if command in {"вых", "выход", "q", "quit"}:
+            break
+        next_position = parse_case_number_command(command, len(entries))
+        if next_position is not None:
+            position = next_position
+            continue
+        if command in CATEGORIES:
+            category, _label = CATEGORIES[command]
+            case["status"] = "reviewed"
+            case["review_category"] = category
+            case["reviewed_at"] = datetime.now().isoformat(timespec="seconds")
+            if not str(case.get("note") or "").strip():
+                case["note"] = ""
+            save_jsonl(entry.cases_path, entry.cases)
+            reviewed += 1
+            position += 1
+            continue
+
+        print("Неизвестная команда.")
+
+    remaining = sum(1 for entry in entries if is_unreviewed(entry.case))
+    print(f"Готово. Размечено за этот запуск: {reviewed}. Осталось неразмеченных: {remaining}")
+
+
 def review_unreviewed_queue(args: argparse.Namespace, *, all_unreviewed: bool = False) -> None:
     runs_dir = Path(args.runs_dir)
     cases_paths = [path.resolve() for path in all_cases_files(runs_dir)]
+    if args.from_run:
+        cases_paths = [
+            cases_path
+            for cases_path in cases_paths
+            if cases_path.parent.name >= args.from_run
+        ]
     queue_paths = cases_paths if all_unreviewed else latest_unreviewed_batch(cases_paths)
     entries = collect_unreviewed_entries(queue_paths)
     if not entries:
@@ -432,8 +522,18 @@ def main() -> int:
         help="Path to trigger_cases.jsonl. Default: newest unreviewed replay batch.",
     )
     parser.add_argument("--runs-dir", default=str(DEFAULT_RUNS_DIR), help="Directory with LiVerse Vosk runs.")
-    parser.add_argument("--latest", action="store_true", help="Review the latest trigger_cases.jsonl only.")
+    parser.add_argument(
+        "--latest",
+        action="store_true",
+        help="Review only one newest trigger_cases.jsonl file. For the newest replay batch, omit --latest.",
+    )
+    parser.add_argument("--latest-batch", action="store_true", help="Review only the latest replay batch.")
     parser.add_argument("--all-unreviewed", action="store_true", help="Review all unreviewed cases from all runs.")
+    parser.add_argument(
+        "--from-run",
+        default="",
+        help="Review only runs whose directory name is this value or newer, for example 20260709_093034_146488.",
+    )
     parser.add_argument("--state", default="", help="Path to review state JSON.")
     parser.add_argument("--no-resume", action="store_true", help="Start from first unreviewed case.")
     args = parser.parse_args()
