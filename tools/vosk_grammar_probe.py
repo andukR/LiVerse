@@ -12,6 +12,7 @@ import sys
 import webbrowser
 import wave
 from datetime import datetime
+from importlib import resources
 from pathlib import Path
 from urllib.parse import quote
 
@@ -24,16 +25,16 @@ if str(CORE_SRC) not in sys.path:
     sys.path.insert(0, str(CORE_SRC))
 
 from bible_parser_core.live_pipeline import (
-    VoskTextBuffer,
+    LiveReferencePipeline,
     add_risk_score,
     build_grammar,
     expand_nehemiah_confusable_candidates,
     expand_joel_confusable_candidates,
     grammar_diagnostics,
     parsed_payload_from_candidates as core_parsed_payload_from_candidates,
-    same_place_candidates,
 )
 from bible_parser_core.parser import DEFAULT_BIBLE
+from bible_parser_core.risk_model import load_risk_model, score_payload_with_model
 from tools.holyrics import (
     MIN_RECOMMENDED_HOLYRICS_VERSION,
     REQUIRED_HOLYRICS_PERMISSIONS,
@@ -57,6 +58,7 @@ WELCOME_TEXT = (
 )
 ENTER_KEYS = {"\r", "\n"}
 SPACE_KEYS = {" "}
+TAB_KEYS = {"\t"}
 
 
 def format_timecode(seconds: float) -> str:
@@ -453,6 +455,22 @@ def ask_enter_or_space(question: str, *, enter_label: str, space_label: str) -> 
             return False
 
 
+def ask_run_mode() -> str:
+    print("Режим работы LiVerse", flush=True)
+    print("Enter — подтверждать каждую ссылку; Tab — полуавтомат; Space — полностью автоматический режим", flush=True)
+    while True:
+        key = read_single_key()
+        if key in ENTER_KEYS:
+            print("подтверждать каждую ссылку", flush=True)
+            return "approval"
+        if key in TAB_KEYS:
+            print("полуавтомат", flush=True)
+            return "semi_auto"
+        if key in SPACE_KEYS:
+            print("полностью автоматический режим", flush=True)
+            return "auto"
+
+
 def configure_interactive_approval_mode(args: argparse.Namespace) -> None:
     if not args.ask_approval_mode or args.text:
         return
@@ -460,13 +478,14 @@ def configure_interactive_approval_mode(args: argparse.Namespace) -> None:
         print("Интерактивный выбор режима недоступен: консоль не принимает ввод.", flush=True)
         return
 
-    use_approval = ask_enter_or_space(
-        "Работать с подтверждением оператора?",
-        enter_label="да",
-        space_label="нет, полностью автоматический режим",
-    )
-    args.require_approval = use_approval
-    if not use_approval:
+    if args.semi_auto_approval:
+        mode = "semi_auto"
+        print("Полуавтоматический режим включён параметром --semi-auto-approval.", flush=True)
+    else:
+        mode = ask_run_mode()
+    args.require_approval = mode == "approval"
+    args.semi_auto_approval = mode == "semi_auto"
+    if mode == "auto":
         return
 
     use_web = ask_enter_or_space(
@@ -475,6 +494,24 @@ def configure_interactive_approval_mode(args: argparse.Namespace) -> None:
         space_label="всплывающее окно",
     )
     args.approval_ui = "web" if use_web else "popup"
+
+
+def default_risk_model_path() -> Path:
+    return Path(str(resources.files("bible_parser_core").joinpath("data/risk_model.json")))
+
+
+def load_runtime_risk_model(args: argparse.Namespace) -> None:
+    args.risk_model_data = None
+    if not args.semi_auto_approval or args.require_approval:
+        return
+    if not args.risk_model.exists():
+        raise SystemExit(f"Модель полуавтоматического режима не найдена: {args.risk_model}")
+    model = load_risk_model(args.risk_model)
+    if args.risk_threshold > 0:
+        model["recommended_threshold"] = args.risk_threshold
+    args.risk_model_data = model
+    threshold = float(model.get("recommended_threshold") or 0.3)
+    print(f"Полуавтоматический режим: модель риска загружена, порог {threshold:.2f}.", flush=True)
 
 
 def add_slide_payload(payload: dict) -> dict:
@@ -566,6 +603,7 @@ def payload_summary(payload: dict) -> dict:
         "risk_level": payload.get("risk_level"),
         "risk_reasons": payload.get("risk_reasons") or [],
         "risk": payload.get("risk") or {},
+        "ml_risk": payload.get("ml_risk") or {},
         "ambiguous_alternatives": payload.get("ambiguous_alternatives") or [],
     }
 
@@ -705,6 +743,33 @@ def popup_approval_decision(slide: dict) -> str:
     return decision["action"]
 
 
+def show_popup_message(title: str, message: str) -> None:
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+    except Exception:
+        return
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    try:
+        messagebox.showwarning(title, message, parent=root)
+    finally:
+        root.destroy()
+
+
+def notify_operator_message(args: argparse.Namespace, payload: dict) -> None:
+    message = str(payload.get("message") or "").strip()
+    if not message:
+        return
+    if args.approval_ui != "popup":
+        return
+    if not (args.require_approval or args.semi_auto_approval):
+        return
+    show_popup_message("LiVerse", message)
+
+
 def publish_after_approval(args: argparse.Namespace, payload: dict) -> dict:
     return {
         "holyrics": publish_holyrics_if_needed(args, payload),
@@ -743,8 +808,37 @@ def submit_for_approval(args: argparse.Namespace, payload: dict) -> dict:
     return {"enabled": True, "ok": True, "candidate": candidate}
 
 
+def approval_required_for_payload(args: argparse.Namespace, payload: dict) -> bool:
+    if not payload.get("slide"):
+        return False
+    if args.require_approval:
+        return True
+    ml_risk = payload.get("ml_risk") or {}
+    return bool(args.semi_auto_approval and ml_risk.get("needs_confirmation"))
+
+
+def apply_ml_risk(args: argparse.Namespace, payload: dict, asr_result: dict | None = None) -> None:
+    if not args.semi_auto_approval or args.require_approval or not payload.get("slide"):
+        return
+    model = getattr(args, "risk_model_data", None)
+    if not model:
+        return
+    ml_risk = score_payload_with_model(payload, model, asr_result=asr_result)
+    try:
+        risk_score = float(payload.get("risk_score") or 0.0)
+    except (TypeError, ValueError):
+        risk_score = 0.0
+    decision_reasons = list(ml_risk.get("decision_reasons") or [])
+    if risk_score >= 0.5 and not ml_risk.get("needs_confirmation"):
+        ml_risk["needs_confirmation"] = True
+        decision_reasons.append("manual_medium_or_high_risk_score")
+    if decision_reasons:
+        ml_risk["decision_reasons"] = decision_reasons
+    payload["ml_risk"] = ml_risk
+
+
 def start_slide_server_if_needed(args: argparse.Namespace):
-    web_approval = args.require_approval and args.approval_ui == "web"
+    web_approval = (args.require_approval or args.semi_auto_approval) and args.approval_ui == "web"
     needs_server = args.start_slide_server or web_approval or args.slide_output in {"web", "both"}
     if not needs_server:
         return None
@@ -774,7 +868,7 @@ def start_slide_server_if_needed(args: argparse.Namespace):
 
 
 def publish_payload(args: argparse.Namespace, payload: dict) -> dict:
-    if args.require_approval:
+    if approval_required_for_payload(args, payload):
         if args.approval_ui == "popup":
             popup_result = approve_with_popup(args, payload)
             return {
@@ -895,10 +989,13 @@ def run_microphone(args: argparse.Namespace) -> int:
             "trigger_cases": "trigger_cases.jsonl",
             "slide_output": args.slide_output,
             "require_approval": args.require_approval,
+            "semi_auto_approval": args.semi_auto_approval,
+            "risk_model": str(args.risk_model) if args.semi_auto_approval else None,
+            "risk_threshold": args.risk_threshold,
             "approval_ui": args.approval_ui,
             "slide_server": f"http://{args.slide_host}:{args.slide_port}" if (
                 args.start_slide_server
-                or (args.require_approval and args.approval_ui == "web")
+                or ((args.require_approval or args.semi_auto_approval) and args.approval_ui == "web")
                 or args.slide_output in {"web", "both"}
             ) else None,
             "holyrics_target": describe_holyrics_target(args),
@@ -928,8 +1025,7 @@ def run_microphone(args: argparse.Namespace) -> int:
 
     SetLogLevel(args.vosk_log_level)
     model = Model(str(args.model))
-    text_buffer = VoskTextBuffer(args.vosk_buffer_parts)
-    last_parsed: dict | None = None
+    pipeline = LiveReferencePipeline(args.bible, buffer_parts=args.vosk_buffer_parts)
     audio_stats = {"chunks": 0, "peak": 0}
     empty_final_count = 0
     trigger_case_count = 0
@@ -1123,22 +1219,15 @@ def run_microphone(args: argparse.Namespace) -> int:
                         if text:
                             empty_final_count = 0
                             console.status("распознаю")
-                            text_buffer.add(text)
-                            candidate_texts = same_place_candidates(text_buffer.candidates(), last_parsed)
-                            candidate_texts = expand_nehemiah_confusable_candidates(
-                                candidate_texts,
-                                bible_path=args.bible,
-                                asr_result=result,
-                            )
-                            payload = parsed_payload_from_candidates(
-                                candidate_texts,
-                                bible_path=args.bible,
-                                show_candidates=args.show_candidates,
+                            payload = add_slide_payload(
+                                pipeline.process_text(
+                                    text,
+                                    asr_result=result,
+                                    show_candidates=args.show_candidates,
+                                )
                             )
                             payload["asr"] = result
-                            payload["vosk_text"] = text
-                            payload["vosk_buffer"] = list(text_buffer.parts)
-                            add_risk_score(payload, asr_result=result)
+                            apply_ml_risk(args, payload, asr_result=result)
                             payload["output"] = publish_payload(args, payload)
                             if payload.get("slide"):
                                 action = approval_action(payload["output"])
@@ -1168,7 +1257,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                                         "action": action,
                                         "ref": ref,
                                         "vosk_text": text,
-                                        "vosk_buffer": list(text_buffer.parts),
+                                        "vosk_buffer": list(payload.get("vosk_buffer") or []),
                                         "payload": payload_summary(payload),
                                         "output": payload["output"],
                                         "asr": result,
@@ -1176,17 +1265,16 @@ def run_microphone(args: argparse.Namespace) -> int:
                                     }
                                 )
                             elif payload.get("message"):
+                                notify_operator_message(args, payload)
                                 console.status(str(payload["message"]))
                             else:
                                 console.status("слушаю")
-                            if payload.get("parsed"):
-                                last_parsed = payload["parsed"]
                             logger.write(
                                 "parsed",
                                 {
                                     "vosk_text": text,
-                                    "vosk_buffer": list(text_buffer.parts),
-                                    "candidate_texts": candidate_texts,
+                                    "vosk_buffer": list(payload.get("vosk_buffer") or []),
+                                    "candidate_texts": list(payload.get("candidate_texts") or []),
                                     "payload": payload_summary(payload),
                                     "output": payload["output"],
                                 },
@@ -1283,6 +1371,23 @@ def main() -> int:
         help="Wait for operator approval before sending to slide output.",
     )
     parser.add_argument(
+        "--semi-auto-approval",
+        action="store_true",
+        help="Use ML risk model: send low-risk references automatically and ask the operator for risky references.",
+    )
+    parser.add_argument(
+        "--risk-model",
+        type=Path,
+        default=default_risk_model_path(),
+        help="JSON Naive Bayes risk model for --semi-auto-approval.",
+    )
+    parser.add_argument(
+        "--risk-threshold",
+        type=float,
+        default=0.0,
+        help="Override model confirmation threshold. 0 uses the threshold stored in the model.",
+    )
+    parser.add_argument(
         "--approval-ui",
         choices=["web", "popup"],
         default="web",
@@ -1341,6 +1446,7 @@ def main() -> int:
             print(grammar_json, flush=True)
         return 0
     configure_interactive_approval_mode(args)
+    load_runtime_risk_model(args)
     print_holyrics_setup_notice_once(args)
     ask_holyrics_theme_name(args)
 
@@ -1356,13 +1462,15 @@ def main() -> int:
                 "open_vocabulary": args.open_vocabulary,
                 "slide_output": args.slide_output,
                 "require_approval": args.require_approval,
+                "semi_auto_approval": args.semi_auto_approval,
+                "risk_model": str(args.risk_model) if args.semi_auto_approval else None,
+                "risk_threshold": args.risk_threshold,
                 "approval_ui": args.approval_ui,
                 "holyrics_target": describe_holyrics_target(args),
                 "grammar": None if grammar is None else grammar_diagnostics(grammar),
             }
         )
         check_holyrics_startup(args, logger)
-        start_slide_server_if_needed(args)
         candidate_texts = expand_nehemiah_confusable_candidates(
             [" ".join(args.text)],
             bible_path=args.bible,
@@ -1373,6 +1481,14 @@ def main() -> int:
             bible_path=args.bible,
             show_candidates=args.show_candidates,
         )
+        add_risk_score(payload)
+        apply_ml_risk(args, payload)
+        if (
+            approval_required_for_payload(args, payload)
+            or args.start_slide_server
+            or args.slide_output in {"web", "both"}
+        ):
+            start_slide_server_if_needed(args)
         payload["output"] = publish_payload(args, payload)
         logger.write(
             "text_probe",

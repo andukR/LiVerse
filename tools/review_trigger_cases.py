@@ -202,6 +202,14 @@ def print_case(case: dict[str, Any], position: int, total: int, *, cases_path: P
     risk_reasons = payload.get("risk_reasons") or []
     if risk_score is not None:
         print(f"risk: {risk_level} {risk_score} reasons={', '.join(str(reason) for reason in risk_reasons)}")
+    ml_risk = payload.get("ml_risk") if isinstance(payload.get("ml_risk"), dict) else {}
+    if ml_risk:
+        print(
+            "ml_risk: "
+            f"p={ml_risk.get('confirm_probability')} "
+            f"threshold={ml_risk.get('threshold')} "
+            f"needs_confirmation={ml_risk.get('needs_confirmation')}"
+        )
     output = case.get("output") if isinstance(case.get("output"), dict) else {}
     holyrics = output.get("holyrics") if isinstance(output.get("holyrics"), dict) else {}
     if holyrics:
@@ -252,12 +260,25 @@ class CaseEntry:
 
 
 def session_source_audio(cases_path: Path) -> str:
+    session = session_metadata(cases_path)
+    return str(session.get("source_audio") or "")
+
+
+def session_metadata(cases_path: Path) -> dict[str, Any]:
     session_path = cases_path.with_name("session.json")
     try:
-        session = json.loads(session_path.read_text(encoding="utf-8"))
+        data = json.loads(session_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return ""
-    return str(session.get("source_audio") or "")
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def is_live_run(cases_path: Path) -> bool:
+    session = session_metadata(cases_path)
+    mode = str(session.get("mode") or "").strip()
+    if mode == "audio_replay" or str(session.get("source_audio") or "").strip():
+        return False
+    return True
 
 
 def case_signature(case: dict[str, Any], cases_path: Path) -> tuple[str, str, str, str, str]:
@@ -312,10 +333,24 @@ def latest_batch_cases_files(runs_dir: Path) -> list[Path]:
     return sorted(paths, key=lambda path: path.parent.name)
 
 
+def latest_live_cases_file(runs_dir: Path) -> Path:
+    candidates = [
+        path
+        for path in all_cases_files(runs_dir)
+        if is_live_run(path) and has_unreviewed_cases(load_jsonl(path))
+    ]
+    if not candidates:
+        raise RuntimeError(f"Не найден live-запуск LiVerse с неразмеченными случаями в {runs_dir}")
+    return sorted(candidates, key=lambda path: path.parent.name, reverse=True)[0]
+
+
 def review(args: argparse.Namespace) -> None:
     if args.latest_batch:
         review_latest_batch(args)
         return
+    if args.latest_live:
+        args.cases = str(latest_live_cases_file(Path(args.runs_dir)))
+        args.latest = True
     if not args.cases and not args.latest:
         review_unreviewed_queue(args, all_unreviewed=args.all_unreviewed)
         return
@@ -528,6 +563,7 @@ def main() -> int:
         help="Review only one newest trigger_cases.jsonl file. For the newest replay batch, omit --latest.",
     )
     parser.add_argument("--latest-batch", action="store_true", help="Review only the latest replay batch.")
+    parser.add_argument("--latest-live", action="store_true", help="Review only the newest live LiVerse run with unreviewed cases.")
     parser.add_argument("--all-unreviewed", action="store_true", help="Review all unreviewed cases from all runs.")
     parser.add_argument(
         "--from-run",

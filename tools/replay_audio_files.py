@@ -777,7 +777,11 @@ def main() -> int:
     if args.download_from_subtitles and args.run and download_video_ids:
         downloaded = collect_audio_files_by_youtube_ids(args.download_dir, download_video_ids)
     explicit_audio = list(args.audio or [])
-    files = [path for path in explicit_audio if path.exists()]
+    missing_explicit_audio = [path for path in explicit_audio if not path.exists()]
+    if missing_explicit_audio:
+        missing_list = "\n".join(f"  - {path}" for path in missing_explicit_audio)
+        raise SystemExit(f"Указанные --audio файлы не найдены:\n{missing_list}")
+    files = list(explicit_audio)
     auto_selected = not explicit_audio
     selected_downloaded = False
     if not files:

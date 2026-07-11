@@ -40,6 +40,7 @@ REFERENCE_WORDS = {
     "пророка",
     "псалом",
     "с",
+    "слова",
     "стих",
     "стиха",
     "стихи",
@@ -59,7 +60,7 @@ VOSK_GRAMMAR_EXTRA_WORDS = {
     "четвёртые",
     "четвёртый",
 }
-CONFUSABLE_NUMBER_PAIRS = ((17, 18), (13, 30), (12, 13))
+CONFUSABLE_NUMBER_PAIRS = ((17, 18), (13, 30), (12, 13), (12, 19), (7, 8))
 CONFUSABLE_NUMBER_MAP = {
     value: other
     for left, right in CONFUSABLE_NUMBER_PAIRS
@@ -132,6 +133,16 @@ VOSK_SMALL_RU_MISSING_WORDS = {
     "четвертый",
     "четырнадцатые",
     "шестнадцатые",
+}
+BLOCKED_CONTEXT_MESSAGES = {
+    "ambiguous_unnumbered_thessalonians": (
+        "Номер книги не был назван или не был распознан программой. "
+        "Введите номер послания Фессалоникийцам вручную."
+    ),
+    "ambiguous_numbered_timothy": (
+        "Номер книги не был назван или не был распознан программой. "
+        "Введите номер послания Тимофею вручную."
+    ),
 }
 
 
@@ -307,6 +318,26 @@ def repeated_confusable_range_reference(
     return parse_live_reference(f"{parsed.book} {parsed.chapter}:17-18", bible_path=bible_path)
 
 
+def repeated_range_end_reference(
+    text: str,
+    parsed: ParsedReference,
+    bible_path: Path = DEFAULT_BIBLE,
+) -> ParsedReference | None:
+    if parsed.start_verse != parsed.end_verse:
+        return None
+    normalized = normalize_text(text)
+    for match in re.finditer(r"\b(\d+)\s+глава\s+(\d+)\s+(\d+)\s+\3\s+стих\b", normalized):
+        chapter = int(match.group(1))
+        start_verse = int(match.group(2))
+        end_verse = int(match.group(3))
+        if chapter != parsed.chapter or parsed.start_verse != end_verse:
+            continue
+        if start_verse >= end_verse:
+            continue
+        return parse_live_reference(f"{parsed.book} {chapter}:{start_verse}-{end_verse}", bible_path=bible_path)
+    return None
+
+
 def ambiguous_reference_alternatives(
     parsed: ParsedReference,
     source_text: str = "",
@@ -353,6 +384,23 @@ def ambiguous_reference_alternatives(
             add(f"Колоссянам {parsed.chapter}:{parsed.start_verse}")
         else:
             add(f"Колоссянам {parsed.chapter}:{parsed.start_verse}-{parsed.end_verse}")
+
+    if parsed.book == "Ефесянам":
+        if parsed.start_verse == parsed.end_verse:
+            add(f"Колоссянам {parsed.chapter}:{parsed.start_verse}")
+        else:
+            add(f"Колоссянам {parsed.chapter}:{parsed.start_verse}-{parsed.end_verse}")
+
+    if (
+        parsed.book == "Филиппийцам"
+        and parsed.chapter == 1
+        and re.search(r"\bпослани[ея]\s+фес+\b", normalized)
+        and not re.search(r"\b(?:1|2|перв\w*|втор\w*)\s+(?:послани[ея]\s+)?фес+\b", normalized)
+    ):
+        if parsed.start_verse == parsed.end_verse:
+            add(f"Филимону {parsed.start_verse}")
+        else:
+            add(f"Филимону {parsed.start_verse}-{parsed.end_verse}")
 
     return alternatives
 
@@ -407,6 +455,10 @@ def resolve_reference_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, sh
     if repeated_confusable_parsed and repeated_confusable_parsed.ref != parsed.ref:
         parsed = repeated_confusable_parsed
         source = "parser_repeated_confusable_range"
+    repeated_range_end_parsed = repeated_range_end_reference(text, parsed, bible_path=bible_path) if parsed else None
+    if repeated_range_end_parsed and repeated_range_end_parsed.ref != parsed.ref:
+        parsed = repeated_range_end_parsed
+        source = "parser_repeated_range_end"
     resolved = None
     invalid_reference = None
     blocked_weak_context = None
@@ -434,6 +486,7 @@ def resolve_reference_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, sh
     }
     if blocked_weak_context:
         payload["blocked_weak_context"] = blocked_weak_context
+        payload["message"] = BLOCKED_CONTEXT_MESSAGES.get(blocked_weak_context)
     if parsed is not None:
         payload["ambiguous_alternatives"] = ambiguous_reference_alternatives(
             parsed,
@@ -452,6 +505,8 @@ def resolver_book_conflict_reason(text: str, ref: str) -> str | None:
     normalized = normalize_text(text)
     if re.search(r"\bтимофе[яю]\b", normalized) and not re.match(r"^[12]\s+Тимофею\b", ref):
         return "resolver_conflicts_with_timothy"
+    if re.search(r"\bпетра\b", normalized) and not re.match(r"^[12]\s+Петра\b", ref):
+        return "resolver_conflicts_with_peter"
     return None
 
 
@@ -678,6 +733,26 @@ def should_block_matched_payload(payload: dict) -> str | None:
     ):
         return "gospel_without_book_name"
 
+    gospel_conflicts = {
+        "матфея": "Матфей",
+        "марка": "Марк",
+        "луки": "Лука",
+        "иоанна": "Иоанн",
+    }
+    for marker, book in gospel_conflicts.items():
+        if re.search(rf"\bевангелие\s+от\s+{marker}\b", normalized) and not ref.startswith(book):
+            return "gospel_book_conflict"
+
+    if (
+        re.search(r"\bфес+с?\s+салон(?:ик|ики)?\b", normalized)
+        and not re.search(r"\b(?:1|2|перв\w*|втор\w*)\s+(?:послани[ея]\s+)?фес+с?\s+салон(?:ик|ики)?\b", normalized)
+        and not re.search(r"^[12]\s+Фессалоникийцам\b", ref)
+    ):
+        return "ambiguous_unnumbered_thessalonians"
+
+    if re.search(r"\bколоссянам\b|\bкол\s+осии\b", normalized) and not ref.startswith("Колоссянам"):
+        return "colossians_book_conflict"
+
     if (
         re.search(r"\b(?:книга\s+)?пророка\s+\S+\s+\d+\s+глава\b", normalized)
         and not re.search(r"\bстих", normalized)
@@ -706,6 +781,13 @@ def should_block_matched_payload(payload: dict) -> str | None:
 
     if re.fullmatch(r"\d+\s+\d+\s+моисея", normalized):
         return "weak_short_moses_context"
+
+    if (
+        ref.startswith("Ездра ")
+        and re.search(r"\bстих\w*\s+ездры\s*$", raw_text)
+        and not re.search(r"\b(?:глав|книг)\w*\b", raw_text)
+    ):
+        return "weak_trailing_ezra_context"
 
     if (
         re.search(r"\b[1234]\s+царств\b", ref, flags=re.IGNORECASE)
@@ -739,6 +821,22 @@ def should_block_matched_payload(payload: dict) -> str | None:
         return "incomplete_first_verse_after_chapter"
 
     if (
+        parsed.get("start_verse") == parsed.get("end_verse")
+        and re.search(r"\bглав\w*\b", raw_text)
+        and re.search(r"\bпо\s*$", normalized)
+    ):
+        return "incomplete_range_end_after_po"
+
+    if (
+        parsed.get("start_verse") == parsed.get("end_verse")
+        and re.search(r"\bглав\w*\b", raw_text)
+        and not re.search(r"\b(?:стих|стиха|стихи|стихов)\b", raw_text)
+        and not re.search(r"\b(?:с|по)\b", normalized)
+        and ends_with_genitive_ordinal(raw_text)
+    ):
+        return "incomplete_range_start_after_chapter"
+
+    if (
         ref == "Числа 1:1"
         and re.search(r"\bчисла\b", normalized)
         and not re.search(r"\bкниг[аи]\b", normalized)
@@ -746,7 +844,30 @@ def should_block_matched_payload(payload: dict) -> str | None:
     ):
         return "weak_bare_numbers_first_verse"
 
+    if (
+        ref.startswith("Ездра ")
+        and re.search(r"\bездр[аы]\b", normalized)
+        and re.search(r"\bсот\w*\b", raw_text)
+        and not re.search(r"\b(?:книг|глав|стих)\w*\b", raw_text)
+    ):
+        return "weak_compact_ezra_hundred_context"
+
     return None
+
+
+def ends_with_genitive_ordinal(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:"
+            r"первого|второго|третьего|четвертого|пятого|шестого|седьмого|восьмого|девятого|"
+            r"десятого|одиннадцатого|двенадцатого|тринадцатого|четырнадцатого|пятнадцатого|"
+            r"шестнадцатого|семнадцатого|восемнадцатого|девятнадцатого|двадцатого|"
+            r"тридцатого|сорокового|пятидесятого|шестидесятого|семидесятого|"
+            r"восьмидесятого|девяностого|сотого"
+            r")\s*$",
+            text,
+        )
+    )
 
 
 def blocked_payload(payload: dict, reason: str) -> dict:
@@ -755,6 +876,7 @@ def blocked_payload(payload: dict, reason: str) -> dict:
     result["parsed"] = None
     result["source"] = None
     result["blocked_weak_context"] = reason
+    result["message"] = BLOCKED_CONTEXT_MESSAGES.get(reason)
     return result
 
 
@@ -833,6 +955,16 @@ def score_reference_risk(payload: dict, asr_result: dict | None = None) -> dict:
         score += 0.15
         reasons.append("compact_reference_without_markers")
 
+    if (
+        parsed
+        and parsed.get("start_verse") == parsed.get("end_verse")
+        and re.search(r"\bглав\w*\b", normalized)
+        and not re.search(r"\bстих\w*\b", normalized)
+        and re.search(r"\b\d+\s*$", normalized)
+    ):
+        score += 0.15
+        reasons.append("bare_verse_number_after_chapter")
+
     if payload.get("source") == "resolver":
         score += 0.15
         reasons.append("resolved_by_fuzzy_match")
@@ -842,6 +974,9 @@ def score_reference_risk(payload: dict, asr_result: dict | None = None) -> dict:
     if payload.get("source") == "parser_repeated_confusable_range":
         score += 0.1
         reasons.append("repeated_confusable_range_repair")
+    if payload.get("source") == "parser_repeated_range_end":
+        score += 0.1
+        reasons.append("repeated_range_end_repair")
     if payload.get("ambiguous_alternatives"):
         score += 0.15
         alternative_books = {
@@ -851,6 +986,7 @@ def score_reference_risk(payload: dict, asr_result: dict | None = None) -> dict:
         }
         parsed_book = str((payload.get("parsed") or {}).get("book") or "")
         if alternative_books and any(book != parsed_book for book in alternative_books):
+            score += 0.1
             reasons.append("confusable_book_alternative")
         else:
             reasons.append("confusable_number_alternative")
