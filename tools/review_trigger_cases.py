@@ -24,6 +24,8 @@ CATEGORIES = {
     "5": ("false_plain_speech", "ложное срабатывание: обычная речь без ссылки"),
     "6": ("false_noise", "ложное срабатывание: шум, музыка или неречь"),
     "7": ("unclear", "непонятно, нужно переслушать позже"),
+    "8": ("parser_error", "Vosk услышал достаточно, но мозг LiVerse разобрал неверно"),
+    "9": ("speaker_error", "ошибка произношения: говорящий назвал ссылку неполно или оговорился"),
 }
 CATEGORY_LABELS = {category: label for category, label in CATEGORIES.values()}
 CATEGORY_LABELS["wrong_reference"] = "ссылка была названа, но Vosk/LiVerse разобрал её неверно"

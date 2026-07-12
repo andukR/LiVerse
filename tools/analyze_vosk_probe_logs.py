@@ -24,6 +24,8 @@ ERROR_CATEGORIES = {
     "false_noise",
     "unclear",
     "wrong_reference",
+    "parser_error",
+    "speaker_error",
 }
 TRAINING_EXCLUDED_CASES = {
     # Старые случаи, размеченные до расширения Vosk-грамматики для Колоссянам.
@@ -476,7 +478,7 @@ def train_naive_bayes(rows: list[dict[str, str]]) -> dict:
         class_count = class_counts[target]
         prior = (class_count + 1) / (total_rows + len(classes))
         model.setdefault("log_prior", {})[target] = math.log(prior)
-        for feature in vocabulary:
+        for feature in sorted(vocabulary):
             count = feature_counts[target][feature]
             probability = (count + 1) / (class_count + 2)
             model["features"].setdefault(feature, {})[target] = math.log(probability)

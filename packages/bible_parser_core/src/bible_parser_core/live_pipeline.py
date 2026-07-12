@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from bible_parser_core.book_aliases import book_synonyms
-from bible_parser_core.parser import DEFAULT_BIBLE, NUMBER_WORDS, ParsedReference, normalize_text, parse_live_reference
+from bible_parser_core.parser import DEFAULT_BIBLE, NUMBER_WORDS, ParsedReference, book_candidates, normalize_text, parse_live_reference
 from bible_parser_core.parser import diagnose_invalid_reference
 from bible_parser_core.reference_resolver import (
     resolve_best_reference_candidate,
@@ -407,22 +407,60 @@ def ambiguous_reference_alternatives(
 
 def compact_reference_list(text: str, bible_path: Path = DEFAULT_BIBLE) -> list[dict[str, str]]:
     normalized = normalize_text(text)
-    if normalized.count("псалом") < 2:
-        return []
     items: list[dict[str, str]] = []
     seen: set[str] = set()
-    parts = re.split(r"\bпсалом\b", normalized)
-    for part in parts[1:]:
-        segment = f"псалом {part.strip()}".strip()
-        if not re.search(r"\bстих\b", segment):
-            continue
-        parsed = parse_live_reference(segment, bible_path=bible_path)
-        if not parsed or not parsed.ref.startswith("Псалтирь "):
-            continue
+
+    def add_item(parsed: ParsedReference | None, segment: str, *, required_prefix: str | None = None) -> None:
+        if not parsed:
+            return
+        if required_prefix and not parsed.ref.startswith(required_prefix):
+            return
         if parsed.ref in seen:
-            continue
+            return
         seen.add(parsed.ref)
         items.append({"ref": parsed.ref, "source_text": segment})
+
+    if normalized.count("псалом") >= 2:
+        parts = re.split(r"\bпсалом\b", normalized)
+        for part in parts[1:]:
+            segment = f"псалом {part.strip()}".strip()
+            if not re.search(r"\bстих\b", segment):
+                continue
+            add_item(parse_live_reference(segment, bible_path=bible_path), segment, required_prefix="Псалтирь ")
+        if len(items) >= 2:
+            return items
+
+    all_books = book_candidates(normalized)
+    exact_books = sorted(
+        (
+            candidate
+            for candidate in all_books
+            if candidate.score >= 0.999
+            and not any(
+                other is not candidate
+                and other.score >= 0.999
+                and other.start <= candidate.start
+                and other.end >= candidate.end
+                and (other.end - other.start) > (candidate.end - candidate.start)
+                for other in all_books
+            )
+        ),
+        key=lambda candidate: candidate.start,
+    )
+    if len(exact_books) < 2:
+        return []
+
+    items = []
+    seen = set()
+    for index, candidate in enumerate(exact_books):
+        end = exact_books[index + 1].start if index + 1 < len(exact_books) else len(normalized)
+        segment = normalized[candidate.start:end].strip()
+        if len(re.findall(r"\b\d+\b", segment)) < 2:
+            continue
+        parsed = parse_live_reference(segment, bible_path=bible_path)
+        if not parsed or parsed.book != candidate.book:
+            continue
+        add_item(parsed, segment)
     return items if len(items) >= 2 else []
 
 
@@ -752,6 +790,15 @@ def should_block_matched_payload(payload: dict) -> str | None:
 
     if re.search(r"\bколоссянам\b|\bкол\s+осии\b", normalized) and not ref.startswith("Колоссянам"):
         return "colossians_book_conflict"
+
+    if (
+        ref.startswith("Руфь ")
+        and re.search(r"\bрусь\b", raw_text)
+        and re.search(r"\b2\s+3\s+4\s+5\b", normalized)
+        and re.search(r"\bпо\s+глава\b", normalized)
+        and not re.search(r"\b(?:книга|руфь|руф)\b", raw_text)
+    ):
+        return "ruth_counting_rhyme"
 
     if (
         re.search(r"\b(?:книга\s+)?пророка\s+\S+\s+\d+\s+глава\b", normalized)

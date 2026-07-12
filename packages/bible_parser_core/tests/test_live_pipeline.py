@@ -749,6 +749,17 @@ class LiveReferencePipelineTest(unittest.TestCase):
             refs,
         )
 
+    def test_compact_references_from_different_books_are_returned_as_list(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("один пять и о анна три четыре иакова один два")
+
+        self.assertTrue(result.get("matched"))
+        self.assertIsNone(result.get("parsed"))
+        self.assertEqual("parser_reference_list", result.get("source"))
+        refs = [item.get("ref") for item in result.get("reference_list") or []]
+        self.assertEqual(["Иоанн 3:4", "Иаков 1:2"], refs)
+
     def test_split_psalm_range_before_psalm_title_uses_full_buffer(self):
         pipeline = LiveReferencePipeline()
 
@@ -996,6 +1007,34 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertEqual("Иаков 2:18", result.get("parsed", {}).get("ref"))
         self.assertEqual("parser", result.get("source"))
+
+    def test_reversed_chapter_after_range_with_self_correction(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("евангелие от луки первое четыре первый четвёртый стих пятое главы")
+
+        self.assertEqual("Лука 5:1-4", result.get("parsed", {}).get("ref"))
+
+    def test_later_explicit_book_correction_overrides_earlier_book_fragment(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text(
+            "первое фесс первое послание петра первое глава третье четвёртый стих"
+        )
+
+        self.assertEqual("1 Петра 1:3-4", result.get("parsed", {}).get("ref"))
+
+    def test_counting_rhyme_does_not_resolve_to_ruth(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("русь два три четыре пять по главе")
+
+        self.assertFalse(result.get("matched"))
+        self.assertEqual("ruth_counting_rhyme", result.get("blocked_weak_context"))
+
+        normal = pipeline.process_text("книга руфь третья глава четвёртый пятый стих")
+
+        self.assertEqual("Руфь 3:4-5", normal.get("parsed", {}).get("ref"))
 
     def test_numbered_kingdoms_range_waits_for_chapter_context(self):
         pipeline = LiveReferencePipeline()

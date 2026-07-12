@@ -933,6 +933,13 @@ def ref_candidates(normalized: str, book: str, bible: dict[str, dict[int, dict[i
         if start_verse <= end_verse:
             add(chapter, list(range(start_verse, end_verse + 1)), match.start(), match.end(), 0.99)
 
+    for match in re.finditer(r"(?:\d+\s+\d+\s+)?(\d+)\s+(\d+)\s+стих\s+(\d+)\s+глава", normalized):
+        start_verse = int(match.group(1))
+        end_verse = int(match.group(2))
+        chapter = int(match.group(3))
+        if start_verse < end_verse:
+            add(chapter, list(range(start_verse, end_verse + 1)), match.start(), match.end(), 1.04)
+
     for match in re.finditer(r"стих\s+с\s+(\d+)\s+по\s+(\d+)\s+(\d+)\s+глава", normalized):
         start_verse = int(match.group(1))
         end_verse = int(match.group(2))
@@ -1433,6 +1440,15 @@ def parse_live_reference(text: str, bible_path: Path = DEFAULT_BIBLE) -> ParsedR
                 score -= 0.35
             if book_candidate.end <= ref_candidate.start:
                 score += 0.2
+                if any(
+                    other is not book_candidate
+                    and other.start > book_candidate.start
+                    and other.end <= ref_candidate.start
+                    and re.match(r"^\d+\s", other.book)
+                    and other.score >= 0.999
+                    for other in books
+                ):
+                    score -= 1.1
             if ref_candidate.end_chapter is not None:
                 score += 0.9
             if len(ref_candidate.verses) > 1:
