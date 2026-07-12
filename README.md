@@ -198,13 +198,11 @@ LiVerse больше не отправляет собственный текст
 
 ## Установка на Windows 10
 
-1. Установите Python 3.10+.
-2. Распакуйте проект.
-3. Запустите `install-windows.ps1`.
-4. Откройте `.env`, вставьте `HOLYRICS_TOKEN` и проверьте `HOLYRICS_PORT`.
-5. Запускайте `run-liverse.cmd`.
+Рекомендуемый способ для церковного компьютера - скрипт
+`update-liverse-windows.ps1`. Он подходит и для первой установки, и для
+обновления уже установленного LiVerse.
 
-### Установка Windows 10 с нуля из консоли
+### Первая установка или обновление из консоли
 
 Если браузер на старом компьютере сильно тормозит, можно поставить Git,
 скачать последнюю версию LiVerse и создать виртуальное окружение одной
@@ -214,25 +212,50 @@ LiVerse больше не отправляет собственный текст
 powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr https://raw.githubusercontent.com/andukR/LiVerse/main/bootstrap-windows.ps1 -UseBasicParsing | iex"
 ```
 
+Старая команда с `bootstrap-windows.ps1` остаётся рабочей: теперь она скачивает
+и запускает актуальный `update-liverse-windows.ps1`.
+
 Скрипт делает следующее:
 
 1. ищет `git`; если Git не найден, пробует поставить Git for Windows через
    `winget`, затем через официальный релиз Git for Windows на GitHub;
 2. скачивает или обновляет репозиторий `https://github.com/andukR/LiVerse.git`
    из ветки `main`;
-3. проверяет Python 3.10+;
-4. создаёт `.venv`;
-5. устанавливает зависимости и сам LiVerse.
+3. проверяет Python 3.10+; если Python не найден и доступен `winget`, пробует
+   поставить Python 3.12;
+4. сохраняет локальный `.env` с token Holyrics;
+5. обновляет tracked-файлы проекта до последней версии GitHub;
+6. пересоздаёт `.venv`, если виртуальное окружение повреждено;
+7. устанавливает зависимости и сам LiVerse через рабочую для Windows 10
+   последовательность `pip install -e . --no-build-isolation`;
+8. создаёт ярлык `LiVerse` на рабочем столе.
 
-По умолчанию проект будет лежать в `%USERPROFILE%\LiVerse`. Запуск:
+По умолчанию проект лежит в `%USERPROFILE%\LiVerse`. Файл настроек с token
+Holyrics лежит там же:
+
+```powershell
+notepad $HOME\LiVerse\.env
+```
+
+При обновлении `.env` не перезаписывается. Не добавляйте `.env` в Git: в нём
+хранится локальный token Holyrics.
+
+Запуск:
 
 ```powershell
 cd $HOME\LiVerse
 .\run-liverse.cmd
 ```
 
-Если LiVerse уже скачан через Git, эта же команда обновит его до последней
-версии ветки `main`.
+Если LiVerse уже установлен через Git, та же команда `bootstrap-windows.ps1`
+обновит его до последней версии ветки `main`.
+
+Если репозиторий уже скачан и нужно запустить новый скрипт из папки проекта:
+
+```powershell
+cd $HOME\LiVerse
+powershell -NoProfile -ExecutionPolicy Bypass -File .\update-liverse-windows.ps1
+```
 
 Если запустить `run-liverse.cmd` без параметров, он включает тот же рабочий
 режим, что и `make liverse`: подтверждение через телефон, вывод в Holyrics и

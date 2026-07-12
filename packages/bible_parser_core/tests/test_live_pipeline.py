@@ -64,6 +64,7 @@ class LiveReferencePipelineTest(unittest.TestCase):
             "послание фил вторая глава пятый стих",
             "послание фи лип вторая глава пятый стих",
             "послание фи лип пи вторая глава пятый стих",
+            "послание фи лип пи царств вторая глава пятый стих",
             "послание филип вторая глава пятый стих",
             "послание филипп вторая глава пятый стих",
         ):
@@ -71,6 +72,10 @@ class LiveReferencePipelineTest(unittest.TestCase):
                 result = pipeline.process_text(text)
 
                 self.assertEqual("Филиппийцам 2:5", result.get("parsed", {}).get("ref"))
+
+        grammar = build_grammar()
+        self.assertIn("фи лип пи царств", grammar)
+        self.assertIn("послание фи лип пи царств", grammar)
 
     def test_philippians_fi_levit_asr_distortion(self):
         pipeline = LiveReferencePipeline()
@@ -100,10 +105,12 @@ class LiveReferencePipelineTest(unittest.TestCase):
         for text, expected in (
             ("книга не ем и я вторая глава первый стих", "Неемия 2:1"),
             ("не ем и я вторая глава первый стих", "Неемия 2:1"),
+            ("не михея вторая глава первый стих", "Неемия 2:1"),
             ("книга ио иль вторая глава первый стих", "Иоиль 2:1"),
             ("пророка ио иль вторая глава первый стих", "Иоиль 2:1"),
             ("книга со фон и я третья глава первый стих", "Софония 3:1"),
             ("пророка со фон и я третья глава первый стих", "Софония 3:1"),
+            ("книга михея первая глава первый стих", "Михей 1:1"),
         ):
             with self.subTest(text=text):
                 result = pipeline.process_text(text)
@@ -140,18 +147,34 @@ class LiveReferencePipelineTest(unittest.TestCase):
             ("первое фес первая глава третий стих", "1 Фессалоникийцам 1:3"),
             ("первое фес салон первая глава третий стих", "1 Фессалоникийцам 1:3"),
             ("первое фесс салоники первая глава третий стих", "1 Фессалоникийцам 1:3"),
+            ("первое фес салоники царств первая глава третий стих", "1 Фессалоникийцам 1:3"),
+            ("первое фесс салоники царств первая глава третий стих", "1 Фессалоникийцам 1:3"),
             ("второе фес салон вторая глава первый стих", "2 Фессалоникийцам 2:1"),
             ("второе послание фесс салоник вторая глава первый стих", "2 Фессалоникийцам 2:1"),
+            ("второе фес салоники царств вторая глава первый стих", "2 Фессалоникийцам 2:1"),
+            ("второе фесс салоники царств вторая глава первый стих", "2 Фессалоникийцам 2:1"),
         ):
             with self.subTest(text=text):
                 result = pipeline.process_text(text)
 
                 self.assertEqual(expected, result.get("parsed", {}).get("ref"))
 
+        grammar = build_grammar()
+        self.assertIn("первое фес салоники царств", grammar)
+        self.assertIn("второе фес салоники царств", grammar)
+        self.assertIn("первое фесс", grammar)
+        self.assertIn("второе фесс", grammar)
+
     def test_unnumbered_fes_saloniki_does_not_resolve_to_ephesians(self):
         pipeline = LiveReferencePipeline()
 
         result = pipeline.process_text("фес салоники четвёртая глава девятые десятая стих")
+
+        self.assertFalse(result.get("matched"))
+        self.assertEqual("ambiguous_unnumbered_thessalonians", result.get("blocked_weak_context"))
+        self.assertIn("Номер книги не был назван", result.get("message", ""))
+
+        result = pipeline.process_text("фес салоники царств первая глава третий стих")
 
         self.assertFalse(result.get("matched"))
         self.assertEqual("ambiguous_unnumbered_thessalonians", result.get("blocked_weak_context"))
@@ -174,6 +197,22 @@ class LiveReferencePipelineTest(unittest.TestCase):
         result = pipeline.process_text("первое иоана четыре восемнадцать")
 
         self.assertEqual("1 Иоанна 4:18", result.get("parsed", {}).get("ref"))
+
+    def test_numbered_yana_epistle_keeps_spoken_book_number(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("второе послание яна первое глава четвёртую стих")
+
+        self.assertEqual("2 Иоанна 1:4", result.get("parsed", {}).get("ref"))
+
+    def test_split_john_alias(self):
+        pipeline = LiveReferencePipeline()
+
+        gospel = pipeline.process_text("евангелие от и о анна три шестнадцать")
+        epistle = pipeline.process_text("первое послание и о анна пятая глава тринадцатый стих")
+
+        self.assertEqual("Иоанн 3:16", gospel.get("parsed", {}).get("ref"))
+        self.assertEqual("1 Иоанна 5:13", epistle.get("parsed", {}).get("ref"))
 
     def test_nonexistent_first_corinthians_verse_does_not_match(self):
         pipeline = LiveReferencePipeline()

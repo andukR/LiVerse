@@ -1,0 +1,29 @@
+name: Windows install
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  install:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install LiVerse with Windows updater
+        shell: powershell
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP "LiVerse"
+          .\update-liverse-windows.ps1 `
+            -TargetDir $target `
+            -RepoUrl "https://github.com/${{ github.repository }}.git" `
+            -Branch "${{ github.ref_name }}"
+
+      - name: Verify installed LiVerse
+        shell: powershell
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP "LiVerse"
+          & "$target\.venv\Scripts\python.exe" -c "import vosk, sounddevice, bible_parser_core; print('Import check OK')"

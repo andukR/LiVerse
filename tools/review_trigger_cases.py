@@ -121,11 +121,17 @@ def save_state(path: Path, case_id: str) -> None:
 
 
 def case_audio_path(case: dict[str, Any], cases_path: Path) -> Path:
+    fallback_path = cases_path.parent / "audio.wav"
     audio = str(case.get("audio") or "").strip()
     if audio:
         path = Path(audio)
-        return path if path.is_absolute() else Path.cwd() / path
-    return cases_path.parent / "audio.wav"
+        candidate = path if path.is_absolute() else Path.cwd() / path
+        if candidate.exists():
+            return candidate
+        if fallback_path.exists():
+            return fallback_path
+        return candidate
+    return fallback_path
 
 
 def float_value(value: object, default: float = 0.0) -> float:
@@ -148,6 +154,15 @@ def play_case(case: dict[str, Any], cases_path: Path, *, long: bool = False) -> 
         start = max(0.0, start - 10.0)
         duration += 20.0
 
+    if shutil.which("mpv"):
+        subprocess.Popen(
+            ["mpv", "--no-video", f"--start={start:.3f}", f"--length={duration:.3f}", "--quiet", str(audio_path)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        print(f"Проигрываю: {audio_path} [{start:.3f}s + {duration:.3f}s]")
+        return
+
     if shutil.which("ffplay"):
         subprocess.Popen(
             [
@@ -160,15 +175,6 @@ def play_case(case: dict[str, Any], cases_path: Path, *, long: bool = False) -> 
                 f"{duration:.3f}",
                 str(audio_path),
             ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        print(f"Проигрываю: {audio_path} [{start:.3f}s + {duration:.3f}s]")
-        return
-
-    if shutil.which("mpv"):
-        subprocess.Popen(
-            ["mpv", "--no-video", f"--start={start:.3f}", f"--length={duration:.3f}", "--quiet", str(audio_path)],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )

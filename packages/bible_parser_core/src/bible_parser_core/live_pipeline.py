@@ -743,10 +743,10 @@ def should_block_matched_payload(payload: dict) -> str | None:
         if re.search(rf"\bевангелие\s+от\s+{marker}\b", normalized) and not ref.startswith(book):
             return "gospel_book_conflict"
 
+    thessalonian_form = r"(?:фес+с?\s+салон(?:ик|ики)?(?:\s+царств)?|фессалоникийцам)"
     if (
-        re.search(r"\bфес+с?\s+салон(?:ик|ики)?\b", normalized)
-        and not re.search(r"\b(?:1|2|перв\w*|втор\w*)\s+(?:послани[ея]\s+)?фес+с?\s+салон(?:ик|ики)?\b", normalized)
-        and not re.search(r"^[12]\s+Фессалоникийцам\b", ref)
+        re.search(rf"\b{thessalonian_form}\b", normalized)
+        and not re.search(rf"\b(?:1|2|перв\w*|втор\w*)\s+(?:послани[ея]\s+)?{thessalonian_form}\b", normalized)
     ):
         return "ambiguous_unnumbered_thessalonians"
 

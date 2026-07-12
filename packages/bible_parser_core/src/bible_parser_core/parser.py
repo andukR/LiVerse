@@ -329,6 +329,7 @@ ASR_REPLACEMENTS = (
     (r"\bпод\s+иуанна\b", "от иоанна"),
     (r"\bевангелие\s+гуана\b", "евангелие от иоанна"),
     (r"\bи\s+у\s+ванна\b", "иоанна"),
+    (r"\bи\s+о\s+анна\b", "иоанна"),
     (r"\bот\s+илана\b", "от иоанна"),
     (r"\bот\s+яна\b", "от иоанна"),
     (r"\biii\b", "3"),
@@ -473,6 +474,7 @@ def normalize_text(text: str) -> str:
     normalized = re.sub(r"\b([12])\s+послание\s+коринфянам\b", r"\1 коринфянам", normalized)
     normalized = re.sub(r"\b([12])\s+послание\s+тимофею\b", r"\1 тимофею", normalized)
     normalized = re.sub(r"\b([12])\s+послание\s+петра\b", r"\1 петра", normalized)
+    normalized = re.sub(r"\b([123])\s+послание\s+яна\b", r"\1 иоанна", normalized)
     normalized = re.sub(r"\b([123])\s+послание\s+иоанна\b", r"\1 иоанна", normalized)
     normalized = re.sub(r"\b1\s+послание\s+(?:апостола\s+павл[аы]\s+)?фессалоникийцам\b", "1 фессалоникийцам", normalized)
     normalized = re.sub(r"\b2\s+послание\s+(?:апостола\s+павл[аы]\s+)?фессалоникийцам\b", "2 фессалоникийцам", normalized)
