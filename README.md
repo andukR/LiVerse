@@ -258,6 +258,18 @@ cd $HOME\LiVerse
 powershell -NoProfile -ExecutionPolicy Bypass -File .\update-liverse-windows.ps1
 ```
 
+Если PowerShell на компьютере работает нестабильно или его невозможно
+обновить, используйте вариант без PowerShell:
+
+```cmd
+cd /d %USERPROFILE%\LiVerse
+update-liverse-windows.cmd
+```
+
+Этот вариант использует обычный `cmd.exe`, `git`, `py/python` и `pip`.
+Журнал обновления создаётся в той же папке `$HOME\LiVerse-update-logs`, только
+с именем вида `liverse-update-cmd-XXXXX.log`.
+
 Каждый запуск `update-liverse-windows.ps1` пишет журнал обновления в папку:
 
 ```powershell
