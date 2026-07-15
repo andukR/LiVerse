@@ -397,12 +397,15 @@ function Sync-Repository {
 }
 
 function Ensure-Venv {
-    param($PythonSpec)
+    param(
+        $PythonSpec,
+        [switch]$Force
+    )
 
     $venvDir = Join-Path $TargetDir ".venv"
     $venvPython = Join-Path $venvDir "Scripts\python.exe"
 
-    if (Test-Path $venvPython) {
+    if ((-not $Force) -and (Test-Path $venvPython)) {
         & $venvPython -c "import sys; print(sys.executable)" *> $null
         $pythonOk = $LASTEXITCODE -eq 0
         & $venvPython -m pip --version *> $null
@@ -534,7 +537,15 @@ try {
     $pythonSpec = Find-Python
     Sync-Repository
     $venvPython = Ensure-Venv -PythonSpec $pythonSpec
-    Install-LiVerse -VenvPython $venvPython
+    try {
+        Install-LiVerse -VenvPython $venvPython
+    }
+    catch {
+        Write-Warning "LiVerse installation failed with the current virtual environment: $($_.Exception.Message)"
+        Write-Warning "Recreating .venv and retrying once."
+        $venvPython = Ensure-Venv -PythonSpec $pythonSpec -Force
+        Install-LiVerse -VenvPython $venvPython
+    }
     New-DesktopShortcut
 
     Write-Host ""
