@@ -353,6 +353,11 @@ function Sync-Repository {
                 -Description "git fetch origin $Branch" `
                 -RetryNetwork
 
+            if (Test-RepositoryAtOrigin) {
+                Write-Host "Repository is already at origin/$Branch. Skipping checkout/reset."
+                return
+            }
+
             # The church computer is a deployment copy, not a development copy.
             # Reset tracked files to the fetched GitHub state while preserving .env.
             Invoke-GitAndAcceptVerified `
