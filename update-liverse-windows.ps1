@@ -421,9 +421,19 @@ function Ensure-Venv {
     }
 
     Write-Step "Creating the virtual environment"
-    & $PythonSpec.File @($PythonSpec.Args) -m venv $venvDir
+    & $PythonSpec.File @($PythonSpec.Args) -m venv $venvDir --without-pip
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $venvPython)) {
         Fail "Could not create the virtual environment."
+    }
+
+    & $venvPython -m ensurepip --upgrade
+    if ($LASTEXITCODE -ne 0) {
+        Fail "Could not install pip into the virtual environment."
+    }
+
+    & $venvPython -m pip --version
+    if ($LASTEXITCODE -ne 0) {
+        Fail "pip is not working in the virtual environment."
     }
 
     return $venvPython

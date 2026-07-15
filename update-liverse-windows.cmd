@@ -109,9 +109,13 @@ if exist "%TARGET_DIR%\.venv" (
   if errorlevel 1 exit /b 18
 )
 echo Creating virtual environment...
-%PYTHON_CMD% -m venv "%TARGET_DIR%\.venv"
+%PYTHON_CMD% -m venv "%TARGET_DIR%\.venv" --without-pip
 if errorlevel 1 exit /b 19
 if not exist "%VENV_PY%" exit /b 20
+"%VENV_PY%" -m ensurepip --upgrade
+if errorlevel 1 exit /b 27
+"%VENV_PY%" -m pip --version
+if errorlevel 1 exit /b 28
 
 :venv_ready
 call :step Installing LiVerse
