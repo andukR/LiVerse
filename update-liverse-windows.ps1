@@ -134,6 +134,52 @@ function Invoke-Git {
     }
 }
 
+function Invoke-GitAndAcceptVerified {
+    param(
+        [string[]]$Arguments,
+        [string]$Description,
+        [scriptblock]$Verify
+    )
+
+    try {
+        Invoke-Git -Arguments $Arguments -Description $Description
+        return
+    }
+    catch {
+        $message = $_.Exception.Message
+        Write-Warning "$Description reported an error: $message"
+        if (& $Verify) {
+            Write-Warning "$Description appears to have completed successfully despite the Git process error. Continuing."
+            return
+        }
+        throw
+    }
+}
+
+function Get-GitOriginUrl {
+    $origin = (& git -C $TargetDir config --get remote.origin.url 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        return ""
+    }
+    return (($origin | Select-Object -First 1) -as [string]).Trim()
+}
+
+function Test-OriginUrl {
+    return (Get-GitOriginUrl) -eq $RepoUrl.Trim()
+}
+
+function Test-RepositoryAtOrigin {
+    $head = (& git -C $TargetDir rev-parse HEAD 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        return $false
+    }
+    $originHead = (& git -C $TargetDir rev-parse "origin/$Branch" 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        return $false
+    }
+    return ((($head | Select-Object -First 1) -as [string]).Trim()) -eq ((($originHead | Select-Object -First 1) -as [string]).Trim())
+}
+
 function Invoke-WebRequestWithRetry {
     param(
         [string]$Uri,
@@ -284,19 +330,19 @@ function Sync-Repository {
                 Fail "The target folder exists but is not a Git repository: $TargetDir"
             }
 
-            $currentOrigin = (& git -C $TargetDir config --get remote.origin.url 2>$null)
-            if ($LASTEXITCODE -ne 0) {
+            $currentOriginText = Get-GitOriginUrl
+            if (-not $currentOriginText) {
                 Fail "The Git repository has no usable 'origin' remote."
             }
 
-            $currentOriginText = (($currentOrigin | Select-Object -First 1) -as [string]).Trim()
             Write-Host "Git origin URL: $currentOriginText"
 
             if ($currentOriginText -ne $RepoUrl.Trim()) {
                 Write-Warning "Correcting origin URL: $currentOriginText -> $RepoUrl"
-                Invoke-Git `
+                Invoke-GitAndAcceptVerified `
                     -Arguments @("-C", $TargetDir, "remote", "set-url", "origin", $RepoUrl) `
-                    -Description "Updating origin URL"
+                    -Description "Updating origin URL" `
+                    -Verify { Test-OriginUrl }
             }
 
             # Only one network operation is needed. Do not use git pull here:
@@ -309,13 +355,15 @@ function Sync-Repository {
 
             # The church computer is a deployment copy, not a development copy.
             # Reset tracked files to the fetched GitHub state while preserving .env.
-            Invoke-Git `
+            Invoke-GitAndAcceptVerified `
                 -Arguments @("-C", $TargetDir, "checkout", "-B", $Branch, "origin/$Branch") `
-                -Description "Checking out $Branch"
+                -Description "Checking out $Branch" `
+                -Verify { Test-RepositoryAtOrigin }
 
-            Invoke-Git `
+            Invoke-GitAndAcceptVerified `
                 -Arguments @("-C", $TargetDir, "reset", "--hard", "origin/$Branch") `
-                -Description "Resetting files to origin/$Branch"
+                -Description "Resetting files to origin/$Branch" `
+                -Verify { Test-RepositoryAtOrigin }
         }
         else {
             $parent = Split-Path -Parent $TargetDir
