@@ -534,6 +534,10 @@ function New-DesktopShortcut {
     $shortcut.TargetPath = $runner
     $shortcut.WorkingDirectory = $TargetDir
     $shortcut.Description = "Start LiVerse"
+    $icon = Join-Path $TargetDir "LiVerse.ico"
+    if (Test-Path $icon) {
+        $shortcut.IconLocation = $icon
+    }
     $shortcut.Save()
 
     Write-Host "Shortcut: $shortcutPath"

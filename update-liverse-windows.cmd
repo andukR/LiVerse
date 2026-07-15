@@ -197,6 +197,7 @@ set "VBS=%TEMP%\liverse-shortcut-%RANDOM%%RANDOM%.vbs"
 >> "%VBS%" echo shortcut.TargetPath = "%TARGET_DIR%\run-liverse.cmd"
 >> "%VBS%" echo shortcut.WorkingDirectory = "%TARGET_DIR%"
 >> "%VBS%" echo shortcut.Description = "Start LiVerse"
+>> "%VBS%" echo shortcut.IconLocation = "%TARGET_DIR%\LiVerse.ico"
 >> "%VBS%" echo shortcut.Save
 cscript //nologo "%VBS%"
 set "VBS_RESULT=%ERRORLEVEL%"
