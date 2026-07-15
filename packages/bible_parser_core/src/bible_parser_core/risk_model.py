@@ -230,8 +230,25 @@ def score_payload_with_model(payload: dict, model: dict, asr_result: dict | None
     row = model_row_from_payload(payload, asr_result=asr_result)
     probability = predict_confirm_probability(model, row)
     threshold = float(model.get("recommended_threshold") or 0.3)
+    needs_confirmation = probability >= threshold
+    decision_reasons: list[str] = []
+    parsed = payload.get("parsed") or {}
+    risk_reasons = set(str(reason) for reason in (payload.get("risk_reasons") or []))
+    if payload.get("source") == "parser_missing_twenty_range":
+        needs_confirmation = True
+        decision_reasons.append("missing_tens_range_repair")
+    if (
+        parsed.get("ref") == "Иоанн 3:16"
+        and payload.get("source") == "parser"
+        and not payload.get("ambiguous_alternatives")
+        and not payload.get("invalid_reference")
+        and not (risk_reasons & {"low_word_confidence", "low_average_confidence", "confusable_book_form"})
+    ):
+        needs_confirmation = False
+        decision_reasons.append("trusted_john_3_16")
     return {
         "confirm_probability": round(probability, 3),
         "threshold": threshold,
-        "needs_confirmation": probability >= threshold,
+        "needs_confirmation": needs_confirmation,
+        "decision_reasons": decision_reasons,
     }

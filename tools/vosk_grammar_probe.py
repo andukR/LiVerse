@@ -746,17 +746,74 @@ def popup_approval_decision(slide: dict) -> str:
 def show_popup_message(title: str, message: str) -> None:
     try:
         import tkinter as tk
-        from tkinter import messagebox
+        from tkinter import font as tkfont
     except Exception:
         return
 
     root = tk.Tk()
-    root.withdraw()
+    root.title(title)
     root.attributes("-topmost", True)
-    try:
-        messagebox.showwarning(title, message, parent=root)
-    finally:
+    root.configure(bg="#101820")
+    root.resizable(True, True)
+
+    width, height = 980, 360
+    screen_width = root.winfo_screenwidth()
+    screen_height = root.winfo_screenheight()
+    x = max(0, (screen_width - width) // 2)
+    y = max(0, (screen_height - height) // 2)
+    root.geometry(f"{width}x{height}+{x}+{y}")
+
+    title_font = tkfont.Font(family="Segoe UI", size=38, weight="bold")
+    body_font = tkfont.Font(family="Segoe UI", size=26, weight="bold")
+    button_font = tkfont.Font(family="Segoe UI", size=22, weight="bold")
+
+    tk.Label(
+        root,
+        text="Внимание",
+        bg="#101820",
+        fg="#ffd166",
+        font=title_font,
+        wraplength=900,
+        justify="center",
+    ).pack(fill="x", padx=36, pady=(34, 10))
+
+    tk.Label(
+        root,
+        text=message,
+        bg="#101820",
+        fg="#f5f7fa",
+        font=body_font,
+        wraplength=900,
+        justify="center",
+    ).pack(fill="both", expand=True, padx=36, pady=(8, 22))
+
+    buttons = tk.Frame(root, bg="#101820")
+    buttons.pack(fill="x", padx=36, pady=(0, 30))
+
+    def close() -> None:
         root.destroy()
+
+    ok = tk.Button(
+        buttons,
+        text="ОК",
+        command=close,
+        bg="#148447",
+        fg="white",
+        activebackground="#1aa158",
+        activeforeground="white",
+        font=button_font,
+        relief="flat",
+        padx=24,
+        pady=16,
+    )
+    ok.pack(fill="x", expand=True)
+
+    root.bind("<Return>", lambda _event: close())
+    root.bind("<Escape>", lambda _event: close())
+    root.protocol("WM_DELETE_WINDOW", close)
+    root.after(100, root.focus_force)
+    root.after(150, root.lift)
+    root.mainloop()
 
 
 def notify_operator_message(args: argparse.Namespace, payload: dict) -> None:

@@ -1,11 +1,17 @@
 ﻿param(
     [string]$TargetDir = (Join-Path $HOME "LiVerse"),
     [string]$RepoUrl = "https://github.com/andukR/LiVerse.git",
-    [string]$Branch = "main"
+    [string]$Branch = "main",
+    [int]$NetworkRetries = 4,
+    [string]$LogDir = (Join-Path $HOME "LiVerse-update-logs")
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+
+$script:UpdateLogPath = $null
+$script:TranscriptStarted = $false
+$script:UpdateFailed = $false
 
 function Write-Step {
     param([string]$Text)
@@ -23,6 +29,42 @@ function Test-Command {
     return $null -ne (Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
+function Start-UpdateLog {
+    if (-not (Test-Path $LogDir)) {
+        New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+    }
+
+    $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $script:UpdateLogPath = Join-Path $LogDir "liverse-update-$timestamp.log"
+
+    try {
+        Start-Transcript -Path $script:UpdateLogPath -Force | Out-Null
+        $script:TranscriptStarted = $true
+        Write-Host "Update log: $script:UpdateLogPath"
+        Write-Host "PowerShell: $($PSVersionTable.PSVersion)"
+        Write-Host "User: $env:USERNAME"
+        Write-Host "Computer: $env:COMPUTERNAME"
+        Write-Host "TargetDir: $TargetDir"
+        Write-Host "RepoUrl: $RepoUrl"
+        Write-Host "Branch: $Branch"
+    }
+    catch {
+        Write-Warning "Could not start update log: $($_.Exception.Message)"
+    }
+}
+
+function Stop-UpdateLog {
+    if ($script:TranscriptStarted) {
+        try {
+            Stop-Transcript | Out-Null
+            $script:TranscriptStarted = $false
+        }
+        catch {
+            Write-Warning "Could not stop update log: $($_.Exception.Message)"
+        }
+    }
+}
+
 function Refresh-Path {
     $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -36,10 +78,85 @@ function Refresh-Path {
     $env:Path = (@($machinePath, $userPath) + $extra) -join ";"
 }
 
+function Invoke-WithRetry {
+    param(
+        [scriptblock]$Action,
+        [string]$Description,
+        [int]$Attempts = $NetworkRetries,
+        [int]$InitialDelaySeconds = 3
+    )
+
+    $lastError = $null
+
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            & $Action
+            return
+        }
+        catch {
+            $lastError = $_
+            if ($attempt -ge $Attempts) {
+                break
+            }
+
+            $delay = $InitialDelaySeconds * $attempt
+            Write-Warning "$Description failed (attempt $attempt of $Attempts): $($_.Exception.Message)"
+            Write-Host "Retrying in $delay seconds..."
+            Start-Sleep -Seconds $delay
+        }
+    }
+
+    throw "$Description failed after $Attempts attempts. Last error: $($lastError.Exception.Message)"
+}
+
+function Invoke-Git {
+    param(
+        [string[]]$Arguments,
+        [string]$Description = "Git command",
+        [switch]$RetryNetwork
+    )
+
+    $action = {
+        # Force HTTP/1.1 only for this Git invocation. This keeps the fix local
+        # to LiVerse instead of changing the user's global Git configuration.
+        & git -c http.version=HTTP/1.1 @Arguments
+        $exitCode = $LASTEXITCODE
+        if ($exitCode -ne 0) {
+            throw "$Description exited with code $exitCode."
+        }
+    }
+
+    if ($RetryNetwork) {
+        Invoke-WithRetry -Action $action -Description $Description
+    }
+    else {
+        & $action
+    }
+}
+
+function Invoke-WebRequestWithRetry {
+    param(
+        [string]$Uri,
+        [string]$OutFile,
+        [hashtable]$Headers = @{}
+    )
+
+    Invoke-WithRetry -Description "Download from $Uri" -Action {
+        Invoke-WebRequest `
+            -Uri $Uri `
+            -OutFile $OutFile `
+            -Headers $Headers `
+            -UseBasicParsing `
+            -TimeoutSec 120
+    }
+}
+
 function Ensure-Git {
     Refresh-Path
     if (Test-Command "git") {
+        $gitCommand = Get-Command git
         Write-Host "Git: $(& git --version)"
+        Write-Host "Git executable: $($gitCommand.Source)"
         return
     }
 
@@ -57,6 +174,9 @@ function Ensure-Git {
     if (-not (Test-Command "git")) {
         Fail "Git is not installed. Install Git for Windows and run this script again."
     }
+
+    Write-Host "Git: $(& git --version)"
+    Write-Host "Git executable: $((Get-Command git).Source)"
 }
 
 function Install-GitFromGitHub {
@@ -64,10 +184,14 @@ function Install-GitFromGitHub {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
     $headers = @{ "User-Agent" = "LiVerse-Windows-Update" }
-    $release = Invoke-RestMethod `
-        -Uri "https://api.github.com/repos/git-for-windows/git/releases/latest" `
-        -Headers $headers `
-        -UseBasicParsing
+    $release = Invoke-WithRetry -Description "Reading the latest Git for Windows release" -Action {
+        Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/git-for-windows/git/releases/latest" `
+            -Headers $headers `
+            -UseBasicParsing `
+            -TimeoutSec 120
+    }
+
     $asset = $release.assets |
         Where-Object { $_.name -like "Git-*-64-bit.exe" } |
         Select-Object -First 1
@@ -77,7 +201,10 @@ function Install-GitFromGitHub {
     }
 
     $installer = Join-Path $env:TEMP $asset.name
-    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $installer -Headers $headers -UseBasicParsing
+    Invoke-WebRequestWithRetry `
+        -Uri $asset.browser_download_url `
+        -OutFile $installer `
+        -Headers $headers
 
     $process = Start-Process `
         -FilePath $installer `
@@ -157,20 +284,51 @@ function Sync-Repository {
                 Fail "The target folder exists but is not a Git repository: $TargetDir"
             }
 
+            $currentOrigin = (& git -C $TargetDir remote get-url origin 2>$null)
+            if ($LASTEXITCODE -ne 0) {
+                Fail "The Git repository has no usable 'origin' remote."
+            }
+
+            if ($currentOrigin.Trim() -ne $RepoUrl.Trim()) {
+                Write-Warning "Correcting origin URL: $currentOrigin -> $RepoUrl"
+                Invoke-Git `
+                    -Arguments @("-C", $TargetDir, "remote", "set-url", "origin", $RepoUrl) `
+                    -Description "Updating origin URL"
+            }
+
+            # Only one network operation is needed. Do not use git pull here:
+            # pull performs another fetch and caused intermittent HTTPS failures.
+            $remoteRef = "+refs/heads/$($Branch):refs/remotes/origin/$($Branch)"
+            Invoke-Git `
+                -Arguments @("-C", $TargetDir, "fetch", "--prune", "origin", $remoteRef) `
+                -Description "git fetch origin $Branch" `
+                -RetryNetwork
+
             # The church computer is a deployment copy, not a development copy.
-            # Reset tracked files to GitHub while preserving the ignored .env file.
-            & git -C $TargetDir fetch origin $Branch
-            if ($LASTEXITCODE -ne 0) { Fail "git fetch failed." }
+            # Reset tracked files to the fetched GitHub state while preserving .env.
+            Invoke-Git `
+                -Arguments @("-C", $TargetDir, "checkout", "-B", $Branch, "origin/$Branch") `
+                -Description "Checking out $Branch"
 
-            & git -C $TargetDir checkout $Branch
-            if ($LASTEXITCODE -ne 0) { Fail "git checkout failed." }
-
-            & git -C $TargetDir reset --hard "origin/$Branch"
-            if ($LASTEXITCODE -ne 0) { Fail "git reset failed." }
+            Invoke-Git `
+                -Arguments @("-C", $TargetDir, "reset", "--hard", "origin/$Branch") `
+                -Description "Resetting files to origin/$Branch"
         }
         else {
-            & git clone --branch $Branch $RepoUrl $TargetDir
-            if ($LASTEXITCODE -ne 0) { Fail "git clone failed." }
+            $parent = Split-Path -Parent $TargetDir
+            if ($parent -and -not (Test-Path $parent)) {
+                New-Item -ItemType Directory -Path $parent -Force | Out-Null
+            }
+
+            Invoke-WithRetry -Description "git clone" -Action {
+                if (Test-Path $TargetDir) {
+                    Remove-Item $TargetDir -Recurse -Force
+                }
+
+                Invoke-Git `
+                    -Arguments @("clone", "--branch", $Branch, "--single-branch", $RepoUrl, $TargetDir) `
+                    -Description "Cloning LiVerse"
+            }
         }
     }
     finally {
@@ -268,6 +426,8 @@ function New-DesktopShortcut {
     Write-Host "Shortcut: $shortcutPath"
 }
 
+Start-UpdateLog
+
 try {
     Write-Step "Preparing LiVerse for Windows 10"
     Ensure-Git
@@ -281,13 +441,28 @@ try {
     Write-Host "LiVerse was installed or updated successfully." -ForegroundColor Green
     Write-Host "Project: $TargetDir"
     Write-Host "Start it from the LiVerse shortcut on the desktop."
+    if ($script:UpdateLogPath) {
+        Write-Host "Update log: $script:UpdateLogPath"
+    }
 }
 catch {
     Write-Host ""
     Write-Host "LiVerse installation/update failed:" -ForegroundColor Red
     Write-Host $_.Exception.Message -ForegroundColor Red
     Write-Host ""
+    Write-Host "The detailed Git or network error should be visible above."
+    if ($script:UpdateLogPath) {
+        Write-Host "Send this update log for diagnostics:"
+        Write-Host $script:UpdateLogPath
+    }
     Write-Host "Press Enter to close this window."
     Read-Host | Out-Null
+    $script:UpdateFailed = $true
+}
+finally {
+    Stop-UpdateLog
+}
+
+if ($script:UpdateFailed) {
     exit 1
 }

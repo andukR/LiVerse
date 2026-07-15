@@ -365,6 +365,7 @@ ASR_REPLACEMENTS = (
     (r"\bкол\s+осии\s+яна\b", "колоссянам 1"),
     (r"\bкол\s+осии\b", "колоссянам"),
     (r"\bкол\s+осия\s+нам\b", "колоссянам"),
+    (r"\bсия\s+нам(?=\s+(?:\d+|перв\w*|втор\w*|трет\w*|четверт\w*|пят\w*|шест\w*|седьм\w*|восьм\w*|девят\w*|десят\w*)\s+глав)", "колоссянам"),
     (r"\bколос\s+нам\b", "колоссянам"),
     (r"\bколос\s+са\s+нам\b", "колоссянам"),
     (r"\bколоса\s+нам\b", "колоссянам"),
@@ -948,19 +949,43 @@ def ref_candidates(normalized: str, book: str, bible: dict[str, dict[int, dict[i
             add(chapter, list(range(start_verse, end_verse + 1)), match.start(), match.end(), 0.99)
 
     cross_chapter_patterns = (
-        (r"(\d+)\s+глава\s+(?:с\s+)?(\d+)\s+стих\s+(?:по|до)\s+(\d+)\s+глава\s+(\d+)\s+стих", 0.995),
-        (r"(\d+)\s+глава\s+(?:с\s+)?(\d+)\s+(?:по|до)\s+(\d+)\s+глава\s+(\d+)\s+стих", 0.985),
+        (r"(\d+)\s+глава\s+(?:с\s+)?(\d+)\s+стих\s+(?:по|до)\s+(\d+)\s+глава\s+(\d+)\s+стих", 3, 4, 0.995),
+        (r"(\d+)\s+глава\s+(?:с\s+)?(\d+)\s+(?:по|до)\s+(\d+)\s+глава\s+(\d+)\s+стих", 3, 4, 0.985),
+        (r"(\d+)\s+глава\s+(?:с\s+)?(\d+)\s+стих\s+(?:до|2)\s+(\d+)(?:\s+\3)?\s+стих\s+(\d+)\s+глава", 4, 3, 1.06),
+        (r"(\d+)\s+(\d+)\s+стих\s+(?:до|2)\s+(\d+)(?:\s+\3)?\s+стих\s+(\d+)\s+глава", 4, 3, 1.06),
+        (r"\b(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\b", 3, 4, 1.07),
     )
-    for pattern, score in cross_chapter_patterns:
+    for pattern, end_chapter_group, end_verse_group, score in cross_chapter_patterns:
         for match in re.finditer(pattern, normalized):
+            start_chapter = int(match.group(1))
+            end_chapter = int(match.group(end_chapter_group))
+            if pattern == r"\b(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\b" and end_chapter != start_chapter + 1:
+                continue
             add_cross_chapter(
-                int(match.group(1)),
+                start_chapter,
                 int(match.group(2)),
-                int(match.group(3)),
-                int(match.group(4)),
+                end_chapter,
+                int(match.group(end_verse_group)),
                 match.start(),
                 match.end(),
                 score,
+            )
+
+    next_chapter_patterns = (
+        r"(\d+)\s+глава\s+(?:с\s+)?(\d+)\s+стих\s+(?:и\s+)?(?:по|до|2)\s+(\d+)\s+стих\s+следующ\w*\s+глава",
+        r"(\d+)\s+глава\s+(?:с\s+)?(\d+)\s+(?:и\s+)?(?:по|до|2)\s+(\d+)\s+стих\s+следующ\w*\s+глава",
+    )
+    for pattern in next_chapter_patterns:
+        for match in re.finditer(pattern, normalized):
+            start_chapter = int(match.group(1))
+            add_cross_chapter(
+                start_chapter,
+                int(match.group(2)),
+                start_chapter + 1,
+                int(match.group(3)),
+                match.start(),
+                match.end(),
+                1.07,
             )
 
     range_patterns = (
@@ -1026,10 +1051,10 @@ def ref_candidates(normalized: str, book: str, bible: dict[str, dict[int, dict[i
         chapter_end = max(chapter_map) if chapter_map else None
         tokens = [token for token, _start, _end in token_spans(normalized)]
         for match in re.finditer(
-            r"(?:с\s+)?(\d+)\s+стих(?:\s+\w+){0,4}?\s+(?:и\s+)?(?:до\s+)?конца\s+глава",
+            r"(?:с\s+(\d+)(?:\s+стих)?|(\d+)\s+стих)(?:\s+\w+){0,4}?\s+(?:и\s+)?(?:до\s+)?конца\s+глава",
             normalized,
         ):
-            start_verse = int(match.group(1))
+            start_verse = int(match.group(1) or match.group(2))
             if chapter_end is not None and start_verse <= chapter_end:
                 add(
                     chapter[0],
@@ -1037,6 +1062,22 @@ def ref_candidates(normalized: str, book: str, bible: dict[str, dict[int, dict[i
                     min(chapter[1], match.start()),
                     max(chapter[2], match.end()),
                     0.96,
+                )
+        chapter_suffix = normalized[chapter[2] :]
+        for match in re.finditer(
+            r"\b(\d+)(?:\s+стих)?(?:\s+\w+){0,4}?\s+(?:и\s+)?(?:до\s+)?конца\s+глава",
+            chapter_suffix,
+        ):
+            start_verse = int(match.group(1))
+            if chapter_end is not None and start_verse <= chapter_end:
+                start = chapter[2] + match.start()
+                end = chapter[2] + match.end()
+                add(
+                    chapter[0],
+                    list(range(start_verse, chapter_end + 1)),
+                    min(chapter[1], start),
+                    max(chapter[2], end),
+                    0.95,
                 )
         for match in re.finditer(r"с\s+(\d+)\s+по\s+(\d+)(?:\s+стих)?", normalized):
             start_verse = int(match.group(1))
@@ -1297,6 +1338,38 @@ def diagnose_invalid_reference(text: str, bible_path: Path = DEFAULT_BIBLE) -> I
         if not chapters:
             continue
 
+        for match in re.finditer(r"\b(\d+)\s+(\d+)\s+стих\s+(\d+)\s+глава\b", normalized):
+            start_verse = int(match.group(1))
+            end_verse = int(match.group(2))
+            chapter = int(match.group(3))
+            if start_verse > end_verse:
+                continue
+            if chapter not in chapters:
+                continue
+            chapter_map = chapters[chapter]
+            missing = [verse for verse in range(start_verse, end_verse + 1) if verse not in chapter_map]
+            if not missing:
+                continue
+            max_verse = max(chapter_map) if chapter_map else None
+            ref = f"{book} {chapter}:{start_verse}-{end_verse}"
+            message = (
+                f"Такого стиха нет: {ref}. "
+                f"В {book} {chapter} главе стихов: {max_verse}."
+                if max_verse
+                else f"Такого стиха нет: {ref}."
+            )
+            return InvalidReference(
+                book=book,
+                chapter=chapter,
+                start_verse=start_verse,
+                end_verse=end_verse,
+                ref=ref,
+                message=message,
+                reason="invalid_verse",
+                source_text=text,
+                max_verse=max_verse,
+            )
+
         chapter, verses = infer_chapter_and_verses(normalized, book, bible)
         if chapter is None or not verses:
             continue
@@ -1495,7 +1568,7 @@ def parse_live_reference(text: str, bible_path: Path = DEFAULT_BIBLE) -> ParsedR
         return None
     if (
         start_verse == end_verse
-        and re.search(r"\b(?:с\s+)?\d+\s+стих(?:\s+\w+){0,4}?\s+(?:и\s+)?(?:до\s+)?конца\s+глава\b", normalized)
+        and re.search(r"\b(?:с\s+\d+(?:\s+стих)?|\d+\s+стих)(?:\s+\w+){0,4}?\s+(?:и\s+)?(?:до\s+)?конца\s+глава\b", normalized)
         and chapter_map
     ):
         chapter_end = max(chapter_map)

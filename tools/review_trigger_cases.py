@@ -205,6 +205,17 @@ def print_case(case: dict[str, Any], position: int, total: int, *, cases_path: P
     parser_text = str(payload.get("text") or "").strip()
     if parser_text and parser_text != str(case.get("vosk_text") or "").strip():
         print(f"parser_text: {parser_text}")
+    reference_list = payload.get("reference_list") if isinstance(payload.get("reference_list"), list) else []
+    if reference_list:
+        print(f"recognized_list ({len(reference_list)}):")
+        for index, item in enumerate(reference_list, start=1):
+            if not isinstance(item, dict):
+                print(f"  {index}. {item}")
+                continue
+            ref = str(item.get("ref") or "").strip()
+            source_text = str(item.get("source_text") or "").strip()
+            suffix = f"  <-  {source_text}" if source_text else ""
+            print(f"  {index}. {ref}{suffix}")
     risk_score = payload.get("risk_score")
     risk_level = payload.get("risk_level")
     risk_reasons = payload.get("risk_reasons") or []
@@ -238,7 +249,12 @@ def find_start_position(cases: list[dict[str, Any]], state_case_id: str, no_resu
     if state_case_id and not no_resume:
         for index, case in enumerate(cases):
             if str(case.get("case_id") or "") == state_case_id:
-                return index
+                if is_unreviewed(case):
+                    return index
+                for next_index in range(index + 1, len(cases)):
+                    if is_unreviewed(cases[next_index]):
+                        return next_index
+                break
     for index, case in enumerate(cases):
         if str(case.get("status") or "unreviewed") == "unreviewed":
             return index

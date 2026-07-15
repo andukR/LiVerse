@@ -24,7 +24,7 @@ HOLYRICS_JSLIB_DOC_URL = "https://github.com/holyrics/jslib/blob/main/README-en.
 REQUIRED_HOLYRICS_PERMISSIONS = (
     "GetAPIServerInfo",
     "SetBibleSettings",
-    "ShowText",
+    "ShowQuickPresentation",
     "ShowVerse",
 )
 THEME_HOLYRICS_PERMISSIONS = (
@@ -213,6 +213,7 @@ def holyrics_verse_id(payload: dict) -> tuple[str | None, str]:
 
 def holyrics_show_verse_count(payload: dict) -> int:
     try:
+        book = str(payload.get("book") or "").strip()
         chapter = int(payload.get("chapter") or 0)
         start_verse = int(payload.get("start_verse") or 0)
         end_verse = int(payload.get("end_verse") or start_verse)
@@ -221,9 +222,33 @@ def holyrics_show_verse_count(payload: dict) -> int:
     except (TypeError, ValueError):
         return 1
 
-    if chapter != end_chapter or start_verse <= 0 or end_verse < start_verse:
+    if start_verse <= 0 or end_verse <= 0:
         return 1
-    return max(1, end_verse - start_verse + 1)
+    if chapter == end_chapter:
+        if end_verse < start_verse:
+            return 1
+        return max(1, end_verse - start_verse + 1)
+
+    try:
+        from bible_parser_core.parser import bible_map
+    except Exception:
+        return 1
+
+    chapters = bible_map().get(book, {})
+    if end_chapter <= chapter or chapter not in chapters or end_chapter not in chapters:
+        return 1
+
+    count = 0
+    for current_chapter in range(chapter, end_chapter + 1):
+        chapter_map = chapters.get(current_chapter, {})
+        if not chapter_map:
+            return 1
+        first = start_verse if current_chapter == chapter else min(chapter_map)
+        last = end_verse if current_chapter == end_chapter else max(chapter_map)
+        if first > last:
+            return 1
+        count += len([verse for verse in range(first, last + 1) if verse in chapter_map])
+    return max(1, count)
 
 
 def slide_payload_to_holyrics_text(payload: dict) -> str:
@@ -515,13 +540,13 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
         show_ok, show_reason, show_body = post_holyrics_api(
             args,
             base_url,
-            "ShowText",
-            {"text": text},
+            "ShowQuickPresentation",
+            slide_payload_to_holyrics_body(args, payload),
         )
-        holyrics_log(f"ShowText response={show_body or show_reason or 'ok'}")
+        holyrics_log(f"ShowQuickPresentation response={show_body or show_reason or 'ok'}")
         if not show_ok:
             return False, show_reason
-        return True, "show_text:reference_list"
+        return True, "show_quick_presentation:reference_list"
 
     verse_id, reason = holyrics_verse_id(payload)
     ref = str(payload.get("ref") or "").strip()

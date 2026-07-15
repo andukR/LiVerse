@@ -40,6 +40,14 @@ REFERENCE_WORDS = {
     "пророка",
     "псалом",
     "с",
+    "следующая",
+    "следующей",
+    "следующую",
+    "следующие",
+    "следующим",
+    "следующий",
+    "следующем",
+    "следующего",
     "слова",
     "стих",
     "стиха",
@@ -286,10 +294,13 @@ def missing_twenty_range_reference(
     parsed: ParsedReference,
     bible_path: Path = DEFAULT_BIBLE,
 ) -> ParsedReference | None:
+    if parsed.end_chapter is not None:
+        return None
     normalized = normalize_text(text)
-    for match in re.finditer(r"\b(1[1-9]|20)\s+([1-9])\s+стих\b", normalized):
+    for match in re.finditer(r"\b(1[1-9]|[2-9]\d)\s+([1-9])(?:\s+стих)?\b", normalized):
         start_verse = int(match.group(1))
-        end_verse = 20 + int(match.group(2))
+        end_digit = int(match.group(2))
+        end_verse = (20 if start_verse <= 20 else (start_verse // 10) * 10) + end_digit
         if start_verse != parsed.start_verse or end_verse <= start_verse:
             continue
         repaired_text = f"{normalized[:match.start()]}{start_verse} {end_verse} стих{normalized[match.end():]}"
@@ -455,7 +466,8 @@ def compact_reference_list(text: str, bible_path: Path = DEFAULT_BIBLE) -> list[
     for index, candidate in enumerate(exact_books):
         end = exact_books[index + 1].start if index + 1 < len(exact_books) else len(normalized)
         segment = normalized[candidate.start:end].strip()
-        if len(re.findall(r"\b\d+\b", segment)) < 2:
+        number_count = len(re.findall(r"\b\d+\b", segment))
+        if number_count < 2 and not (candidate.book == "Псалтирь" and re.search(r"\bпсал\w*\b", segment)):
             continue
         parsed = parse_live_reference(segment, bible_path=bible_path)
         if not parsed or parsed.book != candidate.book:
@@ -500,16 +512,28 @@ def resolve_reference_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, sh
     resolved = None
     invalid_reference = None
     blocked_weak_context = None
+    if parsed is not None:
+        parsed_invalid_reference = diagnose_invalid_reference(text, bible_path=bible_path)
+        if (
+            parsed_invalid_reference
+            and parsed_invalid_reference.book == parsed.book
+            and parsed_invalid_reference.chapter == parsed.chapter
+            and (parsed_invalid_reference.start_verse or 0) <= parsed.start_verse
+            and (parsed_invalid_reference.end_verse or 0) > parsed.end_verse
+        ):
+            invalid_reference = parsed_invalid_reference
+            parsed = None
     if parsed is None:
-        resolved = resolve_best_reference_candidate(text, bible_path=bible_path)
-        if resolved:
-            blocked_weak_context = resolver_book_conflict_reason(text, resolved.ref)
-            if blocked_weak_context:
-                resolved = None
-            else:
-                parsed = parse_live_reference(resolved.ref, bible_path=bible_path)
-                source = "resolver"
-        if parsed is None:
+        if invalid_reference is None:
+            resolved = resolve_best_reference_candidate(text, bible_path=bible_path)
+            if resolved:
+                blocked_weak_context = resolver_book_conflict_reason(text, resolved.ref)
+                if blocked_weak_context:
+                    resolved = None
+                else:
+                    parsed = parse_live_reference(resolved.ref, bible_path=bible_path)
+                    source = "resolver"
+        if parsed is None and invalid_reference is None:
             invalid_reference = diagnose_invalid_reference(text, bible_path=bible_path)
 
     payload = {
@@ -795,7 +819,6 @@ def should_block_matched_payload(payload: dict) -> str | None:
         ref.startswith("Руфь ")
         and re.search(r"\bрусь\b", raw_text)
         and re.search(r"\b2\s+3\s+4\s+5\b", normalized)
-        and re.search(r"\bпо\s+глава\b", normalized)
         and not re.search(r"\b(?:книга|руфь|руф)\b", raw_text)
     ):
         return "ruth_counting_rhyme"
@@ -874,11 +897,30 @@ def should_block_matched_payload(payload: dict) -> str | None:
     ):
         return "incomplete_range_end_after_po"
 
+    if parsed.get("start_verse") == parsed.get("end_verse"):
+        clipped_cross_chapter = re.search(
+            r"\bглава\s+(?:с\s+)?(\d+)(?:\s+стих)?\s+(?:и\s+)?(?:до|2)\s+(\d+)\s+стих\b",
+            normalized,
+        )
+        if clipped_cross_chapter and int(clipped_cross_chapter.group(2)) < int(clipped_cross_chapter.group(1)):
+            return "incomplete_cross_chapter_range_end"
+
+    if (
+        parsed.get("start_verse") == parsed.get("end_verse")
+        and re.search(r"\bглав\w*\b", raw_text)
+        and not re.search(r"\b(?:по|до)\b", normalized)
+        and ends_with_genitive_ordinal_verse(raw_text)
+    ):
+        return "incomplete_range_start_after_chapter"
+
     if (
         parsed.get("start_verse") == parsed.get("end_verse")
         and re.search(r"\bглав\w*\b", raw_text)
         and not re.search(r"\b(?:стих|стиха|стихи|стихов)\b", raw_text)
-        and not re.search(r"\b(?:с|по)\b", normalized)
+        and (
+            not re.search(r"\b(?:с|по)\b", normalized)
+            or (re.search(r"\bс\b", normalized) and not re.search(r"\bпо\b", normalized))
+        )
         and ends_with_genitive_ordinal(raw_text)
     ):
         return "incomplete_range_start_after_chapter"
@@ -912,6 +954,21 @@ def ends_with_genitive_ordinal(text: str) -> bool:
             r"тридцатого|сорокового|пятидесятого|шестидесятого|семидесятого|"
             r"восьмидесятого|девяностого|сотого"
             r")\s*$",
+            text,
+        )
+    )
+
+
+def ends_with_genitive_ordinal_verse(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:"
+            r"первого|второго|третьего|четвертого|пятого|шестого|седьмого|восьмого|девятого|"
+            r"десятого|одиннадцатого|двенадцатого|тринадцатого|четырнадцатого|пятнадцатого|"
+            r"шестнадцатого|семнадцатого|восемнадцатого|девятнадцатого|двадцатого|"
+            r"тридцатого|сорокового|пятидесятого|шестидесятого|семидесятого|"
+            r"восьмидесятого|девяностого|сотого"
+            r")\s+стих[а]?\s*$",
             text,
         )
     )

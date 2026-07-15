@@ -163,7 +163,7 @@ Holyrics API Server указан другой порт, запишите его 
 
 - `GetAPIServerInfo` - стартовая проверка, что Holyrics API Server доступен
 - `ShowVerse`
-- `ShowText` - для слайдов со списком ссылок без текста стихов
+- `ShowQuickPresentation` - для слайдов со списком ссылок без текста стихов
 - `SetBibleSettings`
 - `GetThemes` - для показа списка тем при запуске
 
@@ -186,7 +186,8 @@ LiVerse больше не отправляет собственный текст
 затем `ShowVerse {"id": "43003016"}`.
 
 Если LiVerse распознал не одну цитату, а список ссылок для самостоятельного
-чтения, он показывает компактный текстовый слайд через `ShowText`, например:
+чтения, он показывает компактный текстовый слайд через `ShowQuickPresentation`,
+например:
 
 ```text
 Ссылки для чтения
@@ -256,6 +257,15 @@ cd $HOME\LiVerse
 cd $HOME\LiVerse
 powershell -NoProfile -ExecutionPolicy Bypass -File .\update-liverse-windows.ps1
 ```
+
+Каждый запуск `update-liverse-windows.ps1` пишет журнал обновления в папку:
+
+```powershell
+$HOME\LiVerse-update-logs
+```
+
+Если обновление упало, пришлите последний файл вида
+`liverse-update-YYYYMMDD-HHMMSS.log` из этой папки.
 
 Если запустить `run-liverse.cmd` без параметров, он включает тот же рабочий
 режим, что и `make liverse`: подтверждение через телефон, вывод в Holyrics и

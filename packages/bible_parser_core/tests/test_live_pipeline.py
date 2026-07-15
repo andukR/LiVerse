@@ -1,6 +1,8 @@
 import unittest
+from pathlib import Path
 
 from bible_parser_core.live_pipeline import LiveReferencePipeline, build_grammar
+from bible_parser_core.risk_model import load_risk_model, score_payload_with_model
 
 
 class LiveReferencePipelineTest(unittest.TestCase):
@@ -214,6 +216,33 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertEqual("Иоанн 3:16", gospel.get("parsed", {}).get("ref"))
         self.assertEqual("1 Иоанна 5:13", epistle.get("parsed", {}).get("ref"))
 
+    def test_john_3_16_does_not_require_ml_confirmation_when_clean(self):
+        pipeline = LiveReferencePipeline()
+        model = load_risk_model(
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "bible_parser_core"
+            / "data"
+            / "risk_model.json"
+        )
+
+        result = pipeline.process_text(
+            "иоанна три шестнадцать",
+            asr_result={
+                "text": "иоанна три шестнадцать",
+                "result": [
+                    {"word": "иоанна", "start": 0.0, "end": 0.5, "conf": 1.0},
+                    {"word": "три", "start": 0.5, "end": 0.8, "conf": 1.0},
+                    {"word": "шестнадцать", "start": 0.8, "end": 1.4, "conf": 1.0},
+                ],
+            },
+        )
+        ml_risk = score_payload_with_model(result, model)
+
+        self.assertEqual("Иоанн 3:16", result.get("parsed", {}).get("ref"))
+        self.assertFalse(ml_risk.get("needs_confirmation"))
+        self.assertIn("trusted_john_3_16", ml_risk.get("decision_reasons"))
+
     def test_nonexistent_first_corinthians_verse_does_not_match(self):
         pipeline = LiveReferencePipeline()
 
@@ -222,6 +251,16 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertFalse(result.get("matched"))
         self.assertEqual("invalid_verse", result.get("invalid_reference", {}).get("reason"))
         self.assertEqual("1 Коринфянам 2:25", result.get("invalid_reference", {}).get("ref"))
+        self.assertIn("Такого стиха нет", result.get("message", ""))
+
+    def test_invalid_reversed_range_does_not_fall_back_to_first_existing_verse(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("двадцатый двадцать второе стих шестой главы послание евреям")
+
+        self.assertFalse(result.get("matched"))
+        self.assertEqual("invalid_verse", result.get("invalid_reference", {}).get("reason"))
+        self.assertEqual("Евреям 6:20-22", result.get("invalid_reference", {}).get("ref"))
         self.assertIn("Такого стиха нет", result.get("message", ""))
 
     def test_command_suffix_overrides_incomplete_epistle_prefix(self):
@@ -285,6 +324,8 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertIn("слова", grammar)
         self.assertIn("четвёртого", grammar)
         self.assertIn("четвёртая", grammar)
+        self.assertIn("следующей", grammar)
+        self.assertIn("следующий", grammar)
 
     def test_slow_split_deuteronomy_range_with_yo_form(self):
         pipeline = LiveReferencePipeline()
@@ -465,6 +506,30 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertFalse(result.get("matched"))
         self.assertEqual("incomplete_range_start_after_chapter", result.get("blocked_weak_context"))
 
+    def test_genitive_ordinal_verse_after_chapter_waits_for_range_end(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("евангелие от иоанна третья глава шестнадцатого стих")
+
+        self.assertFalse(result.get("matched"))
+        self.assertEqual("incomplete_range_start_after_chapter", result.get("blocked_weak_context"))
+
+        single_verse = pipeline.process_text("евангелие от иоанна третья глава шестнадцатый стих")
+
+        self.assertEqual("Иоанн 3:16", single_verse.get("parsed", {}).get("ref"))
+
+    def test_from_genitive_ordinal_after_chapter_waits_for_range_end(self):
+        pipeline = LiveReferencePipeline()
+
+        first = pipeline.process_text("ефесянам шестая глава с восьмого", now_ms=1_000)
+
+        self.assertFalse(first.get("matched"))
+        self.assertEqual("incomplete_range_start_after_chapter", first.get("blocked_weak_context"))
+
+        result = pipeline.process_text("по девятый стих", now_ms=2_000)
+
+        self.assertEqual("Ефесянам 6:8-9", result.get("parsed", {}).get("ref"))
+
     def test_range_fragment_ending_with_po_waits_for_end_verse(self):
         pipeline = LiveReferencePipeline()
 
@@ -479,6 +544,57 @@ class LiveReferencePipelineTest(unittest.TestCase):
         result = pipeline.process_text("книга откровений третья глава первого по шестой стих")
 
         self.assertEqual("Откровение 3:1-6", result.get("parsed", {}).get("ref"))
+
+    def test_cross_chapter_range(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text(
+            "евангелие от иоанна третья глава с шестнадцатого стиха до четвёртой главы второго стиха"
+        )
+        asr_variant = pipeline.process_text(
+            "евангелие от иоанна третье шестнадцатого стиха два второго стиха четвёртые главы"
+        )
+        reversed_end = pipeline.process_text(
+            "евангелие от иоанна третья глава с шестнадцатого стиха до второго стиха четвёртой главы"
+        )
+        next_chapter = pipeline.process_text(
+            "евангелие от иоанна третья глава с шестнадцатого стиха и до второго стиха следующей главы"
+        )
+        next_chapter_without_start_verse_word = pipeline.process_text(
+            "евангелие от иоанна третья глава с шестнадцатого и до второго стиха следующей главы"
+        )
+        next_chapter_without_from = pipeline.process_text(
+            "евангелие от иоанна третья глава шестнадцатого до второго стиха следующей главы"
+        )
+        compact = pipeline.process_text("иоана три шестнадцатая четыре два")
+
+        self.assertEqual("Иоанн 3:16-4:2", result.get("parsed", {}).get("ref"))
+        self.assertEqual(4, result.get("parsed", {}).get("end_chapter"))
+        self.assertEqual("Иоанн 3:16-4:2", asr_variant.get("parsed", {}).get("ref"))
+        self.assertEqual("Иоанн 3:16-4:2", reversed_end.get("parsed", {}).get("ref"))
+        self.assertEqual("Иоанн 3:16-4:2", next_chapter.get("parsed", {}).get("ref"))
+        self.assertEqual("Иоанн 3:16-4:2", next_chapter_without_start_verse_word.get("parsed", {}).get("ref"))
+        self.assertEqual("Иоанн 3:16-4:2", next_chapter_without_from.get("parsed", {}).get("ref"))
+        self.assertEqual("Иоанн 3:16-4:2", compact.get("parsed", {}).get("ref"))
+
+    def test_clipped_next_chapter_range_does_not_fall_back_to_single_verse(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text(
+            "евангелие от и о анна третья глава шестнадцатого стиха до второго стиха"
+        )
+
+        self.assertFalse(result.get("matched"))
+        self.assertEqual("incomplete_cross_chapter_range_end", result.get("blocked_weak_context"))
+
+    def test_open_range_to_end_of_chapter_without_verse_word(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("евангелие от иоанна третья глава с шестнадцатого и до конца главы")
+        without_from = pipeline.process_text("евангелие от иоанна третья глава шестнадцатого до конца главы")
+
+        self.assertEqual("Иоанн 3:16-36", result.get("parsed", {}).get("ref"))
+        self.assertEqual("Иоанн 3:16-36", without_from.get("parsed", {}).get("ref"))
 
     def test_complete_single_verse_after_chapter_still_matches(self):
         pipeline = LiveReferencePipeline()
@@ -699,6 +815,7 @@ class LiveReferencePipelineTest(unittest.TestCase):
             "послание кол оси яна третья глава первый стих",
             "послание кол о сия нам третья глава первый стих",
             "послание колос нам третья глава первый стих",
+            "сия нам первое глава девятой одиннадцатый стих",
         ):
             with self.subTest(text=text):
                 result = pipeline.process_text(text)
@@ -760,6 +877,21 @@ class LiveReferencePipelineTest(unittest.TestCase):
         refs = [item.get("ref") for item in result.get("reference_list") or []]
         self.assertEqual(["Иоанн 3:4", "Иаков 1:2"], refs)
 
+    def test_compact_reference_list_accepts_whole_psalm_reference(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text(
+            "иов третье глава седьмой восьмая стих "
+            "иов тридцать третье глава одиннадцатый двенадцатые стих "
+            "псалтырь сто двадцать второе псалом"
+        )
+
+        self.assertTrue(result.get("matched"))
+        self.assertIsNone(result.get("parsed"))
+        self.assertEqual("parser_reference_list", result.get("source"))
+        refs = [item.get("ref") for item in result.get("reference_list") or []]
+        self.assertEqual(["Иов 3:7-8", "Иов 33:11-12", "Псалтирь 122:1-4"], refs)
+
     def test_split_psalm_range_before_psalm_title_uses_full_buffer(self):
         pipeline = LiveReferencePipeline()
 
@@ -789,6 +921,15 @@ class LiveReferencePipelineTest(unittest.TestCase):
         result = pipeline.process_text("псалом двадцать два четыре")
 
         self.assertEqual("Псалтирь 22:4", result.get("parsed", {}).get("ref"))
+
+    def test_psalm_asr_aliases(self):
+        pipeline = LiveReferencePipeline()
+
+        for text in ("салом двадцать два четыре", "салон двадцать два четыре"):
+            with self.subTest(text=text):
+                result = pipeline.process_text(text)
+
+                self.assertEqual("Псалтирь 22:4", result.get("parsed", {}).get("ref"))
 
     def test_numbered_general_epistle_with_poslanie_still_works(self):
         pipeline = LiveReferencePipeline()
@@ -993,6 +1134,32 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertEqual("Деяния 2:18-29", result.get("parsed", {}).get("ref"))
         self.assertEqual("parser_missing_twenty_range", result.get("source"))
 
+    def test_missing_tens_before_range_end_uses_start_verse_tens(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("послание евреям двенадцатая глава двадцать четвёртый шестой")
+
+        self.assertEqual("Евреям 12:24-26", result.get("parsed", {}).get("ref"))
+        self.assertEqual("parser_missing_twenty_range", result.get("source"))
+
+    def test_missing_tens_range_repair_requires_ml_confirmation(self):
+        pipeline = LiveReferencePipeline()
+        model = load_risk_model(
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "bible_parser_core"
+            / "data"
+            / "risk_model.json"
+        )
+
+        result = pipeline.process_text("послание евреям двенадцатая глава двадцать пятый восьмой")
+        ml_risk = score_payload_with_model(result, model)
+
+        self.assertEqual("Евреям 12:25-28", result.get("parsed", {}).get("ref"))
+        self.assertEqual("parser_missing_twenty_range", result.get("source"))
+        self.assertTrue(ml_risk.get("needs_confirmation"))
+        self.assertIn("missing_tens_range_repair", ml_risk.get("decision_reasons"))
+
     def test_missing_twenty_range_does_not_restore_nonexistent_end_verse(self):
         pipeline = LiveReferencePipeline()
 
@@ -1031,6 +1198,11 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertFalse(result.get("matched"))
         self.assertEqual("ruth_counting_rhyme", result.get("blocked_weak_context"))
+
+        short_result = pipeline.process_text("русь два три четыре пять")
+
+        self.assertFalse(short_result.get("matched"))
+        self.assertEqual("ruth_counting_rhyme", short_result.get("blocked_weak_context"))
 
         normal = pipeline.process_text("книга руфь третья глава четвёртый пятый стих")
 

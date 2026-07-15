@@ -10,7 +10,26 @@ $scriptUrl = "https://raw.githubusercontent.com/andukR/LiVerse/$Branch/update-li
 $scriptPath = Join-Path $env:TEMP "update-liverse-windows.ps1"
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-Invoke-WebRequest -Uri $scriptUrl -OutFile $scriptPath -UseBasicParsing
+
+for ($attempt = 1; $attempt -le 4; $attempt++) {
+    try {
+        Invoke-WebRequest `
+            -Uri $scriptUrl `
+            -OutFile $scriptPath `
+            -UseBasicParsing `
+            -TimeoutSec 120
+        break
+    }
+    catch {
+        if ($attempt -ge 4) {
+            throw
+        }
+        $delay = 3 * $attempt
+        Write-Warning "Download failed (attempt $attempt of 4): $($_.Exception.Message)"
+        Write-Host "Retrying in $delay seconds..."
+        Start-Sleep -Seconds $delay
+    }
+}
 
 & powershell -NoProfile -ExecutionPolicy Bypass -File $scriptPath `
     -TargetDir $TargetDir `
