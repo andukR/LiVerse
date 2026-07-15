@@ -284,13 +284,16 @@ function Sync-Repository {
                 Fail "The target folder exists but is not a Git repository: $TargetDir"
             }
 
-            $currentOrigin = (& git -C $TargetDir remote get-url origin 2>$null)
+            $currentOrigin = (& git -C $TargetDir config --get remote.origin.url 2>$null)
             if ($LASTEXITCODE -ne 0) {
                 Fail "The Git repository has no usable 'origin' remote."
             }
 
-            if ($currentOrigin.Trim() -ne $RepoUrl.Trim()) {
-                Write-Warning "Correcting origin URL: $currentOrigin -> $RepoUrl"
+            $currentOriginText = (($currentOrigin | Select-Object -First 1) -as [string]).Trim()
+            Write-Host "Git origin URL: $currentOriginText"
+
+            if ($currentOriginText -ne $RepoUrl.Trim()) {
+                Write-Warning "Correcting origin URL: $currentOriginText -> $RepoUrl"
                 Invoke-Git `
                     -Arguments @("-C", $TargetDir, "remote", "set-url", "origin", $RepoUrl) `
                     -Description "Updating origin URL"
