@@ -421,6 +421,41 @@ function Ensure-Venv {
     return $venvPython
 }
 
+function Test-PythonImports {
+    param(
+        [string]$VenvPython,
+        [string]$Imports,
+        [string]$Description
+    )
+
+    & $VenvPython -c $Imports
+    if ($LASTEXITCODE -eq 0) {
+        Write-Warning "$Description failed, but the required imports already work. Continuing."
+        return $true
+    }
+    return $false
+}
+
+function Invoke-PipInstallOrVerify {
+    param(
+        [string]$VenvPython,
+        [string[]]$PipArgs,
+        [string]$Description,
+        [string]$VerifyImports
+    )
+
+    & $VenvPython -m pip @PipArgs
+    if ($LASTEXITCODE -eq 0) {
+        return
+    }
+
+    if (Test-PythonImports -VenvPython $VenvPython -Imports $VerifyImports -Description $Description) {
+        return
+    }
+
+    Fail "$Description failed."
+}
+
 function Install-LiVerse {
     param([string]$VenvPython)
 
@@ -429,15 +464,24 @@ function Install-LiVerse {
     try {
         # Do not upgrade pip here. On this Windows 10 PC, replacing pip itself
         # caused intermittent access-denied and non-zero-exit errors.
-        & $VenvPython -m pip install --disable-pip-version-check setuptools
-        if ($LASTEXITCODE -ne 0) { Fail "setuptools installation failed." }
+        Invoke-PipInstallOrVerify `
+            -VenvPython $VenvPython `
+            -PipArgs @("install", "--disable-pip-version-check", "setuptools") `
+            -Description "setuptools installation" `
+            -VerifyImports "import setuptools; print('setuptools import OK')"
 
-        & $VenvPython -m pip install --disable-pip-version-check -r requirements.txt
-        if ($LASTEXITCODE -ne 0) { Fail "requirements installation failed." }
+        Invoke-PipInstallOrVerify `
+            -VenvPython $VenvPython `
+            -PipArgs @("install", "--disable-pip-version-check", "-r", "requirements.txt") `
+            -Description "requirements installation" `
+            -VerifyImports "import vosk, sounddevice, qrcode, pysword; print('requirements import OK')"
 
         # Avoid an isolated temporary build environment: it caused WinError 5.
-        & $VenvPython -m pip install --disable-pip-version-check -e . --no-build-isolation
-        if ($LASTEXITCODE -ne 0) { Fail "LiVerse editable installation failed." }
+        Invoke-PipInstallOrVerify `
+            -VenvPython $VenvPython `
+            -PipArgs @("install", "--disable-pip-version-check", "-e", ".", "--no-build-isolation") `
+            -Description "LiVerse editable installation" `
+            -VerifyImports "import bible_parser_core; print('bible_parser_core import OK')"
 
         & $VenvPython -c "import vosk, sounddevice, bible_parser_core; print('Import check OK')"
         if ($LASTEXITCODE -ne 0) { Fail "Import check failed." }
