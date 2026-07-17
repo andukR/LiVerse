@@ -211,6 +211,59 @@ def ask_holyrics_theme_name(args: argparse.Namespace) -> None:
         print("Введите номер из списка или нажмите Enter для темы по умолчанию.", flush=True)
 
 
+def parse_holyrics_quick_duration_minutes(value: str) -> float | None:
+    raw = value.strip().replace(",", ".").casefold()
+    if not raw:
+        return 1.0
+    seconds_match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*(?:s|sec|secs|сек|секунд[аы]?|с)", raw)
+    if seconds_match:
+        return float(seconds_match.group(1)) / 60.0
+    minutes_match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*(?:m|min|mins|мин|минут[аы]?)?", raw)
+    if minutes_match:
+        return float(minutes_match.group(1))
+    return None
+
+
+def format_holyrics_quick_duration(minutes: float) -> str:
+    if minutes == 0:
+        return "0 мин."
+    seconds = minutes * 60.0
+    if seconds < 60:
+        return f"{seconds:g} сек."
+    return f"{minutes:g} мин."
+
+
+def ask_holyrics_quick_presentation_minutes(args: argparse.Namespace) -> None:
+    if not holyrics_output_enabled(args) or args.text or not sys.stdin.isatty():
+        return
+    try:
+        current = float(getattr(args, "holyrics_quick_minutes", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        current = 0.0
+    if current > 0:
+        print(f"Holyrics: время показа цитаты {format_holyrics_quick_duration(current)}", flush=True)
+        return
+
+    print("", flush=True)
+    print("Введите время показа цитаты.", flush=True)
+    print("Enter — 1 минута; 0 — не закрывать автоматически.", flush=True)
+    print("Можно ввести минуты: 1, 0.5; или секунды: 30s, 30 сек.", flush=True)
+    while True:
+        minutes = parse_holyrics_quick_duration_minutes(input("> "))
+        if minutes is None:
+            print("Введите число минут, например 1 или 0.5, либо секунды, например 30s или 30 сек.", flush=True)
+            continue
+        if minutes < 0:
+            print("Введите 0 или положительное время.", flush=True)
+            continue
+        args.holyrics_quick_minutes = minutes
+        if minutes == 0:
+            print("Holyrics: автоматическое закрытие цитаты выключено.", flush=True)
+        else:
+            print(f"Holyrics: цитата будет показана {format_holyrics_quick_duration(minutes)}", flush=True)
+        return
+
+
 def check_holyrics_startup(args: argparse.Namespace, logger: JsonlLogger | None = None) -> None:
     if not holyrics_output_enabled(args):
         return
@@ -1056,6 +1109,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                 or args.slide_output in {"web", "both"}
             ) else None,
             "holyrics_target": describe_holyrics_target(args),
+            "holyrics_quick_minutes": args.holyrics_quick_minutes,
             "grammar": None if grammar is None else grammar_diagnostics(grammar),
         }
     )
@@ -1490,6 +1544,12 @@ def main() -> int:
         help="Holyrics theme name for Bible verse display. Empty uses Holyrics Bible module default.",
     )
     parser.add_argument("--holyrics-timeout", type=float, default=float(env_setting("HOLYRICS_TIMEOUT", "1.5")))
+    parser.add_argument(
+        "--holyrics-quick-minutes",
+        type=float,
+        default=float(env_setting("HOLYRICS_QUICK_MINUTES", "0") or "0"),
+        help="Show Bible verses temporarily and restore the previous Holyrics text presentation after this many minutes. 0 disables it.",
+    )
     parser.set_defaults(session_summary_popup=True, log_audio=True)
     args = parser.parse_args()
     if args.list_audio_devices:
@@ -1506,6 +1566,7 @@ def main() -> int:
     load_runtime_risk_model(args)
     print_holyrics_setup_notice_once(args)
     ask_holyrics_theme_name(args)
+    ask_holyrics_quick_presentation_minutes(args)
 
     if args.text:
         grammar = None if args.open_vocabulary else build_grammar()
@@ -1524,6 +1585,7 @@ def main() -> int:
                 "risk_threshold": args.risk_threshold,
                 "approval_ui": args.approval_ui,
                 "holyrics_target": describe_holyrics_target(args),
+                "holyrics_quick_minutes": args.holyrics_quick_minutes,
                 "grammar": None if grammar is None else grammar_diagnostics(grammar),
             }
         )

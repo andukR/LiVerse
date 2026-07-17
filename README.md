@@ -146,6 +146,7 @@ HOLYRICS_TOKEN=...
 HOLYRICS_HOST=http://localhost
 HOLYRICS_PORT=8091
 HOLYRICS_THEME=
+HOLYRICS_QUICK_MINUTES=0
 ```
 
 `HOLYRICS_TOKEN` - это token из `Holyrics -> Settings -> API Server -> Manage permissions`.
@@ -158,12 +159,23 @@ Holyrics API Server указан другой порт, запишите его 
 список тем Holyrics. Enter или `0` оставляет тему Bible module по умолчанию.
 Если `GetThemes` не включён, LiVerse сообщит об этом и продолжит с темой по
 умолчанию.
+`HOLYRICS_QUICK_MINUTES` - запасной параметр для неинтерактивного запуска.
+Если значение больше `0`, LiVerse перед показом стиха запоминает текущую
+текстовую презентацию Holyrics, показывает найденный стих, а через указанное
+число минут закрывает стих и возвращает прежнюю текстовую презентацию на тот
+же слайд. При обычном запуске LiVerse спрашивает время показа цитаты; Enter
+означает `1` минуту, `0` выключает автоматическое закрытие. Можно вводить
+дробные минуты (`0.5`) или секунды (`30s`, `30 сек`). В `.env` значение
+`HOLYRICS_QUICK_MINUTES` задаётся в минутах.
 
 В Holyrics API Server Local должны быть разрешены:
 
 - `GetAPIServerInfo` - стартовая проверка, что Holyrics API Server доступен
+- `GetCurrentPresentation` - проверка текущей презентации Holyrics
+- `CloseCurrentPresentation` - закрытие временного стиха перед возвратом к плану
 - `ShowVerse`
 - `ShowQuickPresentation` - для слайдов со списком ссылок без текста стихов
+- `ShowText` - возврат к текстовой презентации плана проповеди
 - `SetBibleSettings`
 - `GetThemes` - для показа списка тем при запуске
 
@@ -180,6 +192,10 @@ LiVerse больше не отправляет собственный текст
 2. вызывает `SetBibleSettings` с `show_x_verses`: `1` для одного стиха или
    количеством стихов для диапазона;
 3. вызывает `ShowVerse` с `{"id": "<verse_id>"}`.
+   Если задано время показа цитаты, LiVerse перед этим вызывает
+   `GetCurrentPresentation`, а после таймера вызывает
+   `CloseCurrentPresentation` и восстанавливает текстовую презентацию через
+   `ShowText`.
 
 Например, `Иоанн 3:16` превращается в `43003016`.
 `Иоанн 3:16-19` отправляется как `SetBibleSettings {"show_x_verses": 4}`,

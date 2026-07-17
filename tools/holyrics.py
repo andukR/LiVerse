@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Any
 from urllib import request
@@ -23,8 +24,11 @@ MIN_RECOMMENDED_HOLYRICS_VERSION = "2.28.1"
 HOLYRICS_JSLIB_DOC_URL = "https://github.com/holyrics/jslib/blob/main/README-en.md"
 REQUIRED_HOLYRICS_PERMISSIONS = (
     "GetAPIServerInfo",
+    "GetCurrentPresentation",
+    "CloseCurrentPresentation",
     "SetBibleSettings",
     "ShowQuickPresentation",
+    "ShowText",
     "ShowVerse",
 )
 THEME_HOLYRICS_PERMISSIONS = (
@@ -99,6 +103,8 @@ HOLYRICS_BOOKS = (
     "Откровение",
 )
 HOLYRICS_BOOK_INDEX = {book: index for index, book in enumerate(HOLYRICS_BOOKS, start=1)}
+_TEMPORARY_VERSE_RESTORE_TIMER: threading.Timer | None = None
+_TEMPORARY_VERSE_RESTORE_LOCK = threading.Lock()
 
 
 def parse_env_value(value: str) -> str:
@@ -319,6 +325,77 @@ def post_holyrics_api(args: Any, base_url: str, endpoint: str, body: dict) -> tu
         return False, f"holyrics_http_{exc.code}", body
     except URLError as exc:
         return False, f"holyrics_unavailable:{exc.reason}", ""
+
+
+def holyrics_quick_minutes(args: Any) -> float:
+    try:
+        return max(0.0, float(getattr(args, "holyrics_quick_minutes", 0.0) or 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def get_holyrics_current_presentation(args: Any, base_url: str) -> dict[str, Any] | None:
+    ok, reason, body = post_holyrics_api(args, base_url, "GetCurrentPresentation", {"include_slides": False})
+    if not ok:
+        holyrics_log(f"GetCurrentPresentation response={body or reason or 'failed'}")
+        return None
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    data = parsed.get("data") if isinstance(parsed, dict) else None
+    return data if isinstance(data, dict) else None
+
+
+def restore_holyrics_presentation(args: Any, base_url: str, previous: dict[str, Any] | None) -> None:
+    close_ok, close_reason, close_body = post_holyrics_api(args, base_url, "CloseCurrentPresentation", {})
+    holyrics_log(f"CloseCurrentPresentation response={close_body or close_reason or 'ok'}")
+    if not close_ok:
+        holyrics_log(f"не удалось закрыть временный стих: {close_reason}")
+        return
+
+    if not previous:
+        return
+
+    presentation_type = str(previous.get("type") or "").strip()
+    try:
+        slide_number = int(previous.get("slide_number") or 1)
+    except (TypeError, ValueError):
+        slide_number = 1
+    initial_index = max(0, slide_number - 1)
+    if presentation_type == "text":
+        text_id = str(previous.get("text_id") or previous.get("id") or "").strip()
+        if not text_id:
+            return
+        ok, reason, body = post_holyrics_api(
+            args,
+            base_url,
+            "ShowText",
+            {"id": text_id, "initial_index": initial_index},
+        )
+        holyrics_log(f"ShowText restore response={body or reason or 'ok'}")
+        return
+
+    holyrics_log(f"восстановление презентации типа {presentation_type or '(empty)'} пока не поддержано")
+
+
+def restore_holyrics_presentation_later(args: Any, base_url: str, previous: dict[str, Any] | None, minutes: float) -> None:
+    if minutes <= 0:
+        return
+
+    delay_seconds = max(1.0, minutes * 60.0)
+
+    def restore() -> None:
+        restore_holyrics_presentation(args, base_url, previous)
+
+    global _TEMPORARY_VERSE_RESTORE_TIMER
+    with _TEMPORARY_VERSE_RESTORE_LOCK:
+        if _TEMPORARY_VERSE_RESTORE_TIMER is not None:
+            _TEMPORARY_VERSE_RESTORE_TIMER.cancel()
+        timer = threading.Timer(delay_seconds, restore)
+        timer.daemon = True
+        _TEMPORARY_VERSE_RESTORE_TIMER = timer
+        timer.start()
 
 
 def get_holyrics_api_server_info(args: Any, base_url: str) -> tuple[bool, str, dict[str, Any] | None]:
@@ -559,6 +636,15 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
     holyrics_log(f"show_x_verses={show_x_verses}")
 
     settings_payload: dict[str, Any] = {"show_x_verses": show_x_verses}
+    quick_minutes = holyrics_quick_minutes(args)
+    previous_presentation = None
+    if quick_minutes > 0:
+        previous_presentation = get_holyrics_current_presentation(args, base_url)
+        previous_type = str((previous_presentation or {}).get("type") or "").strip()
+        previous_name = str((previous_presentation or {}).get("name") or "").strip()
+        if previous_presentation:
+            holyrics_log(f"current_presentation={previous_type}:{previous_name}")
+
     theme_name = str(getattr(args, "holyrics_theme", "") or "").strip()
     if theme_name:
         theme_id = str(getattr(args, "_holyrics_theme_id", "") or "").strip()
@@ -586,16 +672,22 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
     if not settings_ok:
         return False, settings_reason
 
+    show_payload = {"id": verse_id}
+
     show_ok, show_reason, show_body = post_holyrics_api(
         args,
         base_url,
         "ShowVerse",
-        {"id": verse_id},
+        show_payload,
     )
     holyrics_log(f"ShowVerse response={show_body or show_reason or 'ok'}")
     if not show_ok:
         return False, show_reason
-    return True, f"verse_id:{verse_id};show_x_verses:{show_x_verses}"
+    close_suffix = ""
+    if quick_minutes > 0:
+        restore_holyrics_presentation_later(args, base_url, previous_presentation, quick_minutes)
+        close_suffix = f";temporary_verse:{quick_minutes:g}min"
+    return True, f"verse_id:{verse_id};show_x_verses:{show_x_verses}{close_suffix}"
 
 
 def post_holyrics_update(args: Any, payload: dict) -> tuple[bool, str]:
