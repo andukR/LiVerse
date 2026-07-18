@@ -737,6 +737,10 @@ def book_candidates(normalized: str) -> list[BookCandidate]:
             candidate_text = " ".join(token for token, _start, _end in tokens[index : index + size])
             if candidate_text in GENERIC_BOOK_VARIANTS:
                 continue
+            if re.search(r"\b\d+\b", candidate_text):
+                trailing_context_number = re.search(r"\D\s+\d+\b", candidate_text)
+                if trailing_context_number:
+                    continue
             if re.search(r"\b(глава|стих|псалом|пророка|паророка|парарока)\b", candidate_text):
                 continue
             if re.fullmatch(r"[123]\s+послание\s+\d+|послание\s+\d+", candidate_text):
@@ -1239,6 +1243,13 @@ def ref_candidates(normalized: str, book: str, bible: dict[str, dict[int, dict[i
             verse, verse_start, verse_end = numbers_after_chapter[0]
             add(chapter[0], [verse], min(chapter[1], verse_start), max(chapter[2], verse_end), 0.74)
     if not candidates and chapter is None and len(numbers) >= 2 and not has_range_word:
+        if len(numbers) >= 3:
+            for first, second, third in ((numbers[0], numbers[1], numbers[2]), (numbers[-3], numbers[-2], numbers[-1])):
+                first_value, first_start, _first_end = first
+                second_value, _second_start, second_end = second
+                third_value, _third_start, third_end = third
+                if second_value == third_value:
+                    add(first_value, [second_value], first_start, max(second_end, third_end), 0.76)
         for first, second in ((numbers[0], numbers[1]), (numbers[-2], numbers[-1])):
             first_value, first_start, first_end = first
             second_value, second_start, second_end = second

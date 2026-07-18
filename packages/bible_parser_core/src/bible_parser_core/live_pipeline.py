@@ -316,6 +316,25 @@ def missing_twenty_range_reference(
     return None
 
 
+def colos_chapter_range_reference(
+    text: str,
+    parsed: ParsedReference,
+    bible_path: Path = DEFAULT_BIBLE,
+) -> ParsedReference | None:
+    if parsed.end_chapter is not None:
+        return None
+    normalized = normalize_text(text)
+    for match in re.finditer(r"\b(\d+)\s+колос\s+(\d+)\s+50\s+стих\b", normalized):
+        chapter = int(match.group(1))
+        start_verse = int(match.group(2))
+        if chapter != parsed.chapter or start_verse != parsed.start_verse:
+            continue
+        repaired = parse_live_reference(f"{parsed.book} {chapter}:{start_verse}-10", bible_path=bible_path)
+        if repaired and repaired.book == parsed.book and repaired.chapter == chapter:
+            return repaired
+    return None
+
+
 def repeated_confusable_range_reference(
     text: str,
     parsed: ParsedReference,
@@ -501,6 +520,10 @@ def resolve_reference_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, sh
     if missing_twenty_parsed and missing_twenty_parsed.ref != parsed.ref:
         parsed = missing_twenty_parsed
         source = "parser_missing_twenty_range"
+    colos_range_parsed = colos_chapter_range_reference(text, parsed, bible_path=bible_path) if parsed else None
+    if colos_range_parsed and colos_range_parsed.ref != parsed.ref:
+        parsed = colos_range_parsed
+        source = "parser_colos_chapter_range"
     repeated_confusable_parsed = repeated_confusable_range_reference(text, parsed, bible_path=bible_path) if parsed else None
     if repeated_confusable_parsed and repeated_confusable_parsed.ref != parsed.ref:
         parsed = repeated_confusable_parsed
@@ -984,6 +1007,27 @@ def blocked_payload(payload: dict, reason: str) -> dict:
     return result
 
 
+def book_fragment_followed_by_verse_without_chapter(payload: dict) -> bool:
+    parts = [
+        normalize_book_form(str(part or ""))
+        for part in (payload.get("vosk_buffer") or [])
+        if str(part or "").strip()
+    ]
+    if len(parts) < 2:
+        return False
+    for previous, current in zip(parts, parts[1:]):
+        if not likely_book_only_fragment(previous):
+            continue
+        if re.search(r"\b\d+\b", previous):
+            continue
+        if not re.search(r"\bстих\w*\b", current):
+            continue
+        if re.search(r"\bглав\w*\b", current):
+            continue
+        return True
+    return False
+
+
 def score_reference_risk(payload: dict, asr_result: dict | None = None) -> dict:
     text = str(payload.get("text") or "")
     vosk_text = str(payload.get("vosk_text") or "")
@@ -1044,6 +1088,9 @@ def score_reference_risk(payload: dict, asr_result: dict | None = None) -> dict:
     if len(payload.get("vosk_buffer") or []) > 1 and text and vosk_text and text != vosk_text:
         score += 0.1
         reasons.append("assembled_from_buffer")
+        if book_fragment_followed_by_verse_without_chapter(payload):
+            score += 0.25
+            reasons.append("book_fragment_without_chapter_marker")
 
     if re.search(r"\b(?:данила|яков|яна)\b", normalized):
         score += 0.15
@@ -1075,6 +1122,9 @@ def score_reference_risk(payload: dict, asr_result: dict | None = None) -> dict:
     if payload.get("source") == "parser_missing_twenty_range":
         score += 0.2
         reasons.append("missing_twenty_range_repair")
+    if payload.get("source") == "parser_colos_chapter_range":
+        score += 0.2
+        reasons.append("colos_chapter_range_repair")
     if payload.get("source") == "parser_repeated_confusable_range":
         score += 0.1
         reasons.append("repeated_confusable_range_repair")
@@ -1167,6 +1217,35 @@ def parsed_payload_from_candidates(
         }
         for attempt in attempts
     ]
+    current_ref = (attempts[0].get("parsed") or {}).get("ref") if attempts else None
+    for index, payload in enumerate(attempts):
+        reference_list = payload.get("reference_list") or []
+        if payload.get("source") != "parser_reference_list" or len(reference_list) < 2:
+            continue
+        refs = {str(item.get("ref") or "") for item in reference_list if isinstance(item, dict)}
+        if current_ref and current_ref not in refs:
+            continue
+        if index > 0:
+            stale_list_item = False
+            for item in reference_list:
+                if not isinstance(item, dict) or str(item.get("ref") or "") == current_ref:
+                    continue
+                source_text = str(item.get("source_text") or "")
+                if not has_reference_marker(source_text):
+                    stale_list_item = True
+                    break
+                item_payload = resolve_reference_payload(source_text, bible_path=bible_path)
+                if should_block_matched_payload(item_payload):
+                    stale_list_item = True
+                    break
+            if stale_list_item:
+                continue
+        payload["attempts"] = [
+            summary
+            for summary_index, summary in enumerate(attempt_summaries)
+            if summary_index != index
+        ]
+        return payload
     if attempts:
         first_text = str(attempts[0].get("text") or "")
         first_parsed = attempts[0].get("parsed") or {}
