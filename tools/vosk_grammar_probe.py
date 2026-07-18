@@ -921,9 +921,11 @@ def submit_for_approval(args: argparse.Namespace, payload: dict) -> dict:
 def approval_required_for_payload(args: argparse.Namespace, payload: dict) -> bool:
     if not payload.get("slide"):
         return False
+    ml_risk = payload.get("ml_risk") or {}
+    if ml_risk.get("auto_reject"):
+        return False
     if args.require_approval:
         return True
-    ml_risk = payload.get("ml_risk") or {}
     return bool(args.semi_auto_approval and ml_risk.get("needs_confirmation"))
 
 
@@ -939,7 +941,12 @@ def apply_ml_risk(args: argparse.Namespace, payload: dict, asr_result: dict | No
     except (TypeError, ValueError):
         risk_score = 0.0
     decision_reasons = list(ml_risk.get("decision_reasons") or [])
-    if risk_score >= 0.5 and not ml_risk.get("needs_confirmation"):
+    auto_reject_threshold = float(getattr(args, "risk_auto_reject_threshold", 0.9) or 0.0)
+    if auto_reject_threshold > 0 and risk_score >= auto_reject_threshold:
+        ml_risk["auto_reject"] = True
+        ml_risk["needs_confirmation"] = False
+        decision_reasons.append("manual_very_high_risk_auto_reject")
+    if not ml_risk.get("auto_reject") and risk_score >= 0.5 and not ml_risk.get("needs_confirmation"):
         ml_risk["needs_confirmation"] = True
         decision_reasons.append("manual_medium_or_high_risk_score")
     if decision_reasons:
@@ -978,6 +985,18 @@ def start_slide_server_if_needed(args: argparse.Namespace):
 
 
 def publish_payload(args: argparse.Namespace, payload: dict) -> dict:
+    ml_risk = payload.get("ml_risk") or {}
+    if ml_risk.get("auto_reject"):
+        return {
+            "approval": {
+                "enabled": True,
+                "ok": True,
+                "action": "reject",
+                "reason": "auto_reject_high_risk",
+            },
+            "holyrics": {"enabled": False, "reason": "auto_reject_high_risk"},
+            "web": {"enabled": False, "reason": "auto_reject_high_risk"},
+        }
     if approval_required_for_payload(args, payload):
         if args.approval_ui == "popup":
             popup_result = approve_with_popup(args, payload)
@@ -1102,6 +1121,7 @@ def run_microphone(args: argparse.Namespace) -> int:
             "semi_auto_approval": args.semi_auto_approval,
             "risk_model": str(args.risk_model) if args.semi_auto_approval else None,
             "risk_threshold": args.risk_threshold,
+            "risk_auto_reject_threshold": args.risk_auto_reject_threshold,
             "approval_ui": args.approval_ui,
             "slide_server": f"http://{args.slide_host}:{args.slide_port}" if (
                 args.start_slide_server
@@ -1499,6 +1519,12 @@ def main() -> int:
         help="Override model confirmation threshold. 0 uses the threshold stored in the model.",
     )
     parser.add_argument(
+        "--risk-auto-reject-threshold",
+        type=float,
+        default=float(env_setting("LIVERSE_RISK_AUTO_REJECT_THRESHOLD", "0.9") or "0.9"),
+        help="In semi-auto mode, reject references with risk_score at or above this value without showing them to the operator. 0 disables it.",
+    )
+    parser.add_argument(
         "--approval-ui",
         choices=["web", "popup"],
         default="web",
@@ -1583,6 +1609,7 @@ def main() -> int:
                 "semi_auto_approval": args.semi_auto_approval,
                 "risk_model": str(args.risk_model) if args.semi_auto_approval else None,
                 "risk_threshold": args.risk_threshold,
+                "risk_auto_reject_threshold": args.risk_auto_reject_threshold,
                 "approval_ui": args.approval_ui,
                 "holyrics_target": describe_holyrics_target(args),
                 "holyrics_quick_minutes": args.holyrics_quick_minutes,
