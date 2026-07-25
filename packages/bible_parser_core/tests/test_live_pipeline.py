@@ -3,7 +3,7 @@ from pathlib import Path
 
 from bible_parser_core.live_pipeline import LiveReferencePipeline, build_grammar
 from bible_parser_core.risk_model import load_risk_model, score_payload_with_model
-from tools.holyrics import cross_chapter_quick_presentation_slides
+from tools.holyrics import cross_chapter_quick_presentation_slides, scripture_range_quick_presentation_slides
 
 
 class LiveReferencePipelineTest(unittest.TestCase):
@@ -651,6 +651,21 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertEqual("Иоанн 3:16-36", result.get("parsed", {}).get("ref"))
         self.assertEqual("Иоанн 3:16-36", without_from.get("parsed", {}).get("ref"))
         self.assertEqual("Иоанн 3:16-36", compact.get("parsed", {}).get("ref"))
+
+    def test_long_same_chapter_range_builds_quick_presentation_slides(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("евангелие от иоанна третья глава с шестнадцатого и до конца главы")
+        slides = scripture_range_quick_presentation_slides(
+            result.get("slide") or result.get("parsed") or {},
+            max_chars=360,
+            max_verses=3,
+        )
+
+        self.assertGreater(len(slides), 3)
+        self.assertTrue(slides[0]["text"].startswith("Иоанн 3:16-36\n\n3:16."))
+        self.assertNotIn("Иоанн 3:16-36", slides[1]["text"])
+        self.assertTrue(any("3:36." in slide["text"] for slide in slides))
 
     def test_complete_single_verse_after_chapter_still_matches(self):
         pipeline = LiveReferencePipeline()

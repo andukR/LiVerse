@@ -22,6 +22,9 @@ DEFAULT_TIMEOUT = 5.0
 DEFAULT_HOLYRICS_ACTION = "ShowQuickPresentation"
 DEFAULT_CROSS_CHAPTER_SLIDE_MAX_CHARS = 760
 DEFAULT_CROSS_CHAPTER_SLIDE_MAX_VERSES = 9
+DEFAULT_LONG_RANGE_SLIDE_MAX_CHARS = 620
+DEFAULT_LONG_RANGE_SLIDE_MAX_VERSES = 7
+DEFAULT_LONG_RANGE_MIN_VERSES = 8
 MIN_RECOMMENDED_HOLYRICS_VERSION = "2.28.1"
 HOLYRICS_JSLIB_DOC_URL = "https://github.com/holyrics/jslib/blob/main/README-en.md"
 REQUIRED_HOLYRICS_PERMISSIONS = (
@@ -274,11 +277,37 @@ def cross_chapter_range(payload: dict) -> tuple[str, int, int, int, int] | None:
     return book, chapter, start_verse, end_chapter, end_verse
 
 
-def cross_chapter_verse_lines(payload: dict) -> list[str]:
-    cross_range = cross_chapter_range(payload)
-    if not cross_range:
+def scripture_range(payload: dict, *, min_same_chapter_verses: int = DEFAULT_LONG_RANGE_MIN_VERSES) -> tuple[str, int, int, int, int] | None:
+    try:
+        book = str(payload.get("book") or "").strip()
+        chapter = int(payload.get("chapter") or 0)
+        start_verse = int(payload.get("start_verse") or 0)
+        end_chapter_value = payload.get("end_chapter")
+        end_chapter = int(end_chapter_value) if end_chapter_value is not None else chapter
+        end_verse = int(payload.get("end_verse") or start_verse)
+    except (TypeError, ValueError):
+        return None
+
+    if not book or chapter <= 0 or start_verse <= 0 or end_chapter < chapter or end_verse <= 0:
+        return None
+    if end_chapter > chapter:
+        return book, chapter, start_verse, end_chapter, end_verse
+    if end_verse < start_verse:
+        return None
+    if end_verse - start_verse + 1 >= max(2, min_same_chapter_verses):
+        return book, chapter, start_verse, chapter, end_verse
+    return None
+
+
+def scripture_range_verse_lines(
+    payload: dict,
+    *,
+    min_same_chapter_verses: int = DEFAULT_LONG_RANGE_MIN_VERSES,
+) -> list[str]:
+    selected_range = scripture_range(payload, min_same_chapter_verses=min_same_chapter_verses)
+    if not selected_range:
         return []
-    book, chapter, start_verse, end_chapter, end_verse = cross_range
+    book, chapter, start_verse, end_chapter, end_verse = selected_range
 
     try:
         from bible_parser_core.parser import bible_map
@@ -305,6 +334,12 @@ def cross_chapter_verse_lines(payload: dict) -> list[str]:
     return lines
 
 
+def cross_chapter_verse_lines(payload: dict) -> list[str]:
+    if not cross_chapter_range(payload):
+        return []
+    return scripture_range_verse_lines(payload, min_same_chapter_verses=10**9)
+
+
 def cross_chapter_quick_presentation_slides(
     payload: dict,
     *,
@@ -312,7 +347,12 @@ def cross_chapter_quick_presentation_slides(
     max_verses: int = DEFAULT_CROSS_CHAPTER_SLIDE_MAX_VERSES,
 ) -> list[dict[str, str]]:
     ref = str(payload.get("ref") or "").strip()
-    lines = cross_chapter_verse_lines(payload)
+    existing_lines = payload.get("_scripture_range_lines")
+    lines = (
+        [str(line) for line in existing_lines if str(line).strip()]
+        if isinstance(existing_lines, list)
+        else cross_chapter_verse_lines(payload)
+    )
     if not ref or not lines:
         return []
 
@@ -388,6 +428,23 @@ def cross_chapter_quick_presentation_slides(
         {"text": slide_text(lines[start:end], first=index == 0)}
         for index, (start, end) in enumerate(ranges)
     ]
+
+
+def scripture_range_quick_presentation_slides(
+    payload: dict,
+    *,
+    max_chars: int = DEFAULT_LONG_RANGE_SLIDE_MAX_CHARS,
+    max_verses: int = DEFAULT_LONG_RANGE_SLIDE_MAX_VERSES,
+    min_same_chapter_verses: int = DEFAULT_LONG_RANGE_MIN_VERSES,
+) -> list[dict[str, str]]:
+    lines = scripture_range_verse_lines(payload, min_same_chapter_verses=min_same_chapter_verses)
+    if not lines:
+        return []
+    return cross_chapter_quick_presentation_slides(
+        {**payload, "_scripture_range_lines": lines},
+        max_chars=max_chars,
+        max_verses=max_verses,
+    )
 
 
 def slide_payload_to_holyrics_text(payload: dict) -> str:
@@ -783,6 +840,17 @@ def cross_chapter_quick_presentation_body(args: Any, base_url: str, payload: dic
     return body
 
 
+def scripture_range_quick_presentation_body(args: Any, base_url: str, payload: dict) -> dict | None:
+    slides = scripture_range_quick_presentation_slides(payload)
+    if not slides:
+        return None
+    body: dict[str, Any] = {"slides": slides}
+    theme = current_bible_theme_filter(args, base_url)
+    if theme:
+        body["theme"] = theme
+    return body
+
+
 def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, str]:
     if str(payload.get("slide_type") or "").strip() == "reference_list":
         text = slide_payload_to_holyrics_text(payload)
@@ -799,20 +867,22 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
             return False, show_reason
         return True, "show_quick_presentation:reference_list"
 
-    if cross_chapter_range(payload):
-        quick_body = cross_chapter_quick_presentation_body(args, base_url, payload)
+    selected_scripture_range = scripture_range(payload)
+    if selected_scripture_range:
+        quick_body = scripture_range_quick_presentation_body(args, base_url, payload)
         if not quick_body:
-            return False, "holyrics_cross_chapter_empty"
+            return False, "holyrics_scripture_range_empty"
         show_ok, show_reason, show_body = post_holyrics_api(
             args,
             base_url,
             "ShowQuickPresentation",
             quick_body,
         )
-        holyrics_log(f"ShowQuickPresentation cross-chapter response={show_body or show_reason or 'ok'}")
+        range_kind = "cross_chapter" if selected_scripture_range[3] > selected_scripture_range[1] else "long_range"
+        holyrics_log(f"ShowQuickPresentation {range_kind} response={show_body or show_reason or 'ok'}")
         if not show_ok:
             return False, show_reason
-        return True, f"show_quick_presentation:cross_chapter;slides:{len(quick_body['slides'])};manual_advance"
+        return True, f"show_quick_presentation:{range_kind};slides:{len(quick_body['slides'])};manual_advance"
 
     verse_id, reason = holyrics_verse_id(payload)
     ref = str(payload.get("ref") or "").strip()
