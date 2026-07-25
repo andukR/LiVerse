@@ -20,6 +20,8 @@ DEFAULT_HOST = "http://localhost"
 DEFAULT_PORT = 8091
 DEFAULT_TIMEOUT = 5.0
 DEFAULT_HOLYRICS_ACTION = "ShowQuickPresentation"
+DEFAULT_CROSS_CHAPTER_SLIDE_MAX_CHARS = 760
+DEFAULT_CROSS_CHAPTER_SLIDE_MAX_VERSES = 9
 MIN_RECOMMENDED_HOLYRICS_VERSION = "2.28.1"
 HOLYRICS_JSLIB_DOC_URL = "https://github.com/holyrics/jslib/blob/main/README-en.md"
 REQUIRED_HOLYRICS_PERMISSIONS = (
@@ -255,6 +257,137 @@ def holyrics_show_verse_count(payload: dict) -> int:
             return 1
         count += len([verse for verse in range(first, last + 1) if verse in chapter_map])
     return max(1, count)
+
+
+def cross_chapter_range(payload: dict) -> tuple[str, int, int, int, int] | None:
+    try:
+        book = str(payload.get("book") or "").strip()
+        chapter = int(payload.get("chapter") or 0)
+        start_verse = int(payload.get("start_verse") or 0)
+        end_chapter = int(payload.get("end_chapter") or 0)
+        end_verse = int(payload.get("end_verse") or 0)
+    except (TypeError, ValueError):
+        return None
+
+    if not book or chapter <= 0 or start_verse <= 0 or end_chapter <= chapter or end_verse <= 0:
+        return None
+    return book, chapter, start_verse, end_chapter, end_verse
+
+
+def cross_chapter_verse_lines(payload: dict) -> list[str]:
+    cross_range = cross_chapter_range(payload)
+    if not cross_range:
+        return []
+    book, chapter, start_verse, end_chapter, end_verse = cross_range
+
+    try:
+        from bible_parser_core.parser import bible_map
+    except Exception:
+        return []
+
+    chapters = bible_map().get(book, {})
+    if chapter not in chapters or end_chapter not in chapters:
+        return []
+
+    lines: list[str] = []
+    for current_chapter in range(chapter, end_chapter + 1):
+        chapter_map = chapters.get(current_chapter, {})
+        if not chapter_map:
+            return []
+        first_verse = start_verse if current_chapter == chapter else min(chapter_map)
+        last_verse = end_verse if current_chapter == end_chapter else max(chapter_map)
+        if first_verse > last_verse:
+            return []
+        for verse in range(first_verse, last_verse + 1):
+            text = chapter_map.get(verse)
+            if text:
+                lines.append(f"{current_chapter}:{verse}. {text}")
+    return lines
+
+
+def cross_chapter_quick_presentation_slides(
+    payload: dict,
+    *,
+    max_chars: int = DEFAULT_CROSS_CHAPTER_SLIDE_MAX_CHARS,
+    max_verses: int = DEFAULT_CROSS_CHAPTER_SLIDE_MAX_VERSES,
+) -> list[dict[str, str]]:
+    ref = str(payload.get("ref") or "").strip()
+    lines = cross_chapter_verse_lines(payload)
+    if not ref or not lines:
+        return []
+
+    max_chars = max(240, max_chars)
+    max_verses = max(1, max_verses)
+
+    def slide_text(slide_lines: list[str], *, first: bool) -> str:
+        body = "\n".join(slide_lines).strip()
+        if first:
+            return f"{ref}\n\n{body}".strip()
+        return body
+
+    total_chars = len(ref) + 2 + sum(len(line) + 1 for line in lines)
+    slide_count = max(
+        1,
+        (total_chars + max_chars - 1) // max_chars,
+        (len(lines) + max_verses - 1) // max_verses,
+    )
+    slide_count = min(slide_count, len(lines))
+    target_chars = max(1, (total_chars + slide_count - 1) // slide_count)
+
+    line_lengths = [len(line) for line in lines]
+    prefix_lengths = [0]
+    for length in line_lengths:
+        prefix_lengths.append(prefix_lengths[-1] + length)
+
+    def chunk_length(start: int, end: int, *, first: bool) -> int:
+        line_count = end - start
+        if line_count <= 0:
+            return 0
+        length = prefix_lengths[end] - prefix_lengths[start] + max(0, line_count - 1)
+        if first:
+            length += len(ref) + 2
+        return length
+
+    dp: list[list[tuple[int, int] | None]] = [[None] * (len(lines) + 1) for _ in range(slide_count + 1)]
+    parent: list[list[int | None]] = [[None] * (len(lines) + 1) for _ in range(slide_count + 1)]
+    dp[0][0] = (0, 0)
+    for slide_index in range(1, slide_count + 1):
+        for end in range(1, len(lines) + 1):
+            best: tuple[int, int] | None = None
+            best_start: int | None = None
+            min_start = max(slide_index - 1, end - max_verses)
+            for start in range(min_start, end):
+                previous = dp[slide_index - 1][start]
+                if previous is None:
+                    continue
+                length = chunk_length(start, end, first=slide_index == 1)
+                cost = (
+                    max(previous[0], length),
+                    previous[1] + (length - target_chars) * (length - target_chars),
+                )
+                if best is None or cost < best:
+                    best = cost
+                    best_start = start
+            dp[slide_index][end] = best
+            parent[slide_index][end] = best_start
+
+    if dp[slide_count][len(lines)] is None:
+        return [{"text": slide_text(lines, first=True)}]
+
+    ranges: list[tuple[int, int]] = []
+    end = len(lines)
+    for slide_index in range(slide_count, 0, -1):
+        start = parent[slide_index][end]
+        if start is None:
+            return [{"text": slide_text(lines, first=True)}]
+        ranges.append((start, end))
+        end = start
+    ranges.reverse()
+
+    return [
+        {"text": slide_text(lines[start:end], first=index == 0)}
+        for index, (start, end) in enumerate(ranges)
+    ]
 
 
 def slide_payload_to_holyrics_text(payload: dict) -> str:
@@ -609,6 +742,47 @@ def resolve_holyrics_theme_id(args: Any, base_url: str, theme_name: str) -> tupl
     return None, f"holyrics_theme_not_found:{requested}"
 
 
+def current_bible_theme_filter(args: Any, base_url: str) -> dict[str, str]:
+    selected_theme_id = str(getattr(args, "_holyrics_theme_id", "") or "").strip()
+    if selected_theme_id:
+        return {"id": selected_theme_id}
+
+    theme_name = str(getattr(args, "holyrics_theme", "") or "").strip()
+    if theme_name:
+        theme_id, reason = resolve_holyrics_theme_id(args, base_url, theme_name)
+        if theme_id:
+            setattr(args, "_holyrics_theme_id", theme_id)
+            return {"id": theme_id}
+        holyrics_log(f"не удалось выбрать тему для межглавного диапазона: {reason}")
+        return {}
+
+    ok, reason, body = post_holyrics_api(args, base_url, "GetBibleSettings", {})
+    if not ok:
+        holyrics_log(f"GetBibleSettings response={body or reason or 'failed'}")
+        return {}
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return {}
+    data = parsed.get("data") if isinstance(parsed, dict) else None
+    theme = data.get("theme") if isinstance(data, dict) else None
+    public_theme_id = str((theme or {}).get("public") or "").strip() if isinstance(theme, dict) else ""
+    if public_theme_id:
+        return {"id": public_theme_id}
+    return {}
+
+
+def cross_chapter_quick_presentation_body(args: Any, base_url: str, payload: dict) -> dict | None:
+    slides = cross_chapter_quick_presentation_slides(payload)
+    if not slides:
+        return None
+    body: dict[str, Any] = {"slides": slides}
+    theme = current_bible_theme_filter(args, base_url)
+    if theme:
+        body["theme"] = theme
+    return body
+
+
 def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, str]:
     if str(payload.get("slide_type") or "").strip() == "reference_list":
         text = slide_payload_to_holyrics_text(payload)
@@ -624,6 +798,21 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
         if not show_ok:
             return False, show_reason
         return True, "show_quick_presentation:reference_list"
+
+    if cross_chapter_range(payload):
+        quick_body = cross_chapter_quick_presentation_body(args, base_url, payload)
+        if not quick_body:
+            return False, "holyrics_cross_chapter_empty"
+        show_ok, show_reason, show_body = post_holyrics_api(
+            args,
+            base_url,
+            "ShowQuickPresentation",
+            quick_body,
+        )
+        holyrics_log(f"ShowQuickPresentation cross-chapter response={show_body or show_reason or 'ok'}")
+        if not show_ok:
+            return False, show_reason
+        return True, f"show_quick_presentation:cross_chapter;slides:{len(quick_body['slides'])};manual_advance"
 
     verse_id, reason = holyrics_verse_id(payload)
     ref = str(payload.get("ref") or "").strip()

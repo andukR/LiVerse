@@ -6,6 +6,7 @@ const asr = document.querySelector("#asr");
 const connection = document.querySelector("#connection");
 const status = document.querySelector("#status");
 const approve = document.querySelector("#approve");
+const approveContext = document.querySelector("#approveContext");
 const reject = document.querySelector("#reject");
 const manualRef = document.querySelector("#manualRef");
 const manualStatus = document.querySelector("#manualStatus");
@@ -150,6 +151,7 @@ function render(state) {
   verse.textContent = candidate.verse || "";
   resizeCandidateVerse();
   asr.textContent = candidate.asr || candidate.detected_text || "";
+  approveContext.classList.toggle("hidden", !candidate.can_set_context);
   status.textContent = "";
 }
 
@@ -171,22 +173,33 @@ function resizeCandidateVerse() {
 
 async function decide(action) {
   approve.disabled = true;
+  approveContext.disabled = true;
   reject.disabled = true;
-  status.textContent = action === "approve" ? "Отправляю в Holyrics…" : "Отклоняю…";
+  status.textContent = (
+    action === "approve-context"
+      ? "Отправляю и запоминаю контекст…"
+      : (action === "approve" ? "Отправляю в Holyrics…" : "Отклоняю…")
+  );
   try {
     const response = await fetch(`/api/${action}`, { method: "POST" });
     const result = await response.json();
     if (!result.ok) throw new Error(result.reason || "Ошибка");
-    status.textContent = action === "approve" ? "Отправлено" : "Отклонено";
+    status.textContent = (
+      action === "approve-context"
+        ? "Контекст запомнен"
+        : (action === "approve" ? "Отправлено" : "Отклонено")
+    );
   } catch (error) {
     status.textContent = `Ошибка: ${error.message}`;
   } finally {
     approve.disabled = false;
+    approveContext.disabled = false;
     reject.disabled = false;
   }
 }
 
 approve.addEventListener("click", () => decide("approve"));
+approveContext.addEventListener("click", () => decide("approve-context"));
 reject.addEventListener("click", () => decide("reject"));
 copySessionQuotes.addEventListener("click", async () => {
   if (!sessionShareText) return;

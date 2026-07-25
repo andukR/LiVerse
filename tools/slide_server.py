@@ -174,6 +174,7 @@ def submit_candidate(payload: dict) -> dict:
         "detected_text": str(payload.get("detected_text") or "").strip(),
         "chunk": payload.get("chunk"),
         "label": str(payload.get("label") or "").strip(),
+        "can_set_context": bool(payload.get("can_set_context")),
     }
     with STATE_LOCK:
         PENDING_CANDIDATE.clear()
@@ -255,7 +256,7 @@ def manual_reference_candidate(reference: str) -> tuple[dict | None, str]:
 
 
 def decide_candidate(action: str) -> tuple[bool, str, dict]:
-    if action not in {"approve", "reject"}:
+    if action not in {"approve", "approve_context", "reject"}:
         return False, "unknown_action", {}
     with STATE_LOCK:
         candidate = dict(PENDING_CANDIDATE)
@@ -276,16 +277,20 @@ def decide_candidate(action: str) -> tuple[bool, str, dict]:
     if not ok:
         return False, reason, candidate
 
-    if action == "approve":
+    if action in {"approve", "approve_context"}:
         remember_approved_quote(candidate)
 
     with STATE_LOCK:
         PENDING_CANDIDATE.clear()
         PROCESSING_STATE.update(
             {
-                "stage": "approved" if action == "approve" else "rejected",
-                "message": "Отправлено в Holyrics" if action == "approve" else "Цитата отклонена",
-                "progress": 100 if action == "approve" else 0,
+                "stage": "approved" if action in {"approve", "approve_context"} else "rejected",
+                "message": (
+                    "Отправлено в Holyrics и запомнено как контекст"
+                    if action == "approve_context"
+                    else ("Отправлено в Holyrics" if action == "approve" else "Цитата отклонена")
+                ),
+                "progress": 100 if action in {"approve", "approve_context"} else 0,
                 "chunk": candidate.get("chunk"),
                 "manual_required": action == "reject",
             }
@@ -429,8 +434,8 @@ class SlideHandler(BaseHTTPRequestHandler):
         self.serve_static()
 
     def do_POST(self) -> None:
-        if self.path in {"/api/approve", "/api/reject"}:
-            action = self.path.rsplit("/", 1)[-1]
+        if self.path in {"/api/approve", "/api/approve-context", "/api/reject"}:
+            action = "approve_context" if self.path == "/api/approve-context" else self.path.rsplit("/", 1)[-1]
             ok, reason, candidate = decide_candidate(action)
             self.send_json({"ok": ok, "reason": reason, "candidate": candidate}, status=200 if ok else 409)
             return

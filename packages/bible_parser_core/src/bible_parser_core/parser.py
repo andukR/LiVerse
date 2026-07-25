@@ -1222,6 +1222,20 @@ def ref_candidates(normalized: str, book: str, bible: dict[str, dict[int, dict[i
             add(chapter[0], [verse], min(chapter[1], match.start()), max(chapter[2], match.end()), 0.88)
 
     numbers = reference_numbers(normalized, book)
+    if re.search(r"\b(?:до\s+)?конца\s+глава\b", normalized) and len(numbers) >= 2:
+        for first, second in ((numbers[0], numbers[1]), (numbers[-2], numbers[-1])):
+            chapter_value, chapter_start, _chapter_end = first
+            start_verse, _verse_start, verse_end = second
+            chapter_map = chapters.get(chapter_value, {})
+            chapter_end = max(chapter_map) if chapter_map else None
+            if chapter_end is not None and start_verse <= chapter_end:
+                add(
+                    chapter_value,
+                    list(range(start_verse, chapter_end + 1)),
+                    chapter_start,
+                    verse_end,
+                    0.94,
+                )
     if not candidates and len(numbers) >= 3:
         for first, second, third in ((numbers[0], numbers[1], numbers[2]), (numbers[-3], numbers[-2], numbers[-1])):
             chapter_value, chapter_start, _chapter_end = first

@@ -957,6 +957,14 @@ def should_block_matched_payload(payload: dict) -> str | None:
         return "weak_bare_numbers_first_verse"
 
     if (
+        ref.startswith("Числа ")
+        and re.search(r"\bо\s+числа\s*$", normalized)
+        and not has_reference_marker(text)
+        and len(re.findall(r"\b\d+\b", normalized)) >= 2
+    ):
+        return "weak_trailing_numbers_context"
+
+    if (
         ref.startswith("Ездра ")
         and re.search(r"\bездр[аы]\b", normalized)
         and re.search(r"\bсот\w*\b", raw_text)
@@ -1131,6 +1139,9 @@ def score_reference_risk(payload: dict, asr_result: dict | None = None) -> dict:
     if payload.get("source") == "parser_repeated_range_end":
         score += 0.1
         reasons.append("repeated_range_end_repair")
+    if payload.get("source") == "context_range":
+        score += 0.5
+        reasons.append("context_range_reference")
     if payload.get("ambiguous_alternatives"):
         score += 0.15
         alternative_books = {
@@ -1195,6 +1206,166 @@ def same_place_candidates(candidates: list[str], last_parsed: dict | ParsedRefer
         if suffix:
             expanded.append(f"{book} {chapter} глава {suffix}")
     return expanded
+
+
+def safe_int(value: object) -> int | None:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def reference_range_context(reference: dict | ParsedReference | None) -> dict | None:
+    if isinstance(reference, ParsedReference):
+        data = asdict(reference)
+    elif isinstance(reference, dict):
+        data = reference.get("parsed") if isinstance(reference.get("parsed"), dict) else reference
+    else:
+        return None
+
+    book = str(data.get("book") or "").strip()
+    chapter = safe_int(data.get("chapter"))
+    start_verse = safe_int(data.get("start_verse"))
+    end_chapter = safe_int(data.get("end_chapter")) or chapter
+    end_verse = safe_int(data.get("end_verse"))
+    if not book or chapter is None or start_verse is None or end_chapter is None or end_verse is None:
+        return None
+    if end_chapter < chapter or (end_chapter == chapter and end_verse <= start_verse):
+        return None
+
+    ref = (
+        f"{book} {chapter}:{start_verse}-{end_verse}"
+        if end_chapter == chapter
+        else f"{book} {chapter}:{start_verse}-{end_chapter}:{end_verse}"
+    )
+    return {
+        "book": book,
+        "chapter": chapter,
+        "start_verse": start_verse,
+        "end_chapter": end_chapter,
+        "end_verse": end_verse,
+        "ref": str(data.get("ref") or ref),
+    }
+
+
+def book_family(book: str) -> str:
+    return re.sub(r"^[1234]\s+", "", book).strip().lower().replace("ё", "е")
+
+
+def has_explicit_other_book_marker(normalized: str, context: dict) -> bool:
+    if re.search(r"\b(?:евангелие|книга|книги|пророк|пророка|псал\w*)\b", normalized):
+        return True
+    if not re.search(r"\bпослани\w*\b", normalized):
+        return False
+    context_family = book_family(str(context.get("book") or ""))
+    candidates = book_candidates(normalized)
+    if not candidates:
+        return False
+    return not any(book_family(candidate.book) == context_family for candidate in candidates)
+
+
+def context_range_contains(context: dict, chapter: int, verse: int) -> bool:
+    start_chapter = int(context["chapter"])
+    start_verse = int(context["start_verse"])
+    end_chapter = int(context["end_chapter"])
+    end_verse = int(context["end_verse"])
+    if chapter < start_chapter or chapter > end_chapter:
+        return False
+    if chapter == start_chapter and verse < start_verse:
+        return False
+    if chapter == end_chapter and verse > end_verse:
+        return False
+    return True
+
+
+def context_chapter_for_verse(
+    context: dict,
+    verse: int,
+    *,
+    preferred_chapter: int | None = None,
+) -> int | None:
+    if preferred_chapter is not None and context_range_contains(context, preferred_chapter, verse):
+        return preferred_chapter
+    for chapter in range(int(context["chapter"]), int(context["end_chapter"]) + 1):
+        if context_range_contains(context, chapter, verse):
+            return chapter
+    return None
+
+
+def contextual_short_reference(
+    text: str,
+    context: dict | None,
+    bible_path: Path = DEFAULT_BIBLE,
+    *,
+    preferred_chapter: int | None = None,
+) -> dict | None:
+    if not context:
+        return None
+    normalized = normalize_text(text)
+    if has_explicit_other_book_marker(normalized, context):
+        return None
+
+    chapter: int | None = None
+    verse: int | None = None
+    for pattern in (
+        r"\b(?P<verse>\d{1,3})\s+стих\w*\s+(?P<chapter>\d{1,3})\s+глав\w*\b",
+        r"\b(?P<chapter>\d{1,3})\s+глав\w*\s+(?P<verse>\d{1,3})(?:\s+стих\w*)?\b",
+        r"\b(?P<verse>\d{1,3})\s+(?P<chapter>\d{1,3})\s+глав\w*\b",
+    ):
+        match = re.search(pattern, normalized)
+        if match:
+            chapter = int(match.group("chapter"))
+            verse = int(match.group("verse"))
+            break
+
+    if verse is None:
+        verse_match = re.search(r"\b(?P<verse>\d{1,3})\s+стих\w*\b", normalized)
+        if verse_match:
+            verse = int(verse_match.group("verse"))
+        elif re.fullmatch(r"\s*\d{1,3}\s*", normalized):
+            verse = int(normalized.strip())
+    if verse is None:
+        return None
+
+    if chapter is None:
+        chapter = context_chapter_for_verse(context, verse, preferred_chapter=preferred_chapter)
+    if chapter is None or not context_range_contains(context, chapter, verse):
+        return None
+
+    parsed = parse_live_reference(f"{context['book']} {chapter}:{verse}", bible_path=bible_path)
+    if parsed is None:
+        return None
+    return {
+        "text": text,
+        "source": "context_range",
+        "resolved": None,
+        "parsed": asdict(parsed),
+        "invalid_reference": None,
+        "message": None,
+        "matched": True,
+        "bible_path": str(bible_path),
+        "context_range": dict(context),
+        "context_reference": True,
+    }
+
+
+def contextual_short_reference_from_candidates(
+    candidates: list[str],
+    context: dict | None,
+    bible_path: Path = DEFAULT_BIBLE,
+    *,
+    preferred_chapter: int | None = None,
+) -> dict | None:
+    for candidate in candidates:
+        payload = contextual_short_reference(
+            candidate,
+            context,
+            bible_path=bible_path,
+            preferred_chapter=preferred_chapter,
+        )
+        if payload:
+            return payload
+    return None
 
 
 def parsed_payload_from_candidates(
@@ -1348,6 +1519,16 @@ class LiveReferencePipeline:
         self.last_text_ms: int | None = None
         self.last_asr_word_end_ms: int | None = None
         self.last_parsed: dict | None = None
+        self.context_range: dict | None = None
+        self.context_current_chapter: int | None = None
+
+    def set_context_range(self, reference: dict | ParsedReference | None) -> bool:
+        context = reference_range_context(reference)
+        if not context:
+            return False
+        self.context_range = context
+        self.context_current_chapter = int(context["chapter"])
+        return True
 
     def process_text(
         self,
@@ -1394,6 +1575,14 @@ class LiveReferencePipeline:
             last_parsed=self.last_parsed,
             show_candidates=show_candidates,
         )
+        context_payload = contextual_short_reference_from_candidates(
+            candidate_texts,
+            self.context_range,
+            bible_path=self.bible_path,
+            preferred_chapter=self.context_current_chapter,
+        )
+        if context_payload:
+            payload = context_payload
         payload["vosk_text"] = text
         payload["vosk_buffer"] = list(self.text_buffer.parts)
         payload["candidate_texts"] = candidate_texts
@@ -1406,6 +1595,8 @@ class LiveReferencePipeline:
             payload["buffer_kept_for_open_range"] = True
         if payload.get("parsed"):
             self.last_parsed = payload["parsed"]
+            if payload.get("context_reference"):
+                self.context_current_chapter = int(payload["parsed"]["chapter"])
             if open_range_start_fragment(str(payload.get("text") or "")):
                 payload["buffer_kept_for_open_range"] = True
             else:

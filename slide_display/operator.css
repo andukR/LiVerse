@@ -17,9 +17,12 @@ header img { width: 72px; height: 72px; padding: 5px; background: white; border-
 h1 { margin: 10px 0 16px; font-size: clamp(32px, 9vw, 54px); color: #f5ce7c; }
 #verse { font-family: Georgia, serif; font-size: clamp(21px, 5.5vw, 30px); line-height: 1.35; }
 details { margin-top: 22px; color: #b8c4cf; }
-.actions { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; margin-top: 28px; }
+.actions { display: flex; gap: 12px; margin-top: 28px; }
+.actions button { flex: 1; }
+.actions .approve { flex: 2; }
 button { min-height: 68px; border: 0; border-radius: 14px; font-size: 21px; font-weight: 750; color: white; }
 .approve { background: #148447; }
+.approve-context { background: #8a6d16; }
 .reject { background: #9b3030; }
 button:disabled { opacity: .5; }
 #status { min-height: 24px; margin-top: 14px; text-align: center; color: #c8d2dc; }

@@ -3,9 +3,44 @@ from pathlib import Path
 
 from bible_parser_core.live_pipeline import LiveReferencePipeline, build_grammar
 from bible_parser_core.risk_model import load_risk_model, score_payload_with_model
+from tools.holyrics import cross_chapter_quick_presentation_slides
 
 
 class LiveReferencePipelineTest(unittest.TestCase):
+    def test_context_range_resolves_chapter_and_verse_without_book(self):
+        pipeline = LiveReferencePipeline()
+        context = pipeline.process_text("первое послание иоанна вторая глава с двенадцатого по семнадцатый стих")
+        self.assertEqual("1 Иоанна 2:12-17", context.get("parsed", {}).get("ref"))
+        self.assertTrue(pipeline.set_context_range(context))
+
+        result = pipeline.process_text(
+            "иоанн завершает этот отрывок удивительными словами семнадцатый стих второй главы"
+        )
+
+        self.assertEqual("1 Иоанна 2:17", result.get("parsed", {}).get("ref"))
+        self.assertEqual("context_range", result.get("source"))
+        self.assertIn("context_range_reference", result.get("risk_reasons") or [])
+
+    def test_context_range_resolves_bare_verse_inside_current_context_chapter(self):
+        pipeline = LiveReferencePipeline()
+        context = pipeline.process_text("первое послание иоанна вторая глава с двенадцатого по семнадцатый стих")
+        self.assertTrue(pipeline.set_context_range(context))
+
+        result = pipeline.process_text("духовное детство радость спасения двенадцатый стих")
+
+        self.assertEqual("1 Иоанна 2:12", result.get("parsed", {}).get("ref"))
+        self.assertEqual("context_range", result.get("source"))
+
+    def test_context_range_does_not_override_explicit_other_book(self):
+        pipeline = LiveReferencePipeline()
+        context = pipeline.process_text("первое послание иоанна вторая глава с двенадцатого по семнадцатый стих")
+        self.assertTrue(pipeline.set_context_range(context))
+
+        result = pipeline.process_text("евангелие от иоанна второй главы семнадцатый стих")
+
+        self.assertEqual("Иоанн 2:17", result.get("parsed", {}).get("ref"))
+        self.assertNotEqual("context_range", result.get("source"))
+
     def assert_book_only_fragment_does_not_reuse_previous_numbers(self, fragment):
         with self.subTest(fragment=fragment):
             pipeline = LiveReferencePipeline()
@@ -577,6 +612,25 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertEqual("Иоанн 3:16-4:2", next_chapter_without_from.get("parsed", {}).get("ref"))
         self.assertEqual("Иоанн 3:16-4:2", compact.get("parsed", {}).get("ref"))
 
+    def test_cross_chapter_range_builds_quick_presentation_slides(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text(
+            "евангелие от иоанна третья глава с шестнадцатого стиха до четвёртой главы второго стиха"
+        )
+        slides = cross_chapter_quick_presentation_slides(
+            result.get("slide") or result.get("parsed") or {},
+            max_chars=360,
+            max_verses=3,
+        )
+
+        self.assertGreater(len(slides), 2)
+        self.assertTrue(slides[0]["text"].startswith("Иоанн 3:16-4:2\n\n3:16."))
+        self.assertIn("3:17.", slides[0]["text"])
+        self.assertNotIn("Иоанн 3:16-4:2", slides[1]["text"])
+        self.assertTrue(any("4:1." in slide["text"] for slide in slides))
+        self.assertTrue(any("4:2." in slide["text"] for slide in slides))
+
     def test_clipped_next_chapter_range_does_not_fall_back_to_single_verse(self):
         pipeline = LiveReferencePipeline()
 
@@ -592,9 +646,11 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         result = pipeline.process_text("евангелие от иоанна третья глава с шестнадцатого и до конца главы")
         without_from = pipeline.process_text("евангелие от иоанна третья глава шестнадцатого до конца главы")
+        compact = pipeline.process_text("иоанна три шестнадцать до конца главы")
 
         self.assertEqual("Иоанн 3:16-36", result.get("parsed", {}).get("ref"))
         self.assertEqual("Иоанн 3:16-36", without_from.get("parsed", {}).get("ref"))
+        self.assertEqual("Иоанн 3:16-36", compact.get("parsed", {}).get("ref"))
 
     def test_complete_single_verse_after_chapter_still_matches(self):
         pipeline = LiveReferencePipeline()
@@ -690,6 +746,17 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         explicit = pipeline.process_text("книга числа первая глава первый стих")
         self.assertEqual("Числа 1:1", explicit.get("parsed", {}).get("ref"))
+
+    def test_weak_trailing_numbers_context_does_not_auto_match(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("второе один о числа")
+
+        self.assertFalse(result.get("matched"))
+        self.assertEqual("weak_trailing_numbers_context", result.get("blocked_weak_context"))
+
+        explicit = pipeline.process_text("книга числа вторая глава первый стих")
+        self.assertEqual("Числа 2:1", explicit.get("parsed", {}).get("ref"))
 
     def test_weak_trailing_ezra_context_does_not_auto_match(self):
         pipeline = LiveReferencePipeline()

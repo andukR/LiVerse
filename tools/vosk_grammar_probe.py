@@ -600,6 +600,15 @@ def add_slide_payload(payload: dict) -> dict:
         "asr": source_text,
         "detected_text": source_text,
     }
+    try:
+        chapter = int(parsed.get("chapter") or 0)
+        start_verse = int(parsed.get("start_verse") or 0)
+        end_chapter = int(parsed.get("end_chapter") or chapter)
+        end_verse = int(parsed.get("end_verse") or 0)
+    except (TypeError, ValueError):
+        chapter = start_verse = end_chapter = end_verse = 0
+    if end_chapter > chapter or (end_chapter == chapter and end_verse > start_verse):
+        payload["slide"]["can_set_context"] = True
     alternatives = []
     for alternative in payload.get("ambiguous_alternatives") or []:
         alternatives.append(
@@ -648,6 +657,9 @@ def payload_summary(payload: dict) -> dict:
         "end_verse": parsed.get("end_verse"),
         "source": payload.get("source"),
         "has_slide": bool(slide),
+        "can_set_context": bool(slide.get("can_set_context")),
+        "context_reference": bool(payload.get("context_reference")),
+        "context_range": payload.get("context_range") or {},
         "invalid_reference": invalid_reference,
         "message": payload.get("message"),
         "attempts": payload.get("attempts") or [],
@@ -698,7 +710,14 @@ def popup_approval_decision(slide: dict) -> str:
     root.resizable(True, True)
 
     alternatives = [item for item in slide.get("alternatives") or [] if isinstance(item, dict)]
-    width, height = 980, 430 if alternatives else 360
+    has_context_button = bool(slide.get("can_set_context"))
+    width = 980
+    if alternatives and has_context_button:
+        height = 520
+    elif alternatives or has_context_button:
+        height = 430
+    else:
+        height = 360
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
     x = max(0, (screen_width - width) // 2)
@@ -722,17 +741,23 @@ def popup_approval_decision(slide: dict) -> str:
     tk.Label(
         root,
         text=(
-            "Enter - основной вариант     1/2/... - альтернативы     Esc или Space - отклонить"
+            "Enter - основной вариант     C - принять как контекст     1/2/... - альтернативы     Esc или Space - отклонить"
             if alternatives
-            else "Enter - принять     Esc или Space - отклонить"
+            else (
+                "Enter - принять     C - принять как контекст     Esc или Space - отклонить"
+                if slide.get("can_set_context")
+                else "Enter - принять     Esc или Space - отклонить"
+            )
         ),
         bg="#101820",
         fg="#c8d2dc",
         font=hint_font,
+        wraplength=900,
+        justify="center",
     ).pack(fill="x", padx=36, pady=(8, 18))
 
     buttons = tk.Frame(root, bg="#101820")
-    buttons.pack(fill="x", padx=36, pady=(0, 30))
+    buttons.pack(fill="x", padx=36, pady=(0, 12 if has_context_button else 30))
 
     def close(action: str) -> None:
         decision["action"] = action
@@ -784,7 +809,28 @@ def popup_approval_decision(slide: dict) -> str:
     )
     reject.pack(side="left", fill="x", expand=True, padx=(10, 0))
 
+    if has_context_button:
+        context_row = tk.Frame(root, bg="#101820")
+        context_row.pack(fill="x", padx=36, pady=(0, 30))
+        context_button = tk.Button(
+            context_row,
+            text="Принять и запомнить как контекстный отрывок",
+            command=lambda: close("approve_context"),
+            bg="#8a6d16",
+            fg="white",
+            activebackground="#a8841b",
+            activeforeground="white",
+            font=button_font,
+            relief="flat",
+            padx=24,
+            pady=16,
+        )
+        context_button.pack(fill="x", expand=True)
+
     root.bind("<Return>", lambda _event: close("approve"))
+    if has_context_button:
+        root.bind("c", lambda _event: close("approve_context"))
+        root.bind("C", lambda _event: close("approve_context"))
     for index, _alternative in enumerate(alternatives, start=1):
         root.bind(str(index), lambda _event, choice=index - 1: close(f"alternative:{choice}"))
     root.bind("<Escape>", lambda _event: close("reject"))
@@ -903,10 +949,10 @@ def approve_with_popup(args: argparse.Namespace, payload: dict) -> dict:
             return {"enabled": True, "ok": False, "reason": "invalid_alternative_selection"}
         output = publish_after_approval(args, payload)
         return {"enabled": True, "ok": True, "action": "approve_alternative", **output}
-    if action != "approve":
+    if action not in {"approve", "approve_context"}:
         return {"enabled": True, "ok": True, "action": "reject"}
     output = publish_after_approval(args, payload)
-    return {"enabled": True, "ok": True, "action": "approve", **output}
+    return {"enabled": True, "ok": True, "action": action, **output}
 
 
 def submit_for_approval(args: argparse.Namespace, payload: dict) -> dict:
@@ -925,6 +971,8 @@ def approval_required_for_payload(args: argparse.Namespace, payload: dict) -> bo
     if ml_risk.get("auto_reject"):
         return False
     if args.require_approval:
+        return True
+    if args.semi_auto_approval and (payload.get("slide") or {}).get("can_set_context"):
         return True
     return bool(args.semi_auto_approval and ml_risk.get("needs_confirmation"))
 
@@ -954,7 +1002,7 @@ def apply_ml_risk(args: argparse.Namespace, payload: dict, asr_result: dict | No
     payload["ml_risk"] = ml_risk
 
 
-def start_slide_server_if_needed(args: argparse.Namespace):
+def start_slide_server_if_needed(args: argparse.Namespace, pipeline: LiveReferencePipeline | None = None):
     web_approval = (args.require_approval or args.semi_auto_approval) and args.approval_ui == "web"
     needs_server = args.start_slide_server or web_approval or args.slide_output in {"web", "both"}
     if not needs_server:
@@ -972,6 +1020,8 @@ def start_slide_server_if_needed(args: argparse.Namespace):
                 return ok, reason
         if args.slide_output in {"web", "both"}:
             set_current_slide(candidate)
+        if action == "approve_context" and pipeline is not None:
+            pipeline.set_context_range(candidate)
         return True, ""
 
     return start_server_thread(
@@ -1022,9 +1072,9 @@ def approval_action(output: dict) -> str:
     action = str(approval.get("action") or "")
     if action == "reject":
         return "reject"
-    if action == "approve":
+    if action in {"approve", "approve_context"}:
         if output.get("holyrics", {}).get("ok") or output.get("web", {}).get("ok"):
-            return "approve"
+            return action
         return "output_failed"
     if approval.get("reason") == "waiting_for_approval" or output.get("holyrics", {}).get("reason") == "waiting_for_approval":
         return "waiting"
@@ -1137,7 +1187,6 @@ def run_microphone(args: argparse.Namespace) -> int:
     print(WELCOME_TEXT, flush=True)
     if logger.run_dir and args.print_log_path:
         print(f"Vosk log: {logger.run_dir / 'events.jsonl'}")
-    start_slide_server_if_needed(args)
 
     def callback(indata, frames, time, status):
         if status:
@@ -1157,6 +1206,7 @@ def run_microphone(args: argparse.Namespace) -> int:
     SetLogLevel(args.vosk_log_level)
     model = Model(str(args.model))
     pipeline = LiveReferencePipeline(args.bible, buffer_parts=args.vosk_buffer_parts)
+    start_slide_server_if_needed(args, pipeline=pipeline)
     audio_stats = {"chunks": 0, "peak": 0}
     empty_final_count = 0
     trigger_case_count = 0
@@ -1362,10 +1412,17 @@ def run_microphone(args: argparse.Namespace) -> int:
                             payload["output"] = publish_payload(args, payload)
                             if payload.get("slide"):
                                 action = approval_action(payload["output"])
+                                if action == "approve_context" and pipeline.set_context_range(payload["slide"]):
+                                    logger.write(
+                                        "context_range_selected",
+                                        {"ref": payload["slide"].get("ref"), "source": "popup"},
+                                    )
                                 append_session_reference(session_refs, payload, action=action)
                                 ref = str((payload.get("parsed") or {}).get("ref") or payload["slide"].get("ref"))
                                 if action == "waiting":
                                     console.status(f"найдена ссылка {ref}, ожидает подтверждения")
+                                elif action == "approve_context":
+                                    console.status(f"контекстный отрывок запомнен: {ref}")
                                 elif action == "approve":
                                     console.status(f"отправлено в Holyrics: {ref}")
                                 elif action == "output_failed":
