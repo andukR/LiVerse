@@ -51,6 +51,7 @@ from tools.holyrics import (
 DEFAULT_MODEL_PATH = Path.cwd() / "models" / "vosk-model-small-ru-0.22"
 DEFAULT_LOG_DIR = Path.cwd() / ".cache" / "liverse" / "vosk_probe"
 HOLYRICS_SETUP_NOTICE_MARKER = Path.cwd() / ".cache" / "liverse" / "holyrics_setup_notice_shown"
+STARTUP_SETTINGS_ENV = "LIVERSE_STARTUP_SETTINGS"
 WELCOME_TEXT = (
     "LiVerse принимает на себя техническую задачу поиска и отображения "
     "библейских ссылок, чтобы вся церковь могла сосредоточиться на слушании, "
@@ -59,6 +60,87 @@ WELCOME_TEXT = (
 ENTER_KEYS = {"\r", "\n"}
 SPACE_KEYS = {" "}
 TAB_KEYS = {"\t"}
+EDIT_SETTINGS_KEYS = {"e", "E"}
+QUIT_KEYS = {"q", "Q"}
+
+
+def startup_settings_path() -> Path:
+    explicit_path = os.environ.get(STARTUP_SETTINGS_ENV)
+    if explicit_path:
+        return Path(explicit_path).expanduser()
+    config_home = os.environ.get("XDG_CONFIG_HOME")
+    base_dir = Path(config_home).expanduser() if config_home else Path.home() / ".config"
+    return base_dir / "liverse" / "settings.json"
+
+
+def load_startup_settings(path: Path | None = None) -> dict:
+    selected_path = path or startup_settings_path()
+    try:
+        data = json.loads(selected_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"LiVerse: не удалось прочитать настройки запуска {selected_path}: {exc}", flush=True)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_startup_settings(args: argparse.Namespace) -> None:
+    if not getattr(args, "_liverse_startup_settings_enabled", False):
+        return
+    path = startup_settings_path()
+    payload = {
+        "version": 1,
+        "run_mode": current_run_mode(args),
+        "approval_ui": str(getattr(args, "approval_ui", "web") or "web"),
+        "holyrics_theme": str(getattr(args, "holyrics_theme", "") or ""),
+        "holyrics_quick_minutes": float(getattr(args, "holyrics_quick_minutes", 0.0) or 0.0),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"LiVerse: не удалось сохранить настройки запуска {path}: {exc}", flush=True)
+
+
+def cli_option_present(*names: str) -> bool:
+    arguments = sys.argv[1:]
+    for argument in arguments:
+        for name in names:
+            if argument == name or argument.startswith(f"{name}="):
+                return True
+    return False
+
+
+def setting_was_explicit(*cli_names: str, env_name: str | None = None) -> bool:
+    if cli_option_present(*cli_names):
+        return True
+    return bool(env_name and env_setting(env_name))
+
+
+def current_run_mode(args: argparse.Namespace) -> str:
+    if getattr(args, "require_approval", False):
+        return "approval"
+    if getattr(args, "semi_auto_approval", False):
+        return "semi_auto"
+    return "auto"
+
+
+def apply_run_mode(args: argparse.Namespace, mode: str) -> None:
+    args.require_approval = mode == "approval"
+    args.semi_auto_approval = mode == "semi_auto"
+
+
+def run_mode_label(mode: str) -> str:
+    if mode == "approval":
+        return "подтверждать каждую ссылку"
+    if mode == "semi_auto":
+        return "полуавтомат"
+    return "автомат"
+
+
+def approval_ui_label(value: str) -> str:
+    return "всплывающее окно" if value == "popup" else "web-интерфейс"
 
 
 def format_timecode(seconds: float) -> str:
@@ -148,6 +230,14 @@ def ask_holyrics_theme_name(args: argparse.Namespace) -> None:
     if not holyrics_output_enabled(args) or args.text or not sys.stdin.isatty():
         return
 
+    if getattr(args, "_liverse_skip_holyrics_theme_question", False):
+        theme = str(getattr(args, "holyrics_theme", "") or "").strip()
+        if theme:
+            print(f"Holyrics: используется последняя тема: {theme}", flush=True)
+        else:
+            print("Holyrics: используется тема Bible module по умолчанию.", flush=True)
+        return
+
     print("", flush=True)
     print("Выбор темы Holyrics", flush=True)
     if not args.holyrics_token:
@@ -211,10 +301,10 @@ def ask_holyrics_theme_name(args: argparse.Namespace) -> None:
         print("Введите номер из списка или нажмите Enter для темы по умолчанию.", flush=True)
 
 
-def parse_holyrics_quick_duration_minutes(value: str) -> float | None:
+def parse_holyrics_quick_duration_minutes(value: str, *, default_minutes: float = 1.0) -> float | None:
     raw = value.strip().replace(",", ".").casefold()
     if not raw:
-        return 1.0
+        return default_minutes
     seconds_match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*(?:s|sec|secs|сек|секунд[аы]?|с)", raw)
     if seconds_match:
         return float(seconds_match.group(1)) / 60.0
@@ -240,16 +330,25 @@ def ask_holyrics_quick_presentation_minutes(args: argparse.Namespace) -> None:
         current = float(getattr(args, "holyrics_quick_minutes", 0.0) or 0.0)
     except (TypeError, ValueError):
         current = 0.0
-    if current > 0:
+    if getattr(args, "_liverse_skip_holyrics_quick_question", False):
+        if current == 0:
+            print("Holyrics: автоматическое закрытие цитаты выключено.", flush=True)
+        else:
+            print(f"Holyrics: время показа цитаты {format_holyrics_quick_duration(current)}", flush=True)
+        return
+    full_startup_setup = bool(getattr(args, "_liverse_full_startup_setup", False))
+    explicit_quick_minutes = setting_was_explicit("--holyrics-quick-minutes", env_name="HOLYRICS_QUICK_MINUTES")
+    if current > 0 and (not full_startup_setup or explicit_quick_minutes):
         print(f"Holyrics: время показа цитаты {format_holyrics_quick_duration(current)}", flush=True)
         return
 
     print("", flush=True)
     print("Введите время показа цитаты.", flush=True)
-    print("Enter — 1 минута; 0 — не закрывать автоматически.", flush=True)
+    default_minutes = current if current > 0 else 1.0
+    print(f"Enter — {format_holyrics_quick_duration(default_minutes)}; 0 — не закрывать автоматически.", flush=True)
     print("Можно ввести минуты: 1, 0.5; или секунды: 30s, 30 сек.", flush=True)
     while True:
-        minutes = parse_holyrics_quick_duration_minutes(input("> "))
+        minutes = parse_holyrics_quick_duration_minutes(input("> "), default_minutes=default_minutes)
         if minutes is None:
             print("Введите число минут, например 1 или 0.5, либо секунды, например 30s или 30 сек.", flush=True)
             continue
@@ -524,6 +623,56 @@ def ask_run_mode() -> str:
             return "auto"
 
 
+def ask_priority_run_mode(settings: dict) -> tuple[str, bool]:
+    print("Режим работы LiVerse", flush=True)
+    if settings:
+        print("Остальные настройки будут взяты из прошлого запуска.", flush=True)
+        print(f"Последний режим: {run_mode_label(str(settings.get('run_mode') or 'semi_auto'))}", flush=True)
+        print(f"Подтверждение: {approval_ui_label(str(settings.get('approval_ui') or 'web'))}", flush=True)
+        theme = str(settings.get("holyrics_theme") or "").strip()
+        print(f"Тема Holyrics: {theme or 'Bible module по умолчанию'}", flush=True)
+        try:
+            quick_minutes = float(settings.get("holyrics_quick_minutes") or 0.0)
+        except (TypeError, ValueError):
+            quick_minutes = 0.0
+        print(f"Время показа: {format_holyrics_quick_duration(quick_minutes)}", flush=True)
+    else:
+        print("Сохранённых настроек пока нет: после выбора режима LiVerse задаст остальные вопросы.", flush=True)
+    print("", flush=True)
+    print("Enter — полуавтомат; Space — автомат; E — полная настройка; Q — выход", flush=True)
+    while True:
+        key = read_single_key()
+        if key in ENTER_KEYS:
+            print("полуавтомат", flush=True)
+            return "semi_auto", not settings
+        if key in SPACE_KEYS:
+            print("автомат", flush=True)
+            return "auto", not settings
+        if key in EDIT_SETTINGS_KEYS:
+            print("полная настройка", flush=True)
+            return ask_run_mode(), True
+        if key in QUIT_KEYS:
+            print("выход", flush=True)
+            raise SystemExit(0)
+
+
+def apply_saved_startup_settings(args: argparse.Namespace, settings: dict) -> None:
+    if not settings:
+        return
+    if not setting_was_explicit("--approval-ui"):
+        approval_ui = str(settings.get("approval_ui") or "").strip()
+        if approval_ui in {"web", "popup"}:
+            args.approval_ui = approval_ui
+    if not setting_was_explicit("--holyrics-theme", env_name="HOLYRICS_THEME"):
+        args.holyrics_theme = str(settings.get("holyrics_theme") or "")
+        setattr(args, "_holyrics_theme_id", "")
+    if not setting_was_explicit("--holyrics-quick-minutes", env_name="HOLYRICS_QUICK_MINUTES"):
+        try:
+            args.holyrics_quick_minutes = float(settings.get("holyrics_quick_minutes") or 0.0)
+        except (TypeError, ValueError):
+            args.holyrics_quick_minutes = 0.0
+
+
 def configure_interactive_approval_mode(args: argparse.Namespace) -> None:
     if not args.ask_approval_mode or args.text:
         return
@@ -531,14 +680,27 @@ def configure_interactive_approval_mode(args: argparse.Namespace) -> None:
         print("Интерактивный выбор режима недоступен: консоль не принимает ввод.", flush=True)
         return
 
-    if args.semi_auto_approval:
+    settings = load_startup_settings()
+    apply_saved_startup_settings(args, settings)
+    setattr(args, "_liverse_startup_settings_enabled", True)
+
+    if cli_option_present("--require-approval"):
+        mode = "approval"
+        full_setup = False
+        print("Режим подтверждения включён параметром --require-approval.", flush=True)
+    elif args.semi_auto_approval:
         mode = "semi_auto"
+        full_setup = False
         print("Полуавтоматический режим включён параметром --semi-auto-approval.", flush=True)
     else:
-        mode = ask_run_mode()
-    args.require_approval = mode == "approval"
-    args.semi_auto_approval = mode == "semi_auto"
-    if mode == "auto":
+        mode, full_setup = ask_priority_run_mode(settings)
+    apply_run_mode(args, mode)
+
+    setattr(args, "_liverse_full_startup_setup", full_setup)
+    if not full_setup:
+        setattr(args, "_liverse_skip_holyrics_theme_question", True)
+        setattr(args, "_liverse_skip_holyrics_quick_question", True)
+    if mode == "auto" or not full_setup:
         return
 
     use_web = ask_enter_or_space(
@@ -1650,6 +1812,7 @@ def main() -> int:
     print_holyrics_setup_notice_once(args)
     ask_holyrics_theme_name(args)
     ask_holyrics_quick_presentation_minutes(args)
+    save_startup_settings(args)
 
     if args.text:
         grammar = None if args.open_vocabulary else build_grammar()
