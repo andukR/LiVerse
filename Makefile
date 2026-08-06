@@ -1,7 +1,7 @@
 PYTHON ?= python3
 VENV ?= .venv
 ARGS ?=
-LIVERSE_ARGS ?= --ask-approval-mode --slide-output holyrics --open-operator-qr
+LIVERSE_ARGS ?= --ask-approval-mode --slide-output holyrics --open-operator-qr --sermon-plan
 ifeq ($(OS),Windows_NT)
 BIN_DIR := $(VENV)\Scripts
 PY := $(BIN_DIR)\python.exe

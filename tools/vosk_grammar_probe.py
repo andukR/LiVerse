@@ -1177,6 +1177,29 @@ def start_slide_server_if_needed(args: argparse.Namespace, pipeline: LiveReferen
     from tools.slide_server import set_current_slide, start_server_thread
 
     def decision_callback(action: str, candidate: dict) -> tuple[bool, str]:
+        if candidate.get("source") == "sermon_plan":
+            presentation = getattr(args, "_holyrics_sermon_plan_presentation", None)
+            if not isinstance(presentation, dict):
+                return False, "sermon_plan_not_loaded"
+            if action == "reject":
+                presentation["speech_parts"] = []
+                return True, ""
+            try:
+                slide_index = int(candidate.get("slide_index"))
+            except (TypeError, ValueError):
+                return False, "sermon_plan_slide_index_missing"
+            ok, reason = show_holyrics_text_slide(
+                args,
+                str(args.holyrics_url).rstrip("/"),
+                presentation,
+                slide_index,
+            )
+            if ok:
+                presentation["current_index"] = slide_index
+                presentation["next_index"] = slide_index + 1
+                presentation["speech_parts"] = []
+            return ok, reason
+
         if action == "reject":
             return True, ""
 
@@ -1368,6 +1391,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                     "slides": slides,
                     "current_index": max(0, int(active.get("slide_number") or 1) - 1),
                     "next_index": max(0, int(active.get("slide_number") or 1) - 1),
+                    "speech_parts": [],
                 }
                 current_slide_index = max(0, int(active.get("slide_number") or 1) - 1)
                 current_slide = slides[current_slide_index] if current_slide_index < len(slides) else {}
@@ -1628,19 +1652,66 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 show_candidates=args.show_candidates,
                             )
                             plan_match = None
-                            if sermon_plan is not None:
+                            # Явно названный адрес всегда важнее строки плана.
+                            plan_requires_approval = bool(args.require_approval or args.semi_auto_approval)
+                            if sermon_plan is not None and not pipeline_payload.get("matched"):
+                                speech_parts = sermon_plan["speech_parts"]
+                                speech_parts.append(text)
+                                del speech_parts[:-2]
                                 plan_match = match_sermon_plan_slide(
                                     sermon_plan["slides"],
-                                    list(pipeline_payload.get("candidate_texts") or [text]),
+                                    [" ".join(speech_parts), text],
                                     current_index=int(sermon_plan["next_index"]),
+                                    threshold=0.52 if plan_requires_approval else 0.68,
+                                    min_content_words=2 if plan_requires_approval else 4,
+                                    min_target_coverage=0.35 if plan_requires_approval else 0.65,
                                 )
                             if plan_match:
-                                plan_ok, plan_reason = show_holyrics_text_slide(
-                                    args,
-                                    str(args.holyrics_url).rstrip("/"),
-                                    sermon_plan,
-                                    int(plan_match["slide_index"]),
-                                )
+                                if plan_requires_approval:
+                                    plan_candidate = {
+                                        "ref": f"План: слайд {plan_match['slide_number']}",
+                                        "verse": str(plan_match["text"]),
+                                        "source": "sermon_plan",
+                                        "asr": text,
+                                        "detected_text": str(plan_match["candidate"]),
+                                        "slide_index": int(plan_match["slide_index"]),
+                                        "slide_number": int(plan_match["slide_number"]),
+                                        "score": float(plan_match["score"]),
+                                    }
+                                    if args.approval_ui == "popup":
+                                        plan_action = popup_approval_decision(plan_candidate)
+                                        if plan_action == "approve":
+                                            plan_ok, plan_reason = show_holyrics_text_slide(
+                                                args,
+                                                str(args.holyrics_url).rstrip("/"),
+                                                sermon_plan,
+                                                int(plan_match["slide_index"]),
+                                            )
+                                        else:
+                                            sermon_plan["speech_parts"] = []
+                                            logger.write(
+                                                "sermon_plan_rejected",
+                                                {**plan_match, "reason": "operator_rejected"},
+                                            )
+                                            console.status(
+                                                f"план проповеди: слайд {plan_match['slide_number']} отклонён"
+                                            )
+                                            continue
+                                    else:
+                                        from tools.slide_server import submit_candidate
+                                        submit_candidate(plan_candidate)
+                                        logger.write("sermon_plan_candidate", plan_candidate)
+                                        console.status(
+                                            f"план проповеди: слайд {plan_match['slide_number']} ожидает подтверждения"
+                                        )
+                                        continue
+                                else:
+                                    plan_ok, plan_reason = show_holyrics_text_slide(
+                                        args,
+                                        str(args.holyrics_url).rstrip("/"),
+                                        sermon_plan,
+                                        int(plan_match["slide_index"]),
+                                    )
                                 logger.write(
                                     "sermon_plan_match",
                                     {**plan_match, "ok": plan_ok, "reason": plan_reason},
@@ -1648,6 +1719,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 if plan_ok:
                                     sermon_plan["current_index"] = int(plan_match["slide_index"])
                                     sermon_plan["next_index"] = int(plan_match["slide_index"]) + 1
+                                    sermon_plan["speech_parts"] = []
                                     pipeline.text_buffer.clear()
                                     console.status(
                                         f"план проповеди: слайд {plan_match['slide_number']}"

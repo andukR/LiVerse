@@ -175,14 +175,22 @@ def submit_candidate(payload: dict) -> dict:
         "chunk": payload.get("chunk"),
         "label": str(payload.get("label") or "").strip(),
         "can_set_context": bool(payload.get("can_set_context")),
+        "slide_index": payload.get("slide_index"),
+        "slide_number": payload.get("slide_number"),
+        "score": payload.get("score"),
     }
     with STATE_LOCK:
         PENDING_CANDIDATE.clear()
         PENDING_CANDIDATE.update(candidate)
+        is_sermon_plan = candidate.get("source") == "sermon_plan"
         PROCESSING_STATE.update(
             {
                 "stage": "candidate",
-                "message": "Ссылка распознана — ожидает подтверждения",
+                "message": (
+                    "Пункт плана распознан — ожидает подтверждения"
+                    if is_sermon_plan
+                    else "Ссылка распознана — ожидает подтверждения"
+                ),
                 "progress": 100,
                 "chunk": candidate.get("chunk"),
                 "manual_required": False,
@@ -277,16 +285,21 @@ def decide_candidate(action: str) -> tuple[bool, str, dict]:
     if not ok:
         return False, reason, candidate
 
-    if action in {"approve", "approve_context"}:
+    if action in {"approve", "approve_context"} and candidate.get("source") != "sermon_plan":
         remember_approved_quote(candidate)
 
+    is_sermon_plan = candidate.get("source") == "sermon_plan"
     with STATE_LOCK:
         PENDING_CANDIDATE.clear()
         PROCESSING_STATE.update(
             {
                 "stage": "approved" if action in {"approve", "approve_context"} else "rejected",
                 "message": (
-                    "Отправлено в Holyrics и запомнено как контекст"
+                    "Слайд плана показан"
+                    if is_sermon_plan and action in {"approve", "approve_context"}
+                    else "Слайд плана отклонён"
+                    if is_sermon_plan
+                    else "Отправлено в Holyrics и запомнено как контекст"
                     if action == "approve_context"
                     else ("Отправлено в Holyrics" if action == "approve" else "Цитата отклонена")
                 ),

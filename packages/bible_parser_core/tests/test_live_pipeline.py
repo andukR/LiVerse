@@ -14,6 +14,28 @@ from tools.holyrics import (
 
 
 class LiveReferencePipelineTest(unittest.TestCase):
+    def test_sermon_plan_candidate_keeps_slide_data_and_operator_wording(self):
+        from tools import slide_server
+
+        slide_server.reset_operator_state()
+        candidate = slide_server.submit_candidate(
+            {
+                "ref": "План: слайд 2",
+                "verse": "Испытание производит терпение",
+                "source": "sermon_plan",
+                "slide_index": 1,
+                "slide_number": 2,
+                "score": 0.73,
+            }
+        )
+
+        self.assertEqual(1, candidate["slide_index"])
+        self.assertEqual(2, candidate["slide_number"])
+        self.assertEqual("Пункт плана распознан — ожидает подтверждения", slide_server.operator_state()["processing"]["message"])
+        ok, _reason, _candidate = slide_server.decide_candidate("reject")
+        self.assertTrue(ok)
+        self.assertEqual("Слайд плана отклонён", slide_server.operator_state()["processing"]["message"])
+
     def test_sermon_plan_verse_uses_quick_text_slide_with_plan_theme(self):
         args = SimpleNamespace(
             sermon_plan=True,
@@ -520,6 +542,53 @@ class LiveReferencePipelineTest(unittest.TestCase):
             lookahead=2,
         )
         self.assertIsNone(match)
+
+    def test_sermon_plan_ignores_ordinary_sermon_words(self):
+        from bible_parser_core.live_pipeline import match_sermon_plan_slide
+
+        slides = [
+            {"text": "Бог даёт человеку настоящую жизнь"},
+            {"text": "Грех лишает человека полноты и мира"},
+        ]
+        match = match_sermon_plan_slide(
+            slides, ["бог хочет чтобы человек жил в мире"], current_index=0
+        )
+        self.assertIsNone(match)
+
+    def test_sermon_plan_approval_match_accepts_vosk_word_endings(self):
+        from bible_parser_core.live_pipeline import match_sermon_plan_slide
+
+        slides = [{"text": "Испытание производит терпение"}]
+        recognized = "ключевые слова якому из производит терпения"
+
+        strict_match = match_sermon_plan_slide(slides, [recognized], current_index=0)
+        approval_match = match_sermon_plan_slide(
+            slides,
+            [recognized],
+            current_index=0,
+            threshold=0.52,
+            min_content_words=2,
+            min_target_coverage=0.35,
+        )
+
+        self.assertIsNone(strict_match)
+        self.assertIsNotNone(approval_match)
+        self.assertEqual(1, approval_match["slide_number"])
+
+    def test_sermon_plan_allows_only_strong_return_to_skipped_slide(self):
+        from bible_parser_core.live_pipeline import match_sermon_plan_slide
+
+        slides = [
+            {"text": "Бог даёт человеку настоящую жизнь"},
+            {"text": "Грех лишает человека полноты и мира"},
+            {"text": "Христос пришёл чтобы спасти и обновить"},
+        ]
+        match = match_sermon_plan_slide(
+            slides, ["грех лишает человека полноты и мира"], current_index=2
+        )
+        self.assertIsNotNone(match)
+        self.assertEqual(2, match["slide_number"])
+        self.assertTrue(match["backtrack"])
 
     def test_sermon_plan_can_restart_from_first_after_last_slide(self):
         from bible_parser_core.live_pipeline import match_sermon_plan_slide

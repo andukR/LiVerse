@@ -262,6 +262,39 @@ def sermon_plan_match_targets(text: str) -> list[str]:
     return targets
 
 
+SERMON_PLAN_COMMON_WORDS = {
+    "и", "в", "во", "на", "с", "со", "к", "по", "из", "для", "о", "об",
+    "не", "но", "что", "это", "мы", "вы", "он", "она", "они", "как", "же",
+    "а", "у", "от", "до", "за", "при", "или", "будем", "будет", "есть",
+}
+
+
+def sermon_plan_content_words(text: str) -> set[str]:
+    return {word for word in normalize_sermon_plan_text(text).split() if word not in SERMON_PLAN_COMMON_WORDS}
+
+
+def sermon_plan_matching_content_words(target_words: set[str], candidate_words: set[str]) -> int:
+    """Count exact words and close Russian word forms without double counting."""
+    matched = target_words & candidate_words
+    remaining_targets = target_words - matched
+    remaining_candidates = candidate_words - matched
+    count = len(matched)
+    for target_word in sorted(remaining_targets, key=len, reverse=True):
+        if len(target_word) < 5:
+            continue
+        closest = max(
+            remaining_candidates,
+            key=lambda word: SequenceMatcher(None, target_word, word).ratio(),
+            default=None,
+        )
+        if closest is None or len(closest) < 5:
+            continue
+        if SequenceMatcher(None, target_word, closest).ratio() >= 0.80:
+            count += 1
+            remaining_candidates.remove(closest)
+    return count
+
+
 def match_sermon_plan_slide(
     slides: list[dict[str, Any]],
     candidates: list[str],
@@ -269,8 +302,11 @@ def match_sermon_plan_slide(
     current_index: int = 0,
     lookahead: int = 2,
     threshold: float = 0.68,
+    allow_backtrack: bool = True,
+    min_content_words: int = 4,
+    min_target_coverage: float = 0.65,
 ) -> dict[str, Any] | None:
-    """Match speech only against the current and nearest upcoming slides."""
+    """Match a prepared plan line while resisting ordinary sermon speech."""
     if not slides or not candidates:
         return None
 
@@ -285,12 +321,14 @@ def match_sermon_plan_slide(
     last_nonempty_index = nonempty_indexes[-1] if nonempty_indexes else -1
     if start >= last_nonempty_index > 0 and 0 not in slide_indexes:
         slide_indexes.append(0)
+    if allow_backtrack:
+        slide_indexes.extend(index for index in range(0, start) if index not in slide_indexes)
     best: dict[str, Any] | None = None
     for slide_index in slide_indexes:
         slide = slides[slide_index]
         for target in sermon_plan_match_targets(str(slide.get("text") or "")):
             target_words = target.split()
-            target_set = set(target_words)
+            target_set = sermon_plan_content_words(target)
             if len(target_words) < 3:
                 continue
 
@@ -299,13 +337,23 @@ def match_sermon_plan_slide(
                 candidate_words = candidate.split()
                 if len(candidate_words) < 3:
                     continue
-                candidate_set = set(candidate_words)
-                common = target_set & candidate_set
-                target_coverage = len(common) / max(1, len(target_set))
-                candidate_coverage = len(common) / max(1, len(candidate_set))
+                candidate_set = sermon_plan_content_words(candidate)
+                matched_content_words = sermon_plan_matching_content_words(target_set, candidate_set)
+                target_coverage = matched_content_words / max(1, len(target_set))
+                candidate_coverage = matched_content_words / max(1, len(candidate_set))
                 sequence_score = SequenceMatcher(None, candidate, target).ratio()
                 score = (0.55 * sequence_score) + (0.30 * target_coverage) + (0.15 * candidate_coverage)
-                if target_coverage < 0.55 or score < threshold:
+                is_backtrack = slide_index < start and slide_index != 0
+                if (
+                    matched_content_words < min_content_words
+                    or target_coverage < min_target_coverage
+                    or score < threshold
+                ):
+                    continue
+                # Возврат к уже пропущенному пункту разрешаем только по фразе,
+                # заметно сильнее обычного совпадения: это защищает экран от
+                # случайного возвращения во время свободной речи проповедника.
+                if is_backtrack and (matched_content_words < 5 or target_coverage < 0.80 or score < 0.84):
                     continue
                 result = {
                     "slide_index": slide_index,
@@ -314,6 +362,8 @@ def match_sermon_plan_slide(
                     "matched_text": target,
                     "candidate": raw_candidate,
                     "score": round(score, 3),
+                    "matched_content_words": matched_content_words,
+                    "backtrack": is_backtrack,
                 }
                 if best is None or score > float(best["score"]):
                     best = result

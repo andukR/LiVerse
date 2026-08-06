@@ -7,7 +7,7 @@ if not exist .venv (
 )
 call .venv\Scripts\activate.bat
 if "%~1"=="" (
-  python tools\vosk_grammar_probe.py --ask-approval-mode --slide-output holyrics --open-operator-qr
+  python tools\vosk_grammar_probe.py --ask-approval-mode --slide-output holyrics --open-operator-qr --sermon-plan
 ) else (
   python tools\vosk_grammar_probe.py %*
 )
