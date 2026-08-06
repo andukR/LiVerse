@@ -1,12 +1,73 @@
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from bible_parser_core.live_pipeline import LiveReferencePipeline, build_grammar
 from bible_parser_core.risk_model import load_risk_model, score_payload_with_model
-from tools.holyrics import cross_chapter_quick_presentation_slides, scripture_range_quick_presentation_slides
+from tools.holyrics import (
+    cross_chapter_quick_presentation_slides,
+    post_holyrics_url,
+    restore_holyrics_presentation,
+    scripture_range_quick_presentation_slides,
+)
 
 
 class LiveReferencePipelineTest(unittest.TestCase):
+    def test_sermon_plan_verse_uses_quick_text_slide_with_plan_theme(self):
+        args = SimpleNamespace(
+            sermon_plan=True,
+            holyrics_quick_minutes=0.0,
+            holyrics_theme="",
+            _holyrics_sermon_plan_theme_id="plan-theme",
+            _holyrics_sermon_plan_presentation={"type": "text", "text_id": "sermon-plan"},
+        )
+        payload = {
+            "ref": "Иоанн 3:16",
+            "verse": "Ибо так возлюбил Бог мир...",
+            "book": "Иоанн",
+            "chapter": 3,
+            "start_verse": 16,
+            "end_verse": 16,
+        }
+
+        with patch("tools.holyrics.post_holyrics_api", return_value=(True, "", "")) as api:
+            ok, reason = post_holyrics_url(args, "http://127.0.0.1:8091", payload)
+
+        self.assertTrue(ok)
+        self.assertEqual("show_quick_presentation:sermon_verse;temporary_verse:0min", reason)
+        api.assert_called_once_with(
+            args,
+            "http://127.0.0.1:8091",
+            "ShowQuickPresentation",
+            {
+                "slides": [
+                    {
+                        "text": "Иоанн 3:16\n\nИбо так возлюбил Бог мир...",
+                        "theme": {"id": "plan-theme"},
+                    }
+                ]
+            },
+        )
+
+    def test_text_plan_restore_does_not_close_presentation_first(self):
+        args = SimpleNamespace()
+        previous = {
+            "type": "text",
+            "text_id": "sermon-plan",
+            "slide_number": 4,
+        }
+
+        with patch("tools.holyrics.post_holyrics_api", return_value=(True, "", "")) as api:
+            restore_holyrics_presentation(args, "http://127.0.0.1:8091", previous)
+
+        api.assert_called_once_with(
+            args,
+            "http://127.0.0.1:8091",
+            "ShowText",
+            {"id": "sermon-plan", "initial_index": 3},
+        )
+
     def test_context_range_resolves_chapter_and_verse_without_book(self):
         pipeline = LiveReferencePipeline()
         context = pipeline.process_text("первое послание иоанна вторая глава с двенадцатого по семнадцатый стих")
@@ -361,6 +422,123 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertIn("четвёртая", grammar)
         self.assertIn("следующей", grammar)
         self.assertIn("следующий", grammar)
+
+    def test_sermon_plan_grammar_and_ordered_match(self):
+        from bible_parser_core.live_pipeline import match_sermon_plan_slide, sermon_plan_grammar_phrases
+
+        slides = [
+            {"text": "Тема сегодняшней проповеди\nЖизнь с избытком."},
+            {"text": "1. Сегодня мы с вами будем читать из книги пророка Исайя"},
+            {"text": "2. Затем прочитаем из Евангелия от Иоанна 3 глава 16 стих."},
+            {"text": ""},
+        ]
+
+        grammar = sermon_plan_grammar_phrases(slides)
+        self.assertIn("сегодня", grammar)
+        self.assertIn("затем прочитаем из евангелия от иоанна глава стих", grammar)
+
+        match = match_sermon_plan_slide(
+            slides,
+            ["затем прочитаем из евангелия от иоанна третья глава шестнадцатый стих"],
+            current_index=1,
+        )
+        self.assertIsNotNone(match)
+        self.assertEqual(3, match["slide_number"])
+
+    def test_sermon_plan_matches_text_line_without_standalone_reference(self):
+        from bible_parser_core.live_pipeline import match_sermon_plan_slide, sermon_plan_grammar_phrases
+
+        slides = [
+            {"text": "Тема демо-проповеди: Жизнь с избытком"},
+            {"text": "1. Бог даёт человеку настоящую жизнь.\nИоанна 10:10"},
+            {"text": "2. Грех лишает человека полноты и мира.\nРимлянам 3:23"},
+        ]
+
+        grammar = sermon_plan_grammar_phrases(slides)
+        self.assertIn("даёт", grammar)
+        filtered_grammar = sermon_plan_grammar_phrases(slides, lambda word: word != "даёт")
+        self.assertFalse(any("даёт" in phrase.split() for phrase in filtered_grammar))
+
+        match = match_sermon_plan_slide(
+            slides,
+            ["бог человеку настоящую жизнь"],
+            current_index=1,
+        )
+        self.assertIsNotNone(match)
+        self.assertEqual(2, match["slide_number"])
+
+        reference_only = match_sermon_plan_slide(
+            slides,
+            ["иоанна десять десять"],
+            current_index=1,
+        )
+        self.assertIsNone(reference_only)
+
+    def test_sermon_plan_matches_demo_recognition_in_order(self):
+        from bible_parser_core.live_pipeline import match_sermon_plan_slide
+
+        slides = [
+            {"text": "Тема демо-проповеди: Жизнь с избытком"},
+            {"text": "1. Бог даёт человеку настоящую жизнь.\nИоанна 10:10"},
+            {"text": "2. Грех лишает человека полноты и мира.\nРимлянам 3:23"},
+            {"text": "3. Бог показал Свою любовь во Христе.\nИоанна 3:16"},
+            {"text": "4. Христос пришёл, чтобы спасти и обновить.\nИоанна 12:47"},
+            {"text": "5. Новая жизнь начинается с веры и послушания.\nГалатам 2:20"},
+            {"text": "Заключение: примем Божий дар и будем жить для Его славы."},
+        ]
+        recognized = [
+            "тема демо проповеди жизнь с избытком",
+            "бог человеку настоящую жизнь",
+            "грех лишает человека полноты и мира",
+            "бог показал свою любовь во христе",
+            "христос чтобы спасти и обновить",
+            "новая жизнь начинается с веры и послушания",
+            "заключение примем божий дар и будем жить для его для его славы",
+        ]
+
+        next_index = 0
+        for expected_slide_number, candidate in enumerate(recognized, start=1):
+            match = match_sermon_plan_slide(slides, [candidate], current_index=next_index)
+            self.assertIsNotNone(match, candidate)
+            self.assertEqual(expected_slide_number, match["slide_number"])
+            next_index = int(match["slide_index"]) + 1
+
+    def test_sermon_plan_does_not_jump_far_forward(self):
+        from bible_parser_core.live_pipeline import match_sermon_plan_slide
+
+        slides = [
+            {"text": "Первая достаточно длинная строка плана"},
+            {"text": "Вторая достаточно длинная строка плана"},
+            {"text": "Третья достаточно длинная строка плана"},
+            {"text": "Четвёртая далёкая строка плана проповеди"},
+        ]
+
+        match = match_sermon_plan_slide(
+            slides,
+            ["четвертая далекая строка плана проповеди"],
+            current_index=0,
+            lookahead=2,
+        )
+        self.assertIsNone(match)
+
+    def test_sermon_plan_can_restart_from_first_after_last_slide(self):
+        from bible_parser_core.live_pipeline import match_sermon_plan_slide
+
+        slides = [
+            {"text": "Тема демо-проповеди: Жизнь с избытком"},
+            {"text": "Первый достаточно длинный пункт проповеди"},
+            {"text": "Заключение: примем Божий дар и будем жить для Его славы."},
+            {"text": ""},
+        ]
+
+        match = match_sermon_plan_slide(
+            slides,
+            ["тема демо проповеди жизнь избытком"],
+            current_index=2,
+        )
+
+        self.assertIsNotNone(match)
+        self.assertEqual(1, match["slide_number"])
 
     def test_slow_split_deuteronomy_range_with_yo_form(self):
         pipeline = LiveReferencePipeline()

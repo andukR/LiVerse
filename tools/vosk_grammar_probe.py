@@ -31,7 +31,9 @@ from bible_parser_core.live_pipeline import (
     expand_nehemiah_confusable_candidates,
     expand_joel_confusable_candidates,
     grammar_diagnostics,
+    match_sermon_plan_slide,
     parsed_payload_from_candidates as core_parsed_payload_from_candidates,
+    sermon_plan_grammar_phrases,
 )
 from bible_parser_core.parser import DEFAULT_BIBLE
 from bible_parser_core.risk_model import load_risk_model, score_payload_with_model
@@ -43,7 +45,9 @@ from tools.holyrics import (
     default_holyrics_url,
     describe_holyrics_target,
     env_setting,
+    get_holyrics_current_presentation,
     get_holyrics_theme_options,
+    show_holyrics_text_slide,
     post_holyrics_update,
 )
 
@@ -1346,6 +1350,64 @@ def run_microphone(args: argparse.Namespace) -> int:
         }
     )
     check_holyrics_startup(args, logger)
+    SetLogLevel(args.vosk_log_level)
+    model = Model(str(args.model))
+    sermon_plan = None
+    if args.sermon_plan:
+        active = get_holyrics_current_presentation(
+            args,
+            str(args.holyrics_url).rstrip("/"),
+            include_slides=True,
+        )
+        if active and str(active.get("type") or "") == "text":
+            slides = list(active.get("slides") or [])
+            nonempty_slide_count = sum(1 for slide in slides if str(slide.get("text") or "").strip())
+            if nonempty_slide_count:
+                sermon_plan = {
+                    **active,
+                    "slides": slides,
+                    "current_index": max(0, int(active.get("slide_number") or 1) - 1),
+                    "next_index": max(0, int(active.get("slide_number") or 1) - 1),
+                }
+                current_slide_index = max(0, int(active.get("slide_number") or 1) - 1)
+                current_slide = slides[current_slide_index] if current_slide_index < len(slides) else {}
+                sermon_plan_theme_id = str(current_slide.get("theme_id") or "").strip()
+                if not sermon_plan_theme_id:
+                    sermon_plan_theme_id = next(
+                        (
+                            str(slide.get("theme_id") or "").strip()
+                            for slide in slides
+                            if str(slide.get("theme_id") or "").strip()
+                        ),
+                        "",
+                    )
+                setattr(args, "_holyrics_sermon_plan_theme_id", sermon_plan_theme_id)
+                setattr(args, "_holyrics_sermon_plan_presentation", sermon_plan)
+                if grammar is not None:
+                    grammar = sorted(
+                        set(grammar)
+                        | set(
+                            sermon_plan_grammar_phrases(
+                                slides,
+                                word_is_known=lambda word: model.vosk_model_find_word(word) != -1,
+                            )
+                        )
+                    )
+                logger.write(
+                    "sermon_plan_loaded",
+                    {
+                        "name": active.get("name"),
+                        "text_id": active.get("text_id") or active.get("id"),
+                        "slides": nonempty_slide_count,
+                        "current_slide": active.get("slide_number"),
+                    },
+                )
+                print(
+                    f"План проповеди: {active.get('name')} ({nonempty_slide_count} непустых слайда)",
+                    flush=True,
+                )
+        if sermon_plan is None:
+            print("План проповеди не найден: откройте текстовую презентацию Holyrics до запуска LiVerse.", flush=True)
     print(WELCOME_TEXT, flush=True)
     if logger.run_dir and args.print_log_path:
         print(f"Vosk log: {logger.run_dir / 'events.jsonl'}")
@@ -1365,8 +1427,6 @@ def run_microphone(args: argparse.Namespace) -> int:
             pass
         audio_queue.put(data)
 
-    SetLogLevel(args.vosk_log_level)
-    model = Model(str(args.model))
     pipeline = LiveReferencePipeline(args.bible, buffer_parts=args.vosk_buffer_parts)
     start_slide_server_if_needed(args, pipeline=pipeline)
     audio_stats = {"chunks": 0, "peak": 0}
@@ -1562,13 +1622,39 @@ def run_microphone(args: argparse.Namespace) -> int:
                         if text:
                             empty_final_count = 0
                             console.status("распознаю")
-                            payload = add_slide_payload(
-                                pipeline.process_text(
-                                    text,
-                                    asr_result=result,
-                                    show_candidates=args.show_candidates,
-                                )
+                            pipeline_payload = pipeline.process_text(
+                                text,
+                                asr_result=result,
+                                show_candidates=args.show_candidates,
                             )
+                            plan_match = None
+                            if sermon_plan is not None:
+                                plan_match = match_sermon_plan_slide(
+                                    sermon_plan["slides"],
+                                    list(pipeline_payload.get("candidate_texts") or [text]),
+                                    current_index=int(sermon_plan["next_index"]),
+                                )
+                            if plan_match:
+                                plan_ok, plan_reason = show_holyrics_text_slide(
+                                    args,
+                                    str(args.holyrics_url).rstrip("/"),
+                                    sermon_plan,
+                                    int(plan_match["slide_index"]),
+                                )
+                                logger.write(
+                                    "sermon_plan_match",
+                                    {**plan_match, "ok": plan_ok, "reason": plan_reason},
+                                )
+                                if plan_ok:
+                                    sermon_plan["current_index"] = int(plan_match["slide_index"])
+                                    sermon_plan["next_index"] = int(plan_match["slide_index"]) + 1
+                                    pipeline.text_buffer.clear()
+                                    console.status(
+                                        f"план проповеди: слайд {plan_match['slide_number']}"
+                                    )
+                                    continue
+                                console.status(f"ошибка показа плана: {plan_reason}")
+                            payload = add_slide_payload(pipeline_payload)
                             payload["asr"] = result
                             apply_ml_risk(args, payload, asr_result=result)
                             payload["output"] = publish_payload(args, payload)
@@ -1668,6 +1754,11 @@ def main() -> int:
     parser.add_argument("--device", type=int)
     parser.add_argument("--list-audio-devices", action="store_true", help="Print microphone/input device list and exit.")
     parser.add_argument("--open-vocabulary", action="store_true", help="Run Vosk without generated grammar.")
+    parser.add_argument(
+        "--sermon-plan",
+        action="store_true",
+        help="Read the active Holyrics text presentation and follow its spoken sermon-plan lines.",
+    )
     parser.add_argument(
         "--vosk-buffer-parts",
         type=int,

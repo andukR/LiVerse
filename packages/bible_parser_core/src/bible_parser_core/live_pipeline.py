@@ -6,8 +6,9 @@ import re
 import time
 from collections import deque
 from dataclasses import asdict
+from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from bible_parser_core.book_aliases import book_synonyms
 from bible_parser_core.parser import DEFAULT_BIBLE, NUMBER_WORDS, ParsedReference, book_candidates, normalize_text, parse_live_reference
@@ -219,6 +220,104 @@ def grammar_diagnostics(grammar: list[str]) -> dict[str, Any]:
         },
         "filtered_missing_words_count": len(VOSK_SMALL_RU_MISSING_WORDS),
     }
+
+
+def normalize_sermon_plan_text(text: str) -> str:
+    """Normalize a prepared sermon-plan slide and recognized speech alike."""
+    without_item_number = re.sub(r"^\s*\d+\s*[.)]\s*", "", text or "")
+    return normalize_text(without_item_number)
+
+
+def sermon_plan_grammar_phrases(
+    slides: list[dict[str, Any]],
+    word_is_known: Callable[[str], bool] | None = None,
+) -> list[str]:
+    """Build extra Vosk phrases from non-empty sermon-plan slides."""
+    phrases: set[str] = set()
+    for slide in slides:
+        for line in str(slide.get("text") or "").splitlines():
+            without_item_number = re.sub(r"^\s*\d+\s*[.)]\s*", "", line)
+            normalized = re.sub(r"[^а-яёa-z]+", " ", without_item_number.lower()).strip()
+            words = [
+                word
+                for word in normalized.split()
+                if len(word) > 1 and (word_is_known is None or word_is_known(word))
+            ]
+            if not words:
+                continue
+            phrases.update(words)
+            phrases.add(" ".join(words))
+    return sorted(phrases)
+
+
+def sermon_plan_match_targets(text: str) -> list[str]:
+    """Return plan text variants, excluding standalone Bible-reference lines."""
+    targets: list[str] = []
+    for line in (text or "").splitlines():
+        if re.search(r"\d+\s*:\s*\d+", line):
+            continue
+        normalized = normalize_sermon_plan_text(line)
+        if normalized and normalized not in targets:
+            targets.append(normalized)
+    return targets
+
+
+def match_sermon_plan_slide(
+    slides: list[dict[str, Any]],
+    candidates: list[str],
+    *,
+    current_index: int = 0,
+    lookahead: int = 2,
+    threshold: float = 0.68,
+) -> dict[str, Any] | None:
+    """Match speech only against the current and nearest upcoming slides."""
+    if not slides or not candidates:
+        return None
+
+    start = max(0, current_index)
+    end = min(len(slides), start + max(0, lookahead) + 1)
+    slide_indexes = list(range(start, end))
+    nonempty_indexes = [
+        index
+        for index, slide in enumerate(slides)
+        if sermon_plan_match_targets(str(slide.get("text") or ""))
+    ]
+    last_nonempty_index = nonempty_indexes[-1] if nonempty_indexes else -1
+    if start >= last_nonempty_index > 0 and 0 not in slide_indexes:
+        slide_indexes.append(0)
+    best: dict[str, Any] | None = None
+    for slide_index in slide_indexes:
+        slide = slides[slide_index]
+        for target in sermon_plan_match_targets(str(slide.get("text") or "")):
+            target_words = target.split()
+            target_set = set(target_words)
+            if len(target_words) < 3:
+                continue
+
+            for raw_candidate in candidates:
+                candidate = normalize_sermon_plan_text(raw_candidate)
+                candidate_words = candidate.split()
+                if len(candidate_words) < 3:
+                    continue
+                candidate_set = set(candidate_words)
+                common = target_set & candidate_set
+                target_coverage = len(common) / max(1, len(target_set))
+                candidate_coverage = len(common) / max(1, len(candidate_set))
+                sequence_score = SequenceMatcher(None, candidate, target).ratio()
+                score = (0.55 * sequence_score) + (0.30 * target_coverage) + (0.15 * candidate_coverage)
+                if target_coverage < 0.55 or score < threshold:
+                    continue
+                result = {
+                    "slide_index": slide_index,
+                    "slide_number": slide_index + 1,
+                    "text": str(slide.get("text") or ""),
+                    "matched_text": target,
+                    "candidate": raw_candidate,
+                    "score": round(score, 3),
+                }
+                if best is None or score > float(best["score"]):
+                    best = result
+    return best
 
 
 def normalize_book_form(text: str) -> str:
