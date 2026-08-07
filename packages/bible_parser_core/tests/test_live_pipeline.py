@@ -7,9 +7,12 @@ from bible_parser_core.live_pipeline import LiveReferencePipeline, build_grammar
 from bible_parser_core.risk_model import load_risk_model, score_payload_with_model
 from tools.holyrics import (
     cross_chapter_quick_presentation_slides,
+    handle_scripture_range_reading_match,
     post_holyrics_url,
     restore_holyrics_presentation,
     scripture_range_quick_presentation_slides,
+    scripture_range_reading_active,
+    scripture_range_reading_state,
 )
 
 
@@ -913,6 +916,141 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertTrue(slides[0]["text"].startswith("Иоанн 3:16-36\n\n3:16."))
         self.assertNotIn("Иоанн 3:16-36", slides[1]["text"])
         self.assertTrue(any("3:36." in slide["text"] for slide in slides))
+
+    def test_long_range_state_tracks_each_slides_last_verse(self):
+        payload = {
+            "ref": "1 Иоанна 2:1-20",
+            "book": "1 Иоанна",
+        }
+        slides = [
+            {"text": "1 Иоанна 2:1-20\n\n2:1. Начало\n2:6. Конец первого слайда"},
+            {"text": "2:7. Начало второго\n2:11. Конец второго слайда"},
+        ]
+
+        state = scripture_range_reading_state(payload, slides)
+
+        self.assertIsNotNone(state)
+        self.assertEqual([6, 11], [item["verse"] for item in state["targets"]])
+
+    def test_showing_long_range_activates_reading_state(self):
+        pipeline = LiveReferencePipeline()
+        parsed = pipeline.process_text(
+            "первая иоанна вторая глава с первого по двадцатый стих"
+        )["parsed"]
+        args = SimpleNamespace(
+            holyrics_theme="",
+            holyrics_quick_minutes=0.0,
+        )
+
+        with patch(
+            "tools.holyrics.post_holyrics_api",
+            side_effect=[
+                (True, "", '{"data": {}}'),
+                (True, "", ""),
+            ],
+        ):
+            ok, reason = post_holyrics_url(args, "http://127.0.0.1:8091", parsed)
+
+        self.assertTrue(ok)
+        self.assertIn("show_quick_presentation:long_range", reason)
+        self.assertTrue(scripture_range_reading_active(args))
+        self.assertEqual(
+            [6, 11, 15, 20],
+            [item["verse"] for item in args._holyrics_scripture_range_reading["targets"]],
+        )
+
+    def test_last_verse_advances_long_range_and_final_verse_completes_it(self):
+        args = SimpleNamespace(
+            holyrics_url="http://127.0.0.1:8091",
+            holyrics_token="token",
+            holyrics_timeout=1.0,
+            _holyrics_scripture_range_reading={
+                "ref": "1 Иоанна 2:1-20",
+                "book": "1 Иоанна",
+                "book_id": 62,
+                "current_index": 0,
+                "targets": [
+                    {"slide_index": 0, "chapter": 2, "verse": 6, "text": "конец"},
+                    {"slide_index": 1, "chapter": 2, "verse": 11, "text": "конец"},
+                ],
+            },
+        )
+        verse_six = SimpleNamespace(book_id=62, chapter=2, start_verse=6, end_verse=6)
+        verse_eleven = SimpleNamespace(book_id=62, chapter=2, start_verse=11, end_verse=11)
+
+        with patch("tools.holyrics.post_holyrics_api", return_value=(True, "", "")) as api:
+            advanced = handle_scripture_range_reading_match(args, verse_six)
+
+        self.assertTrue(advanced["advanced"])
+        self.assertEqual(1, args._holyrics_scripture_range_reading["current_index"])
+        api.assert_called_once_with(
+            args,
+            "http://127.0.0.1:8091",
+            "ActionGoToIndex",
+            {"index": 1},
+        )
+
+        completed = handle_scripture_range_reading_match(args, verse_eleven)
+
+        self.assertTrue(completed["completed"])
+        self.assertFalse(scripture_range_reading_active(args))
+
+    def test_non_boundary_verse_is_consumed_without_advancing_long_range(self):
+        args = SimpleNamespace(
+            _holyrics_scripture_range_reading={
+                "ref": "1 Иоанна 2:1-20",
+                "book": "1 Иоанна",
+                "book_id": 62,
+                "current_index": 0,
+                "targets": [
+                    {"slide_index": 0, "chapter": 2, "verse": 6, "text": "конец"},
+                ],
+            }
+        )
+        verse_four = SimpleNamespace(book_id=62, chapter=2, start_verse=4, end_verse=4)
+
+        result = handle_scripture_range_reading_match(args, verse_four)
+
+        self.assertTrue(result["active"])
+        self.assertFalse(result["matched_boundary"])
+        self.assertTrue(scripture_range_reading_active(args))
+
+    def test_final_long_range_verse_restores_current_sermon_plan_slide(self):
+        presentation = {
+            "type": "text",
+            "text_id": "sermon-plan",
+            "current_index": 2,
+        }
+        args = SimpleNamespace(
+            holyrics_url="http://127.0.0.1:8091",
+            _holyrics_sermon_plan_presentation=presentation,
+            _holyrics_scripture_range_reading={
+                "ref": "1 Иоанна 2:1-20",
+                "book": "1 Иоанна",
+                "book_id": 62,
+                "current_index": 0,
+                "targets": [
+                    {"slide_index": 0, "chapter": 2, "verse": 20, "text": "конец"},
+                ],
+            },
+        )
+        verse_twenty = SimpleNamespace(book_id=62, chapter=2, start_verse=20, end_verse=20)
+
+        with patch(
+            "tools.holyrics.show_holyrics_text_slide",
+            return_value=(True, "sermon_plan_show_text"),
+        ) as show:
+            result = handle_scripture_range_reading_match(args, verse_twenty)
+
+        self.assertTrue(result["completed"])
+        self.assertTrue(result["restored_sermon_plan"])
+        self.assertFalse(scripture_range_reading_active(args))
+        show.assert_called_once_with(
+            args,
+            "http://127.0.0.1:8091",
+            presentation,
+            2,
+        )
 
     def test_complete_single_verse_after_chapter_still_matches(self):
         pipeline = LiveReferencePipeline()

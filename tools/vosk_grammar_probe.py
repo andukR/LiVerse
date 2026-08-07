@@ -9,6 +9,7 @@ import os
 import queue
 import re
 import sys
+import time
 import webbrowser
 import wave
 from datetime import datetime
@@ -37,6 +38,13 @@ from bible_parser_core.live_pipeline import (
 )
 from bible_parser_core.parser import DEFAULT_BIBLE
 from bible_parser_core.risk_model import load_risk_model, score_payload_with_model
+from bible_parser_core.bible_text_search import BibleTextSearcher
+from bible_parser_core.text_citation_detector import (
+    ScriptureTextDetector,
+    TextCitationDecision,
+    TextDetectionConfig,
+)
+from bible_parser_core.verse_text_search import CANONICAL_BOOK_NAMES_BY_ID
 from tools.holyrics import (
     MIN_RECOMMENDED_HOLYRICS_VERSION,
     REQUIRED_HOLYRICS_PERMISSIONS,
@@ -47,13 +55,16 @@ from tools.holyrics import (
     env_setting,
     get_holyrics_current_presentation,
     get_holyrics_theme_options,
+    handle_scripture_range_reading_match,
     show_holyrics_text_slide,
+    scripture_range_reading_active,
     post_holyrics_update,
 )
 
 
 DEFAULT_MODEL_PATH = Path.cwd() / "models" / "vosk-model-small-ru-0.22"
 DEFAULT_LOG_DIR = Path.cwd() / ".cache" / "liverse" / "vosk_probe"
+DEFAULT_TEXT_DETECTION_DB = PROJECT_ROOT / "bible_index" / "bible_index.db"
 HOLYRICS_SETUP_NOTICE_MARKER = Path.cwd() / ".cache" / "liverse" / "holyrics_setup_notice_shown"
 STARTUP_SETTINGS_ENV = "LIVERSE_STARTUP_SETTINGS"
 WELCOME_TEXT = (
@@ -66,6 +77,16 @@ SPACE_KEYS = {" "}
 TAB_KEYS = {"\t"}
 EDIT_SETTINGS_KEYS = {"e", "E"}
 QUIT_KEYS = {"q", "Q"}
+
+
+def parse_window_sizes(value: str) -> tuple[int, ...]:
+    try:
+        sizes = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("размеры окон должны быть целыми числами через запятую") from exc
+    if not sizes or any(size <= 0 for size in sizes):
+        raise argparse.ArgumentTypeError("укажите положительные размеры окон через запятую")
+    return sizes
 
 
 def startup_settings_path() -> Path:
@@ -796,6 +817,68 @@ def add_slide_payload(payload: dict) -> dict:
     return payload
 
 
+def text_citation_payload(decision: TextCitationDecision, recognized_text: str) -> dict:
+    """Build the ordinary LiVerse slide payload without reparsing DB abbreviations."""
+    candidate = decision.top_candidate
+    if candidate is None:
+        return {"text": recognized_text, "source": "text_citation", "parsed": None, "slide": None}
+    book = CANONICAL_BOOK_NAMES_BY_ID.get(candidate.book_id)
+    if not book or candidate.chapter <= 0 or candidate.start_verse <= 0:
+        return {"text": recognized_text, "source": "text_citation", "parsed": None, "slide": None}
+    end_verse = candidate.end_verse or candidate.start_verse
+    verse_part = str(candidate.start_verse)
+    if end_verse > candidate.start_verse:
+        verse_part += f"-{end_verse}"
+    reference = f"{book} {candidate.chapter}:{verse_part}"
+    payload = {
+        "text": recognized_text,
+        "source": "text_citation",
+        "matched": True,
+        "parsed": {
+            "book": book,
+            "chapter": candidate.chapter,
+            "start_verse": candidate.start_verse,
+            "end_verse": end_verse,
+            "end_chapter": candidate.chapter,
+            "ref": reference,
+            "verse_text": candidate.text,
+        },
+        "text_citation": {
+            "index_reference": candidate.reference,
+            "window": decision.window_text,
+            "score": round(decision.score, 3),
+            "margin": round(decision.margin, 3),
+            "matched_words": decision.matched_words,
+            "confirmations": decision.confirmations,
+            "reason": decision.reason,
+        },
+    }
+    return add_slide_payload(payload)
+
+
+def text_citation_output_args(args: argparse.Namespace) -> argparse.Namespace:
+    """Use the existing publisher, changing only text-citation approval policy."""
+    output_args = argparse.Namespace(**vars(args))
+    if args.citation_detection_mode == "hybrid_auto":
+        output_args.require_approval = False
+        output_args.semi_auto_approval = False
+    elif args.citation_detection_mode == "hybrid_confirm":
+        output_args.require_approval = True
+        output_args.semi_auto_approval = False
+    return output_args
+
+
+def text_decision_ready_for_scripture_range(
+    decision: TextCitationDecision | None,
+) -> bool:
+    """Allow a known slide boundary without waiting to hear it twice."""
+    return bool(
+        decision is not None
+        and decision.top_candidate is not None
+        and (decision.accepted or decision.reason == "pending_confirmation")
+    )
+
+
 def parsed_payload_from_candidates(
     candidates: list[str],
     bible_path: Path = DEFAULT_BIBLE,
@@ -1169,7 +1252,10 @@ def apply_ml_risk(args: argparse.Namespace, payload: dict, asr_result: dict | No
 
 
 def start_slide_server_if_needed(args: argparse.Namespace, pipeline: LiveReferencePipeline | None = None):
-    web_approval = (args.require_approval or args.semi_auto_approval) and args.approval_ui == "web"
+    text_confirmation = getattr(args, "citation_detection_mode", "address_only") == "hybrid_confirm"
+    web_approval = (
+        args.require_approval or args.semi_auto_approval or text_confirmation
+    ) and args.approval_ui == "web"
     needs_server = args.start_slide_server or web_approval or args.slide_output in {"web", "both"}
     if not needs_server:
         return None
@@ -1341,7 +1427,9 @@ def run_microphone(args: argparse.Namespace) -> int:
     audio_queue: queue.Queue[bytes] = queue.Queue()
     console = ConsoleStatus(debug=args.debug_console)
     session_refs: list[dict] = []
-    grammar = None if args.open_vocabulary else build_grammar()
+    address_detection_enabled = args.citation_detection_mode != "text_only"
+    text_detection_enabled = args.citation_detection_mode != "address_only"
+    grammar = None if (args.open_vocabulary or text_detection_enabled) else build_grammar()
     logger = JsonlLogger(Path(args.log_dir), enabled=not args.no_log)
     logger.write_session(
         {
@@ -1352,6 +1440,8 @@ def run_microphone(args: argparse.Namespace) -> int:
             "blocksize": args.blocksize,
             "device": args.device,
             "open_vocabulary": args.open_vocabulary,
+            "citation_detection_mode": args.citation_detection_mode,
+            "text_detection_db": str(args.text_detection_db) if text_detection_enabled else None,
             "vosk_buffer_parts": args.vosk_buffer_parts,
             "log_audio": args.log_audio,
             "trigger_cases": "trigger_cases.jsonl",
@@ -1364,7 +1454,11 @@ def run_microphone(args: argparse.Namespace) -> int:
             "approval_ui": args.approval_ui,
             "slide_server": f"http://{args.slide_host}:{args.slide_port}" if (
                 args.start_slide_server
-                or ((args.require_approval or args.semi_auto_approval) and args.approval_ui == "web")
+                or ((
+                    args.require_approval
+                    or args.semi_auto_approval
+                    or args.citation_detection_mode == "hybrid_confirm"
+                ) and args.approval_ui == "web")
                 or args.slide_output in {"web", "both"}
             ) else None,
             "holyrics_target": describe_holyrics_target(args),
@@ -1376,7 +1470,7 @@ def run_microphone(args: argparse.Namespace) -> int:
     SetLogLevel(args.vosk_log_level)
     model = Model(str(args.model))
     sermon_plan = None
-    if args.sermon_plan:
+    if args.sermon_plan and address_detection_enabled:
         active = get_holyrics_current_presentation(
             args,
             str(args.holyrics_url).rstrip("/"),
@@ -1452,6 +1546,37 @@ def run_microphone(args: argparse.Namespace) -> int:
         audio_queue.put(data)
 
     pipeline = LiveReferencePipeline(args.bible, buffer_parts=args.vosk_buffer_parts)
+    text_searcher = None
+    text_detector = None
+    if text_detection_enabled:
+        try:
+            text_searcher = BibleTextSearcher(args.text_detection_db)
+            text_detector = ScriptureTextDetector(
+                text_searcher,
+                TextDetectionConfig(
+                    min_words=args.text_min_words,
+                    buffer_words=args.text_buffer_words,
+                    window_sizes=args.text_window_sizes,
+                    candidate_limit=args.text_candidate_limit,
+                    result_limit=args.text_result_limit,
+                    acceptance_score=args.text_acceptance_score,
+                    immediate_score=args.text_immediate_score,
+                    minimum_margin=args.text_minimum_margin,
+                    minimum_matched_content_words=args.text_minimum_matched_words,
+                    confirmations_required=args.text_confirmations,
+                    confirmation_window_seconds=args.text_confirmation_seconds,
+                    duplicate_cooldown_seconds=args.text_duplicate_cooldown_seconds,
+                    address_suppression_seconds=args.text_address_suppression_seconds,
+                    search_interval_ms=args.text_search_interval_ms,
+                    max_range_verses=args.text_max_range_verses,
+                ),
+                event_callback=logger.write,
+            )
+            print(f"Поиск цитат по тексту: {args.text_detection_db}", flush=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.write("text_detection_startup_error", {"error": str(exc)})
+            print(f"LiVerse: не удалось включить поиск цитат по тексту: {exc}", file=sys.stderr)
+            return 2
     start_slide_server_if_needed(args, pipeline=pipeline)
     audio_stats = {"chunks": 0, "peak": 0}
     empty_final_count = 0
@@ -1646,15 +1771,34 @@ def run_microphone(args: argparse.Namespace) -> int:
                         if text:
                             empty_final_count = 0
                             console.status("распознаю")
-                            pipeline_payload = pipeline.process_text(
-                                text,
-                                asr_result=result,
-                                show_candidates=args.show_candidates,
-                            )
+                            recognition_time = time.monotonic()
+                            if address_detection_enabled:
+                                pipeline_payload = pipeline.process_text(
+                                    text,
+                                    asr_result=result,
+                                    show_candidates=args.show_candidates,
+                                )
+                            else:
+                                pipeline_payload = {
+                                    "text": text,
+                                    "matched": False,
+                                    "parsed": None,
+                                    "source": "text_only",
+                                }
+                            if text_detector is not None and pipeline_payload.get("matched"):
+                                explicit_ref = str(
+                                    (pipeline_payload.get("parsed") or {}).get("ref") or ""
+                                )
+                                text_detector.suppress_after_address(explicit_ref, recognition_time)
+                            long_passage_reading = scripture_range_reading_active(args)
                             plan_match = None
                             # Явно названный адрес всегда важнее строки плана.
                             plan_requires_approval = bool(args.require_approval or args.semi_auto_approval)
-                            if sermon_plan is not None and not pipeline_payload.get("matched"):
+                            if (
+                                sermon_plan is not None
+                                and not pipeline_payload.get("matched")
+                                and not long_passage_reading
+                            ):
                                 speech_parts = sermon_plan["speech_parts"]
                                 speech_parts.append(text)
                                 del speech_parts[:-2]
@@ -1667,6 +1811,8 @@ def run_microphone(args: argparse.Namespace) -> int:
                                     min_target_coverage=0.35 if plan_requires_approval else 0.65,
                                 )
                             if plan_match:
+                                if text_detector is not None:
+                                    text_detector.clear()
                                 if plan_requires_approval:
                                     plan_candidate = {
                                         "ref": f"План: слайд {plan_match['slide_number']}",
@@ -1726,10 +1872,58 @@ def run_microphone(args: argparse.Namespace) -> int:
                                     )
                                     continue
                                 console.status(f"ошибка показа плана: {plan_reason}")
-                            payload = add_slide_payload(pipeline_payload)
+                            output_args = args
+                            text_decision = None
+                            if (
+                                text_detector is not None
+                                and not pipeline_payload.get("matched")
+                                and plan_match is None
+                            ):
+                                text_decision = text_detector.process_fragment(text, recognition_time)
+                            range_reading_action = None
+                            if (
+                                long_passage_reading
+                                and text_decision_ready_for_scripture_range(text_decision)
+                            ):
+                                range_reading_action = handle_scripture_range_reading_match(
+                                    args,
+                                    text_decision.top_candidate,
+                                )
+                                logger.write(
+                                    "SCRIPTURE_RANGE_READING",
+                                    {
+                                        **range_reading_action,
+                                        "candidate": text_decision.reference,
+                                        "score": round(text_decision.score, 3),
+                                        "window": text_decision.window_text,
+                                    },
+                                )
+                                if range_reading_action.get("advanced"):
+                                    text_detector.clear()
+                                    console.status(
+                                        f"длинный отрывок: слайд {int(range_reading_action['next_index']) + 1}"
+                                    )
+                                elif range_reading_action.get("completed"):
+                                    text_detector.clear()
+                                    if range_reading_action.get("restored_sermon_plan"):
+                                        console.status("длинный отрывок завершён: возвращён план проповеди")
+                                    elif range_reading_action.get("reason") == "long_passage_completed":
+                                        console.status("чтение длинного отрывка завершено")
+                                    else:
+                                        console.status(
+                                            "длинный отрывок завершён, ошибка возврата к плану: "
+                                            f"{range_reading_action.get('reason')}"
+                                        )
+                            if long_passage_reading:
+                                payload = add_slide_payload(pipeline_payload)
+                            elif text_decision is not None and text_decision.accepted:
+                                payload = text_citation_payload(text_decision, text)
+                                output_args = text_citation_output_args(args)
+                            else:
+                                payload = add_slide_payload(pipeline_payload)
                             payload["asr"] = result
-                            apply_ml_risk(args, payload, asr_result=result)
-                            payload["output"] = publish_payload(args, payload)
+                            apply_ml_risk(output_args, payload, asr_result=result)
+                            payload["output"] = publish_payload(output_args, payload)
                             if payload.get("slide"):
                                 action = approval_action(payload["output"])
                                 if action == "approve_context" and pipeline.set_context_range(payload["slide"]):
@@ -1775,6 +1969,12 @@ def run_microphone(args: argparse.Namespace) -> int:
                             elif payload.get("message"):
                                 notify_operator_message(args, payload)
                                 console.status(str(payload["message"]))
+                            elif long_passage_reading:
+                                if not range_reading_action or not (
+                                    range_reading_action.get("advanced")
+                                    or range_reading_action.get("completed")
+                                ):
+                                    console.status("чтение длинного отрывка")
                             else:
                                 console.status("слушаю")
                             logger.write(
@@ -1815,6 +2015,8 @@ def run_microphone(args: argparse.Namespace) -> int:
         finally:
             if audio_log:
                 audio_log.close()
+            if text_searcher is not None:
+                text_searcher.close()
 
 
 def main() -> int:
@@ -1831,6 +2033,37 @@ def main() -> int:
         action="store_true",
         help="Read the active Holyrics text presentation and follow its spoken sermon-plan lines.",
     )
+    parser.add_argument(
+        "--citation-detection-mode",
+        choices=["address_only", "text_only", "hybrid_auto", "hybrid_confirm"],
+        default=env_setting("LIVERSE_CITATION_DETECTION_MODE", "address_only"),
+        help=(
+            "Citation channel: address_only keeps the previous behavior; text_only tests "
+            "spoken verse text; hybrid_auto shows strong text matches; hybrid_confirm "
+            "asks the operator before showing a text match."
+        ),
+    )
+    parser.add_argument(
+        "--text-detection-db",
+        type=Path,
+        default=Path(env_setting("LIVERSE_TEXT_DETECTION_DB", str(DEFAULT_TEXT_DETECTION_DB))),
+        help="SQLite Bible text index used outside address_only mode.",
+    )
+    parser.add_argument("--text-min-words", type=int, default=5)
+    parser.add_argument("--text-buffer-words", type=int, default=35)
+    parser.add_argument("--text-window-sizes", type=parse_window_sizes, default=(5, 7, 10, 15, 20))
+    parser.add_argument("--text-candidate-limit", type=int, default=100)
+    parser.add_argument("--text-result-limit", type=int, default=5)
+    parser.add_argument("--text-acceptance-score", type=float, default=70.0)
+    parser.add_argument("--text-immediate-score", type=float, default=90.0)
+    parser.add_argument("--text-minimum-margin", type=float, default=12.0)
+    parser.add_argument("--text-minimum-matched-words", type=int, default=3)
+    parser.add_argument("--text-confirmations", type=int, default=2)
+    parser.add_argument("--text-confirmation-seconds", type=float, default=5.0)
+    parser.add_argument("--text-duplicate-cooldown-seconds", type=float, default=30.0)
+    parser.add_argument("--text-address-suppression-seconds", type=float, default=8.0)
+    parser.add_argument("--text-search-interval-ms", type=int, default=300)
+    parser.add_argument("--text-max-range-verses", type=int, choices=[1, 2], default=2)
     parser.add_argument(
         "--vosk-buffer-parts",
         type=int,

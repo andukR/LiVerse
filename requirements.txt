@@ -2,3 +2,6 @@ sounddevice
 vosk
 qrcode[pil]
 pysword
+pymorphy3
+pymorphy3-dicts-ru
+rapidfuzz

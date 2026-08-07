@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Any
@@ -24,7 +25,7 @@ DEFAULT_CROSS_CHAPTER_SLIDE_MAX_CHARS = 760
 DEFAULT_CROSS_CHAPTER_SLIDE_MAX_VERSES = 9
 DEFAULT_LONG_RANGE_SLIDE_MAX_CHARS = 620
 DEFAULT_LONG_RANGE_SLIDE_MAX_VERSES = 7
-DEFAULT_LONG_RANGE_MIN_VERSES = 8
+DEFAULT_LONG_RANGE_MIN_VERSES = 5
 MIN_RECOMMENDED_HOLYRICS_VERSION = "2.28.1"
 HOLYRICS_JSLIB_DOC_URL = "https://github.com/holyrics/jslib/blob/main/README-en.md"
 REQUIRED_HOLYRICS_PERMISSIONS = (
@@ -113,6 +114,7 @@ HOLYRICS_BOOKS = (
 HOLYRICS_BOOK_INDEX = {book: index for index, book in enumerate(HOLYRICS_BOOKS, start=1)}
 _TEMPORARY_VERSE_RESTORE_TIMER: threading.Timer | None = None
 _TEMPORARY_VERSE_RESTORE_LOCK = threading.Lock()
+_VERSE_LINE_RE = re.compile(r"(?m)^(\d+):(\d+)\.\s*(.+)$")
 
 
 def parse_env_value(value: str) -> str:
@@ -618,6 +620,7 @@ def show_holyrics_text_slide(
     presentation: dict[str, Any],
     slide_index: int,
 ) -> tuple[bool, str]:
+    clear_scripture_range_reading(args)
     text_id = str(presentation.get("text_id") or presentation.get("id") or "").strip()
     if not text_id:
         return False, "sermon_plan_text_id_missing"
@@ -916,7 +919,124 @@ def scripture_range_quick_presentation_body(args: Any, base_url: str, payload: d
     return body
 
 
+def scripture_range_reading_state(payload: dict, slides: list[dict]) -> dict | None:
+    """Describe the last Bible verse on each generated Holyrics slide."""
+    book = str(payload.get("book") or "").strip()
+    book_id = HOLYRICS_BOOK_INDEX.get(book)
+    ref = str(payload.get("ref") or "").strip()
+    if book_id is None or not ref or not slides:
+        return None
+    targets: list[dict[str, Any]] = []
+    for slide_index, slide in enumerate(slides):
+        matches = list(_VERSE_LINE_RE.finditer(str(slide.get("text") or "")))
+        if not matches:
+            return None
+        last = matches[-1]
+        targets.append(
+            {
+                "slide_index": slide_index,
+                "chapter": int(last.group(1)),
+                "verse": int(last.group(2)),
+                "text": last.group(3).strip(),
+            }
+        )
+    return {
+        "ref": ref,
+        "book": book,
+        "book_id": book_id,
+        "current_index": 0,
+        "targets": targets,
+    }
+
+
+def clear_scripture_range_reading(args: Any) -> None:
+    setattr(args, "_holyrics_scripture_range_reading", None)
+
+
+def scripture_range_reading_active(args: Any) -> bool:
+    state = getattr(args, "_holyrics_scripture_range_reading", None)
+    return isinstance(state, dict) and bool(state.get("targets"))
+
+
+def handle_scripture_range_reading_match(args: Any, candidate: Any) -> dict:
+    """Advance a long-passage slide when its final verse was just read."""
+    state = getattr(args, "_holyrics_scripture_range_reading", None)
+    if not isinstance(state, dict):
+        return {"active": False, "matched_boundary": False, "reason": "inactive"}
+    targets = list(state.get("targets") or [])
+    current_index = int(state.get("current_index") or 0)
+    if current_index < 0 or current_index >= len(targets):
+        clear_scripture_range_reading(args)
+        return {"active": False, "matched_boundary": False, "reason": "invalid_state"}
+    target = targets[current_index]
+    try:
+        candidate_book_id = int(getattr(candidate, "book_id", 0) or 0)
+        candidate_chapter = int(getattr(candidate, "chapter", 0) or 0)
+        candidate_start = int(getattr(candidate, "start_verse", 0) or 0)
+        candidate_end = int(getattr(candidate, "end_verse", candidate_start) or candidate_start)
+    except (TypeError, ValueError):
+        return {"active": True, "matched_boundary": False, "reason": "invalid_candidate"}
+    matched_boundary = (
+        candidate_book_id == int(state.get("book_id") or 0)
+        and candidate_chapter == int(target["chapter"])
+        and candidate_start <= int(target["verse"]) <= candidate_end
+    )
+    if not matched_boundary:
+        return {
+            "active": True,
+            "matched_boundary": False,
+            "reason": "inside_long_passage",
+            "current_index": current_index,
+            "target": target,
+        }
+    next_index = current_index + 1
+    if next_index >= len(targets):
+        clear_scripture_range_reading(args)
+        presentation = getattr(args, "_holyrics_sermon_plan_presentation", None)
+        restored = False
+        restore_reason = "sermon_plan_not_loaded"
+        if isinstance(presentation, dict):
+            try:
+                return_index = max(0, int(presentation.get("current_index") or 0))
+            except (TypeError, ValueError):
+                return_index = 0
+            restored, restore_reason = show_holyrics_text_slide(
+                args,
+                str(getattr(args, "holyrics_url", "")).rstrip("/"),
+                presentation,
+                return_index,
+            )
+        return {
+            "active": False,
+            "matched_boundary": True,
+            "completed": True,
+            "restored_sermon_plan": restored,
+            "reason": restore_reason if isinstance(presentation, dict) else "long_passage_completed",
+            "current_index": current_index,
+            "target": target,
+        }
+    base_url = str(getattr(args, "holyrics_url", "")).rstrip("/")
+    ok, reason, _body = post_holyrics_api(
+        args,
+        base_url,
+        "ActionGoToIndex",
+        {"index": next_index},
+    )
+    if ok:
+        state["current_index"] = next_index
+    return {
+        "active": True,
+        "matched_boundary": True,
+        "advanced": ok,
+        "reason": reason or ("long_passage_slide_advanced" if ok else "long_passage_advance_failed"),
+        "current_index": current_index,
+        "next_index": next_index,
+        "target": target,
+    }
+
+
 def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, str]:
+    clear_scripture_range_reading(args)
     if str(payload.get("slide_type") or "").strip() == "reference_list":
         text = slide_payload_to_holyrics_text(payload)
         if not text:
@@ -930,6 +1050,7 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
         holyrics_log(f"ShowQuickPresentation response={show_body or show_reason or 'ok'}")
         if not show_ok:
             return False, show_reason
+        clear_scripture_range_reading(args)
         return True, "show_quick_presentation:reference_list"
 
     selected_scripture_range = scripture_range(payload)
@@ -947,6 +1068,8 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
         holyrics_log(f"ShowQuickPresentation {range_kind} response={show_body or show_reason or 'ok'}")
         if not show_ok:
             return False, show_reason
+        state = scripture_range_reading_state(payload, list(quick_body["slides"]))
+        setattr(args, "_holyrics_scripture_range_reading", state)
         return True, f"show_quick_presentation:{range_kind};slides:{len(quick_body['slides'])};manual_advance"
 
     sermon_plan_presentation = getattr(args, "_holyrics_sermon_plan_presentation", None)
@@ -964,6 +1087,7 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
         holyrics_log(f"ShowQuickPresentation sermon verse response={show_body or show_reason or 'ok'}")
         if not show_ok:
             return False, show_reason
+        clear_scripture_range_reading(args)
         quick_minutes = holyrics_quick_minutes(args)
         if quick_minutes > 0:
             restore_holyrics_presentation_later(args, base_url, sermon_plan_presentation, quick_minutes)
@@ -1027,6 +1151,7 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
     holyrics_log(f"ShowVerse response={show_body or show_reason or 'ok'}")
     if not show_ok:
         return False, show_reason
+    clear_scripture_range_reading(args)
     close_suffix = ""
     if quick_minutes > 0:
         restore_holyrics_presentation_later(args, base_url, previous_presentation, quick_minutes)
