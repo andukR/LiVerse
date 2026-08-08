@@ -15,10 +15,100 @@ from tools.holyrics import (
     scripture_range_quick_presentation_slides,
     scripture_range_reading_active,
     scripture_range_reading_state,
+    sync_scripture_range_reading,
 )
 
 
 class LiveReferencePipelineTest(unittest.TestCase):
+    def test_popup_uses_monitor_under_pointer_instead_of_combined_desktop(self):
+        from tools.vosk_grammar_probe import center_tk_window, xrandr_monitor_bounds
+
+        monitor_list = """Monitors: 2
+ 0: +*eDP-1 1920/344x1080/194+0+0  eDP-1
+ 1: +HDMI-1 1920/510x1080/290+1920+0  HDMI-1
+"""
+        self.assertEqual((0, 0, 1920, 1080), xrandr_monitor_bounds(monitor_list, 500, 400))
+        self.assertEqual((1920, 0, 1920, 1080), xrandr_monitor_bounds(monitor_list, 2500, 400))
+
+        geometries: list[str] = []
+        root = SimpleNamespace(geometry=geometries.append)
+        with patch("tools.vosk_grammar_probe.tk_monitor_bounds", return_value=(0, 0, 1920, 1080)):
+            center_tk_window(root, 980, 360)
+        with patch("tools.vosk_grammar_probe.tk_monitor_bounds", return_value=(-1920, 0, 1920, 1080)):
+            center_tk_window(root, 980, 360)
+
+        self.assertEqual(["980x360+470+360", "980x360-1450+360"], geometries)
+
+    def test_ordinary_words_by_and_byt_do_not_become_genesis(self):
+        samples = (
+            "если глаз твой соблазняет тебя лучше войти в жизнь с одним глазом "
+            "нежели с двумя глазами быть ввержену в геенну огненную",
+            "лучше тебе с одним глазом нежели с двумя глазами бы тебе быть ввержену",
+            "в этом стихе сказано что лучше быть верным в одном и в двух делах",
+        )
+
+        for text in samples:
+            with self.subTest(text=text):
+                result = LiveReferencePipeline().process_text(text)
+                self.assertFalse(result.get("matched"))
+
+    def test_compact_genesis_alias_still_matches(self):
+        compact = LiveReferencePipeline().process_text("быт один два")
+        full = LiveReferencePipeline().process_text("бытие первая глава второй стих")
+
+        self.assertEqual("Бытие 1:2", compact.get("parsed", {}).get("ref"))
+        self.assertEqual("Бытие 1:2", full.get("parsed", {}).get("ref"))
+
+    def test_long_passage_disables_only_address_recognition(self):
+        from tools.vosk_grammar_probe import address_recognition_allowed
+
+        self.assertFalse(address_recognition_allowed(True, True))
+        self.assertTrue(address_recognition_allowed(True, False))
+        self.assertFalse(address_recognition_allowed(False, False))
+
+    def test_confident_plan_match_is_automatic_in_semi_auto_mode(self):
+        from tools.vosk_grammar_probe import sermon_plan_match_requires_approval
+
+        args = SimpleNamespace(require_approval=False, semi_auto_approval=True)
+        confident = {"score": 0.81, "matched_content_words": 5, "target_coverage": 0.8}
+        uncertain = {"score": 0.61, "matched_content_words": 3, "target_coverage": 0.6}
+
+        self.assertFalse(sermon_plan_match_requires_approval(args, confident))
+        self.assertTrue(sermon_plan_match_requires_approval(args, uncertain))
+
+    def test_confident_long_range_is_automatic_in_semi_auto_mode(self):
+        from tools.vosk_grammar_probe import approval_required_for_payload
+
+        args = SimpleNamespace(require_approval=False, semi_auto_approval=True)
+        payload = {
+            "slide": {"ref": "Матфей 18:3-9", "can_set_context": True},
+            "ml_risk": {"needs_confirmation": False},
+        }
+
+        self.assertFalse(approval_required_for_payload(args, payload))
+
+    def test_confident_context_range_is_not_forced_to_confirmation(self):
+        from tools.vosk_grammar_probe import apply_ml_risk
+
+        args = SimpleNamespace(
+            require_approval=False,
+            semi_auto_approval=True,
+            risk_model_data={"loaded": True},
+            risk_auto_reject_threshold=0.9,
+        )
+        payload = {
+            "source": "context_range",
+            "slide": {"ref": "Колоссянам 3:7-8"},
+            "risk_score": 0.5,
+        }
+        with patch(
+            "tools.vosk_grammar_probe.score_payload_with_model",
+            return_value={"needs_confirmation": False, "decision_reasons": []},
+        ):
+            apply_ml_risk(args, payload)
+
+        self.assertFalse(payload["ml_risk"]["needs_confirmation"])
+
     def test_sermon_plan_startup_does_not_request_theme_list(self):
         from tools.vosk_grammar_probe import ask_holyrics_theme_name
 
@@ -1152,6 +1242,44 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertTrue(result["active"])
         self.assertFalse(result["matched_boundary"])
         self.assertTrue(scripture_range_reading_active(args))
+
+    def test_manual_right_arrow_synchronizes_long_range_slide(self):
+        args = SimpleNamespace(
+            holyrics_url="http://127.0.0.1:8091",
+            _holyrics_scripture_range_reading={
+                "current_index": 0,
+                "targets": [{"verse": 6}, {"verse": 11}],
+            },
+        )
+        with patch(
+            "tools.holyrics.get_holyrics_current_presentation",
+            return_value={"type": "quick_presentation", "slide_number": 2},
+        ):
+            result = sync_scripture_range_reading(args)
+
+        self.assertTrue(result["manual_advance"])
+        self.assertEqual(1, args._holyrics_scripture_range_reading["current_index"])
+
+    def test_manual_sermon_plan_restore_ends_long_range_mode(self):
+        plan = {"type": "text", "text_id": "sermon-plan", "current_index": 0}
+        args = SimpleNamespace(
+            holyrics_url="http://127.0.0.1:8091",
+            _holyrics_sermon_plan_presentation=plan,
+            _holyrics_scripture_range_reading={
+                "current_index": 0,
+                "targets": [{"verse": 6}, {"verse": 11}],
+            },
+        )
+        with patch(
+            "tools.holyrics.get_holyrics_current_presentation",
+            return_value={"type": "text", "text_id": "sermon-plan", "slide_number": 3},
+        ):
+            result = sync_scripture_range_reading(args)
+
+        self.assertTrue(result["manual_restore"])
+        self.assertFalse(scripture_range_reading_active(args))
+        self.assertEqual(2, plan["current_index"])
+        self.assertEqual(3, plan["next_index"])
 
     def test_final_long_range_verse_restores_current_sermon_plan_slide(self):
         presentation = {

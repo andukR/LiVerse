@@ -773,6 +773,10 @@ def book_candidates(normalized: str) -> list[BookCandidate]:
             candidate_text = " ".join(token for token, _start, _end in tokens[index : index + size])
             if candidate_text in GENERIC_BOOK_VARIANTS:
                 continue
+            # Обычные слова «бы» и «быть» фонетически близки к сокращению
+            # «Быт», но сами по себе не должны означать книгу Бытие.
+            if candidate_text in {"бы", "быть"}:
+                continue
             if re.search(r"\b\d+\b", candidate_text):
                 trailing_context_number = re.search(r"\D\s+\d+\b", candidate_text)
                 if trailing_context_number:

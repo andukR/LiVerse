@@ -370,6 +370,7 @@ def match_sermon_plan_slide(
                     "candidate": raw_candidate,
                     "score": round(score, 3),
                     "matched_content_words": matched_content_words,
+                    "target_coverage": round(target_coverage, 3),
                     "backtrack": is_backtrack,
                 }
                 if best is None or score > float(best["score"]):

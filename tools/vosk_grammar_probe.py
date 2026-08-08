@@ -8,6 +8,7 @@ import json
 import os
 import queue
 import re
+import subprocess
 import sys
 import time
 import webbrowser
@@ -59,6 +60,7 @@ from tools.holyrics import (
     show_holyrics_text_slide,
     scripture_range,
     scripture_range_reading_active,
+    sync_scripture_range_reading,
     post_holyrics_update,
 )
 
@@ -507,6 +509,90 @@ def session_references_text(records: list[dict]) -> str:
     return "\n".join(lines)
 
 
+_XRANDR_MONITOR_RE = re.compile(
+    r"\s(?P<width>\d+)/\d+x(?P<height>\d+)/\d+(?P<x>[+-]\d+)(?P<y>[+-]\d+)\s"
+)
+
+
+def xrandr_monitor_bounds(output: str, pointer_x: int, pointer_y: int) -> tuple[int, int, int, int] | None:
+    monitors: list[tuple[int, int, int, int, bool]] = []
+    for line in output.splitlines():
+        match = _XRANDR_MONITOR_RE.search(line)
+        if not match:
+            continue
+        x = int(match.group("x"))
+        y = int(match.group("y"))
+        width = int(match.group("width"))
+        height = int(match.group("height"))
+        monitors.append((x, y, width, height, "*" in line.split(maxsplit=2)[1]))
+    for x, y, width, height, _primary in monitors:
+        if x <= pointer_x < x + width and y <= pointer_y < y + height:
+            return x, y, width, height
+    for x, y, width, height, primary in monitors:
+        if primary:
+            return x, y, width, height
+    if monitors:
+        return monitors[0][:4]
+    return None
+
+
+def tk_monitor_bounds(root) -> tuple[int, int, int, int]:
+    pointer_x = int(root.winfo_pointerx())
+    pointer_y = int(root.winfo_pointery())
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class MonitorInfo(ctypes.Structure):
+                _fields_ = [
+                    ("cbSize", wintypes.DWORD),
+                    ("rcMonitor", wintypes.RECT),
+                    ("rcWork", wintypes.RECT),
+                    ("dwFlags", wintypes.DWORD),
+                ]
+
+            monitor_from_point = ctypes.windll.user32.MonitorFromPoint
+            monitor_from_point.argtypes = [wintypes.POINT, wintypes.DWORD]
+            monitor_from_point.restype = ctypes.c_void_p
+            get_monitor_info = ctypes.windll.user32.GetMonitorInfoW
+            get_monitor_info.argtypes = [ctypes.c_void_p, ctypes.POINTER(MonitorInfo)]
+            get_monitor_info.restype = wintypes.BOOL
+            monitor = monitor_from_point(
+                wintypes.POINT(pointer_x, pointer_y),
+                1,
+            )
+            info = MonitorInfo(cbSize=ctypes.sizeof(MonitorInfo))
+            if monitor and get_monitor_info(monitor, ctypes.byref(info)):
+                work = info.rcWork
+                return work.left, work.top, work.right - work.left, work.bottom - work.top
+        except Exception:
+            pass
+    elif os.environ.get("DISPLAY"):
+        try:
+            result = subprocess.run(
+                ["xrandr", "--listmonitors"],
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=1.0,
+            )
+            bounds = xrandr_monitor_bounds(result.stdout, pointer_x, pointer_y)
+            if bounds is not None:
+                return bounds
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return 0, 0, int(root.winfo_screenwidth()), int(root.winfo_screenheight())
+
+
+def center_tk_window(root, width: int, height: int) -> None:
+    screen_x, screen_y, screen_width, screen_height = tk_monitor_bounds(root)
+    x = screen_x + max(0, (screen_width - width) // 2)
+    y = screen_y + max(0, (screen_height - height) // 2)
+    root.geometry(f"{width}x{height}{x:+d}{y:+d}")
+
+
 def show_session_summary_popup(records: list[dict]) -> None:
     try:
         import tkinter as tk
@@ -528,11 +614,7 @@ def show_session_summary_popup(records: list[dict]) -> None:
     root.resizable(True, True)
 
     width, height = 760, 560
-    screen_width = root.winfo_screenwidth()
-    screen_height = root.winfo_screenheight()
-    x = max(0, (screen_width - width) // 2)
-    y = max(0, (screen_height - height) // 2)
-    root.geometry(f"{width}x{height}+{x}+{y}")
+    center_tk_window(root, width, height)
 
     title_font = tkfont.Font(family="Segoe UI", size=28, weight="bold")
     body_font = tkfont.Font(family="Segoe UI", size=18)
@@ -672,7 +754,11 @@ def ask_priority_run_mode(settings: dict, *, sermon_plan: bool = False) -> tuple
     else:
         print("Сохранённых настроек пока нет: после выбора режима LiVerse задаст остальные вопросы.", flush=True)
     print("", flush=True)
-    print("Enter — полуавтомат; Space — автомат; E — полная настройка; Q — выход", flush=True)
+    print(
+        "Enter — осторожный полуавтомат (уверенное показывает сам, сомнительное подтверждает)",
+        flush=True,
+    )
+    print("Space — автомат без проверки риска; E — полная настройка; Q — выход", flush=True)
     while True:
         key = read_single_key()
         if key in ENTER_KEYS:
@@ -887,6 +973,11 @@ def text_decision_ready_for_scripture_range(
     )
 
 
+def address_recognition_allowed(address_detection_enabled: bool, long_passage_reading: bool) -> bool:
+    """Keep address parsing off while the already selected passage is being read."""
+    return bool(address_detection_enabled and not long_passage_reading)
+
+
 def parsed_payload_from_candidates(
     candidates: list[str],
     bible_path: Path = DEFAULT_BIBLE,
@@ -975,11 +1066,7 @@ def popup_approval_decision(slide: dict) -> str:
         height = 430
     else:
         height = 360
-    screen_width = root.winfo_screenwidth()
-    screen_height = root.winfo_screenheight()
-    x = max(0, (screen_width - width) // 2)
-    y = max(0, (screen_height - height) // 2)
-    root.geometry(f"{width}x{height}+{x}+{y}")
+    center_tk_window(root, width, height)
 
     ref_font = tkfont.Font(family="Segoe UI", size=54, weight="bold")
     hint_font = tkfont.Font(family="Segoe UI", size=24, weight="bold")
@@ -1113,11 +1200,7 @@ def show_popup_message(title: str, message: str) -> None:
     root.resizable(True, True)
 
     width, height = 980, 360
-    screen_width = root.winfo_screenwidth()
-    screen_height = root.winfo_screenheight()
-    x = max(0, (screen_width - width) // 2)
-    y = max(0, (screen_height - height) // 2)
-    root.geometry(f"{width}x{height}+{x}+{y}")
+    center_tk_window(root, width, height)
 
     title_font = tkfont.Font(family="Segoe UI", size=38, weight="bold")
     body_font = tkfont.Font(family="Segoe UI", size=26, weight="bold")
@@ -1229,9 +1312,19 @@ def approval_required_for_payload(args: argparse.Namespace, payload: dict) -> bo
         return False
     if args.require_approval:
         return True
-    if args.semi_auto_approval and (payload.get("slide") or {}).get("can_set_context"):
-        return True
     return bool(args.semi_auto_approval and ml_risk.get("needs_confirmation"))
+
+
+def sermon_plan_match_requires_approval(args: argparse.Namespace, match: dict) -> bool:
+    if args.require_approval:
+        return True
+    if not args.semi_auto_approval:
+        return False
+    return not (
+        float(match.get("score") or 0.0) >= 0.68
+        and int(match.get("matched_content_words") or 0) >= 4
+        and float(match.get("target_coverage") or 0.0) >= 0.65
+    )
 
 
 def apply_ml_risk(args: argparse.Namespace, payload: dict, asr_result: dict | None = None) -> None:
@@ -1251,7 +1344,12 @@ def apply_ml_risk(args: argparse.Namespace, payload: dict, asr_result: dict | No
         ml_risk["auto_reject"] = True
         ml_risk["needs_confirmation"] = False
         decision_reasons.append("manual_very_high_risk_auto_reject")
-    if not ml_risk.get("auto_reject") and risk_score >= 0.5 and not ml_risk.get("needs_confirmation"):
+    if (
+        not ml_risk.get("auto_reject")
+        and payload.get("source") != "context_range"
+        and risk_score >= 0.5
+        and not ml_risk.get("needs_confirmation")
+    ):
         ml_risk["needs_confirmation"] = True
         decision_reasons.append("manual_medium_or_high_risk_score")
     if decision_reasons:
@@ -1787,7 +1885,18 @@ def run_microphone(args: argparse.Namespace) -> int:
                             empty_final_count = 0
                             console.status("распознаю")
                             recognition_time = time.monotonic()
-                            if address_detection_enabled:
+                            range_sync = None
+                            if scripture_range_reading_active(args):
+                                range_sync = sync_scripture_range_reading(args)
+                                logger.write("SCRIPTURE_RANGE_SYNC", range_sync)
+                                if range_sync.get("manual_advance") or range_sync.get("manual_restore"):
+                                    if text_detector is not None:
+                                        text_detector.clear()
+                            long_passage_reading = scripture_range_reading_active(args)
+                            if address_recognition_allowed(
+                                address_detection_enabled,
+                                long_passage_reading,
+                            ):
                                 pipeline_payload = pipeline.process_text(
                                     text,
                                     asr_result=result,
@@ -1805,10 +1914,11 @@ def run_microphone(args: argparse.Namespace) -> int:
                                     (pipeline_payload.get("parsed") or {}).get("ref") or ""
                                 )
                                 text_detector.suppress_after_address(explicit_ref, recognition_time)
-                            long_passage_reading = scripture_range_reading_active(args)
                             plan_match = None
                             # Явно названный адрес всегда важнее строки плана.
-                            plan_requires_approval = bool(args.require_approval or args.semi_auto_approval)
+                            plan_search_with_review = bool(
+                                args.require_approval or args.semi_auto_approval
+                            )
                             if (
                                 sermon_plan is not None
                                 and not pipeline_payload.get("matched")
@@ -1821,11 +1931,15 @@ def run_microphone(args: argparse.Namespace) -> int:
                                     sermon_plan["slides"],
                                     [" ".join(speech_parts), text],
                                     current_index=int(sermon_plan["next_index"]),
-                                    threshold=0.52 if plan_requires_approval else 0.68,
-                                    min_content_words=2 if plan_requires_approval else 4,
-                                    min_target_coverage=0.35 if plan_requires_approval else 0.65,
+                                    threshold=0.52 if plan_search_with_review else 0.68,
+                                    min_content_words=2 if plan_search_with_review else 4,
+                                    min_target_coverage=0.35 if plan_search_with_review else 0.65,
                                 )
                             if plan_match:
+                                plan_requires_approval = sermon_plan_match_requires_approval(
+                                    args,
+                                    plan_match,
+                                )
                                 if text_detector is not None:
                                     text_detector.clear()
                                 if plan_requires_approval:

@@ -962,6 +962,56 @@ def scripture_range_reading_active(args: Any) -> bool:
     return isinstance(state, dict) and bool(state.get("targets"))
 
 
+def sync_scripture_range_reading(args: Any) -> dict:
+    """Synchronize manual Holyrics navigation with the active long passage."""
+    state = getattr(args, "_holyrics_scripture_range_reading", None)
+    if not isinstance(state, dict):
+        return {"active": False, "reason": "inactive"}
+    current = get_holyrics_current_presentation(
+        args,
+        str(getattr(args, "holyrics_url", "")).rstrip("/"),
+    )
+    if current is None:
+        return {"active": True, "reason": "current_presentation_unavailable"}
+
+    current_type = str(current.get("type") or "").strip()
+    current_text_id = str(current.get("text_id") or current.get("id") or "").strip()
+    sermon_plan = getattr(args, "_holyrics_sermon_plan_presentation", None)
+    sermon_plan_id = ""
+    if isinstance(sermon_plan, dict):
+        sermon_plan_id = str(sermon_plan.get("text_id") or sermon_plan.get("id") or "").strip()
+    if current_type == "text" and sermon_plan_id and current_text_id == sermon_plan_id:
+        try:
+            slide_index = max(0, int(current.get("slide_number") or 1) - 1)
+        except (TypeError, ValueError):
+            slide_index = int(sermon_plan.get("current_index") or 0)
+        sermon_plan["current_index"] = slide_index
+        sermon_plan["next_index"] = slide_index + 1
+        clear_scripture_range_reading(args)
+        return {
+            "active": False,
+            "manual_restore": True,
+            "reason": "sermon_plan_restored_manually",
+            "slide_index": slide_index,
+        }
+
+    targets = list(state.get("targets") or [])
+    try:
+        current_index = int(current.get("slide_number") or 1) - 1
+    except (TypeError, ValueError):
+        return {"active": True, "reason": "current_slide_unknown"}
+    if current_type == "quick_presentation" and 0 <= current_index < len(targets):
+        previous_index = int(state.get("current_index") or 0)
+        state["current_index"] = current_index
+        return {
+            "active": True,
+            "manual_advance": current_index != previous_index,
+            "reason": "long_passage_slide_synchronized",
+            "current_index": current_index,
+        }
+    return {"active": True, "reason": "long_passage_still_active"}
+
+
 def handle_scripture_range_reading_match(args: Any, candidate: Any) -> dict:
     """Advance a long-passage slide when its final verse was just read."""
     state = getattr(args, "_holyrics_scripture_range_reading", None)
