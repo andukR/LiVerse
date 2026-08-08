@@ -868,6 +868,10 @@ def resolve_holyrics_theme_id(args: Any, base_url: str, theme_name: str) -> tupl
 
 
 def current_bible_theme_filter(args: Any, base_url: str) -> dict[str, str]:
+    sermon_plan_theme_id = str(getattr(args, "_holyrics_sermon_plan_theme_id", "") or "").strip()
+    if sermon_plan_theme_id:
+        return {"id": sermon_plan_theme_id}
+
     selected_theme_id = str(getattr(args, "_holyrics_theme_id", "") or "").strip()
     if selected_theme_id:
         return {"id": selected_theme_id}

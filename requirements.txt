@@ -5,3 +5,4 @@ pysword
 pymorphy3
 pymorphy3-dicts-ru
 rapidfuzz
+words2numsrus==0.1.0

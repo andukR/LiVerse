@@ -4,12 +4,14 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from bible_parser_core.live_pipeline import LiveReferencePipeline, build_grammar
+from bible_parser_core.parser import normalize_text
 from bible_parser_core.risk_model import load_risk_model, score_payload_with_model
 from tools.holyrics import (
     cross_chapter_quick_presentation_slides,
     handle_scripture_range_reading_match,
     post_holyrics_url,
     restore_holyrics_presentation,
+    scripture_range_quick_presentation_body,
     scripture_range_quick_presentation_slides,
     scripture_range_reading_active,
     scripture_range_reading_state,
@@ -17,6 +19,98 @@ from tools.holyrics import (
 
 
 class LiveReferencePipelineTest(unittest.TestCase):
+    def test_sermon_plan_startup_does_not_request_theme_list(self):
+        from tools.vosk_grammar_probe import ask_holyrics_theme_name
+
+        args = SimpleNamespace(slide_output="holyrics", text=None, sermon_plan=True)
+        with (
+            patch("tools.vosk_grammar_probe.sys.stdin.isatty", return_value=True),
+            patch("tools.vosk_grammar_probe.get_holyrics_theme_options") as get_themes,
+        ):
+            ask_holyrics_theme_name(args)
+
+        get_themes.assert_not_called()
+
+    def test_interactive_duration_uses_bare_seconds_and_russian_m_for_minutes(self):
+        from tools.vosk_grammar_probe import parse_holyrics_quick_duration_minutes
+
+        self.assertEqual(0.5, parse_holyrics_quick_duration_minutes("30"))
+        self.assertEqual(1.5, parse_holyrics_quick_duration_minutes("90"))
+        self.assertEqual(1.0, parse_holyrics_quick_duration_minutes("1м"))
+        self.assertEqual(0.5, parse_holyrics_quick_duration_minutes("0,5м"))
+        self.assertEqual(0.5, parse_holyrics_quick_duration_minutes("30s"))
+        self.assertEqual(2.0, parse_holyrics_quick_duration_minutes("2m"))
+
+    def test_long_range_uses_sermon_plan_theme(self):
+        args = SimpleNamespace(
+            _holyrics_sermon_plan_theme_id="plan-theme",
+            holyrics_theme="unused-fallback",
+        )
+        payload = {
+            "ref": "1 Иоанна 2:1-20",
+            "book": "1 Иоанна",
+            "chapter": 2,
+            "start_verse": 1,
+            "end_verse": 20,
+            "verse": "2:1. Начало\n2:20. Конец",
+        }
+
+        body = scripture_range_quick_presentation_body(args, "http://127.0.0.1:8091", payload)
+
+        self.assertIsNotNone(body)
+        self.assertEqual({"id": "plan-theme"}, body.get("theme"))
+
+    def test_words2numsrus_normalizes_inflected_compound_numbers_safely(self):
+        self.assertEqual(
+            "в 121 стих",
+            normalize_text("в ста двадцати первом стихе"),
+        )
+        self.assertEqual(
+            "в 22 стих",
+            normalize_text("в двадцатью двумя стихе"),
+        )
+        self.assertEqual("семью детьми", normalize_text("семью детьми"))
+        self.assertEqual("3 16", normalize_text("три шестнадцать"))
+
+    def test_successfully_shown_long_range_automatically_selects_context(self):
+        from tools.vosk_grammar_probe import action_selects_context
+
+        slide = {
+            "book": "1 Иоанна",
+            "chapter": 2,
+            "start_verse": 10,
+            "end_chapter": 2,
+            "end_verse": 15,
+        }
+
+        self.assertTrue(action_selects_context("sent", slide))
+        self.assertTrue(action_selects_context("approve", slide))
+        self.assertFalse(action_selects_context("waiting", slide))
+
+        pipeline = LiveReferencePipeline()
+        self.assertTrue(pipeline.set_context_range(slide))
+        result = pipeline.process_text("четырнадцатая стих")
+        self.assertEqual("1 Иоанна 2:14", result.get("parsed", {}).get("ref"))
+        self.assertEqual("context_range", result.get("source"))
+
+        result = pipeline.process_text("в четырнадцатом стихе")
+        self.assertEqual("1 Иоанна 2:14", result.get("parsed", {}).get("ref"))
+        self.assertEqual("context_range", result.get("source"))
+
+    def test_short_range_is_not_automatically_selected_as_context(self):
+        from tools.vosk_grammar_probe import action_selects_context
+
+        slide = {
+            "book": "1 Иоанна",
+            "chapter": 2,
+            "start_verse": 10,
+            "end_chapter": 2,
+            "end_verse": 13,
+        }
+
+        self.assertFalse(action_selects_context("sent", slide))
+        self.assertTrue(action_selects_context("approve_context", slide))
+
     def test_sermon_plan_candidate_keeps_slide_data_and_operator_wording(self):
         from tools import slide_server
 
@@ -115,6 +209,47 @@ class LiveReferencePipelineTest(unittest.TestCase):
         result = pipeline.process_text("духовное детство радость спасения двенадцатый стих")
 
         self.assertEqual("1 Иоанна 2:12", result.get("parsed", {}).get("ref"))
+        self.assertEqual("context_range", result.get("source"))
+
+    def test_context_range_resolves_spoken_subranges(self):
+        context = {
+            "book": "Колоссянам",
+            "chapter": 3,
+            "start_verse": 6,
+            "end_chapter": 3,
+            "end_verse": 14,
+        }
+        for text, expected in (
+            ("апостол павел в седьмом восьмом стихе пишет", "Колоссянам 3:7-8"),
+            ("прочитаем шестого до седьмого стиха", "Колоссянам 3:6-7"),
+            ("прочитаем с шестого до седьмого стиха", "Колоссянам 3:6-7"),
+            ("прочитаем шестой седьмой стих", "Колоссянам 3:6-7"),
+            ("в девятом и десятом стихи апостол павел пишет", "Колоссянам 3:9-10"),
+        ):
+            with self.subTest(text=text):
+                pipeline = LiveReferencePipeline()
+                self.assertTrue(pipeline.set_context_range(context))
+                result = pipeline.process_text(text)
+                self.assertEqual(expected, result.get("parsed", {}).get("ref"))
+                self.assertEqual("context_range", result.get("source"))
+
+    def test_context_range_does_not_treat_compact_chapter_verse_as_subrange(self):
+        pipeline = LiveReferencePipeline()
+        self.assertTrue(
+            pipeline.set_context_range(
+                {
+                    "book": "Иоанн",
+                    "chapter": 3,
+                    "start_verse": 1,
+                    "end_chapter": 3,
+                    "end_verse": 20,
+                }
+            )
+        )
+
+        result = pipeline.process_text("три шестнадцать стих")
+
+        self.assertEqual("Иоанн 3:16", result.get("parsed", {}).get("ref"))
         self.assertEqual("context_range", result.get("source"))
 
     def test_context_range_does_not_override_explicit_other_book(self):
@@ -444,7 +579,10 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertIn("по", grammar)
         self.assertIn("слова", grammar)
         self.assertIn("четвёртого", grammar)
+        self.assertIn("четвёртом", grammar)
         self.assertIn("четвёртая", grammar)
+        self.assertNotIn("четвертом", grammar)
+        self.assertNotIn("сотом", grammar)
         self.assertIn("следующей", grammar)
         self.assertIn("следующий", grammar)
 
@@ -1336,6 +1474,26 @@ class LiveReferencePipelineTest(unittest.TestCase):
             with self.subTest(text=text):
                 result = pipeline.process_text(text)
                 self.assertEqual("Колоссянам", result.get("parsed", {}).get("book"))
+
+    def test_colossians_new_phonetic_forms_keep_long_range(self):
+        for book_words in ("кол ось яна", "ко лось яна", "кол сям"):
+            with self.subTest(book_words=book_words):
+                pipeline = LiveReferencePipeline()
+                result = pipeline.process_text(
+                    f"послание {book_words} третья глава с первого по десятое стих"
+                )
+                self.assertEqual("Колоссянам 3:1-10", result.get("parsed", {}).get("ref"))
+
+    def test_bare_poslanie_syam_does_not_become_first_john(self):
+        pipeline = LiveReferencePipeline()
+
+        pipeline.process_text("сегодняшнее проповедь будет по отрыв ко из")
+        result = pipeline.process_text(
+            "послание сям третья глава с первого по десятое стих"
+        )
+
+        self.assertFalse(result.get("matched"))
+        self.assertEqual("unrecognized_epistle_book", result.get("blocked_weak_context"))
 
     def test_colossians_chapter_without_verse_does_not_become_philemon(self):
         pipeline = LiveReferencePipeline()

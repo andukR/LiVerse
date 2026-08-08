@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from bible_parser_core.book_aliases import book_synonyms
-from bible_parser_core.parser import DEFAULT_BIBLE, NUMBER_WORDS, ParsedReference, book_candidates, normalize_text, parse_live_reference
+from bible_parser_core.parser import DEFAULT_BIBLE, NUMBER_WORDS, ORDINALS, ParsedReference, book_candidates, normalize_text, parse_live_reference
 from bible_parser_core.parser import diagnose_invalid_reference
 from bible_parser_core.reference_resolver import (
     resolve_best_reference_candidate,
@@ -65,6 +65,7 @@ VOSK_GRAMMAR_EXTRA_WORDS = {
     "четвёртого",
     "четвёртое",
     "четвёртой",
+    "четвёртом",
     "четвёртую",
     "четвёртые",
     "четвёртый",
@@ -126,6 +127,7 @@ VOSK_SMALL_RU_MISSING_WORDS = {
     "софонии",
     "софония",
     "сотого",
+    "сотом",
     "тринадцатые",
     "фесалоникийцам",
     "фессалоникийцам",
@@ -135,6 +137,7 @@ VOSK_SMALL_RU_MISSING_WORDS = {
     "цартвтретья",
     "четвертая",
     "четвертого",
+    "четвертом",
     "четвертое",
     "четвертой",
     "четвертую",
@@ -144,6 +147,10 @@ VOSK_SMALL_RU_MISSING_WORDS = {
     "шестнадцатые",
 }
 BLOCKED_CONTEXT_MESSAGES = {
+    "unrecognized_epistle_book": (
+        "Название послания не было распознано достаточно надёжно. "
+        "Повторите адрес или выберите книгу вручную."
+    ),
     "ambiguous_unnumbered_thessalonians": (
         "Номер книги не был назван или не был распознан программой. "
         "Введите номер послания Фессалоникийцам вручную."
@@ -977,6 +984,12 @@ def should_block_matched_payload(payload: dict) -> str | None:
         if re.search(rf"\bевангелие\s+от\s+{marker}\b", normalized) and not ref.startswith(book):
             return "gospel_book_conflict"
 
+    if (
+        re.search(r"\bпослани[ея]\s+сям\b", normalized)
+        and not re.search(r"\bкол\s+сям\b", raw_text)
+    ):
+        return "unrecognized_epistle_book"
+
     thessalonian_form = r"(?:фес+с?\s+салон(?:ик|ики)?(?:\s+царств)?|фессалоникийцам)"
     if (
         re.search(rf"\b{thessalonian_form}\b", normalized)
@@ -1441,6 +1454,50 @@ def context_chapter_for_verse(
     return None
 
 
+def context_chapter_for_verse_range(
+    context: dict,
+    start_verse: int,
+    end_verse: int,
+    *,
+    preferred_chapter: int | None = None,
+) -> int | None:
+    if start_verse > end_verse:
+        return None
+    if (
+        preferred_chapter is not None
+        and context_range_contains(context, preferred_chapter, start_verse)
+        and context_range_contains(context, preferred_chapter, end_verse)
+    ):
+        return preferred_chapter
+    for chapter in range(int(context["chapter"]), int(context["end_chapter"]) + 1):
+        if (
+            context_range_contains(context, chapter, start_verse)
+            and context_range_contains(context, chapter, end_verse)
+        ):
+            return chapter
+    return None
+
+
+def contextual_spoken_verse_range(text: str, normalized: str) -> tuple[int, int] | None:
+    connected = re.search(
+        r"\b(?:с\s+)?(?P<start>\d{1,3})\s+(?:по|до|и)\s+"
+        r"(?P<end>\d{1,3})\s+стих\w*\b",
+        normalized,
+    )
+    if connected:
+        return int(connected.group("start")), int(connected.group("end"))
+
+    raw_words = re.findall(r"[а-я]+", text.lower().replace("ё", "е"))
+    for start_word, end_word, marker in zip(raw_words, raw_words[1:], raw_words[2:]):
+        if not marker.startswith("стих"):
+            continue
+        start_verse = ORDINALS.get(start_word)
+        end_verse = ORDINALS.get(end_word)
+        if start_verse is not None and end_verse is not None:
+            return int(start_verse), int(end_verse)
+    return None
+
+
 def contextual_short_reference(
     text: str,
     context: dict | None,
@@ -1455,33 +1512,49 @@ def contextual_short_reference(
         return None
 
     chapter: int | None = None
-    verse: int | None = None
+    start_verse: int | None = None
+    end_verse: int | None = None
+    spoken_range = contextual_spoken_verse_range(text, normalized)
+    if spoken_range:
+        start_verse, end_verse = spoken_range
     for pattern in (
         r"\b(?P<verse>\d{1,3})\s+стих\w*\s+(?P<chapter>\d{1,3})\s+глав\w*\b",
         r"\b(?P<chapter>\d{1,3})\s+глав\w*\s+(?P<verse>\d{1,3})(?:\s+стих\w*)?\b",
         r"\b(?P<verse>\d{1,3})\s+(?P<chapter>\d{1,3})\s+глав\w*\b",
     ):
+        if start_verse is not None:
+            break
         match = re.search(pattern, normalized)
         if match:
             chapter = int(match.group("chapter"))
-            verse = int(match.group("verse"))
+            start_verse = end_verse = int(match.group("verse"))
             break
 
-    if verse is None:
+    if start_verse is None:
         verse_match = re.search(r"\b(?P<verse>\d{1,3})\s+стих\w*\b", normalized)
         if verse_match:
-            verse = int(verse_match.group("verse"))
+            start_verse = end_verse = int(verse_match.group("verse"))
         elif re.fullmatch(r"\s*\d{1,3}\s*", normalized):
-            verse = int(normalized.strip())
-    if verse is None:
+            start_verse = end_verse = int(normalized.strip())
+    if start_verse is None or end_verse is None:
         return None
 
     if chapter is None:
-        chapter = context_chapter_for_verse(context, verse, preferred_chapter=preferred_chapter)
-    if chapter is None or not context_range_contains(context, chapter, verse):
+        chapter = context_chapter_for_verse_range(
+            context,
+            start_verse,
+            end_verse,
+            preferred_chapter=preferred_chapter,
+        )
+    if (
+        chapter is None
+        or not context_range_contains(context, chapter, start_verse)
+        or not context_range_contains(context, chapter, end_verse)
+    ):
         return None
 
-    parsed = parse_live_reference(f"{context['book']} {chapter}:{verse}", bible_path=bible_path)
+    verse_part = str(start_verse) if start_verse == end_verse else f"{start_verse}-{end_verse}"
+    parsed = parse_live_reference(f"{context['book']} {chapter}:{verse_part}", bible_path=bible_path)
     if parsed is None:
         return None
     return {

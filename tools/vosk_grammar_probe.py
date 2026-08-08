@@ -57,6 +57,7 @@ from tools.holyrics import (
     get_holyrics_theme_options,
     handle_scripture_range_reading_match,
     show_holyrics_text_slide,
+    scripture_range,
     scripture_range_reading_active,
     post_holyrics_update,
 )
@@ -255,6 +256,10 @@ def ask_holyrics_theme_name(args: argparse.Namespace) -> None:
     if not holyrics_output_enabled(args) or args.text or not sys.stdin.isatty():
         return
 
+    if getattr(args, "sermon_plan", False):
+        print("Holyrics: тема стихов будет взята из текущей презентации плана проповеди.", flush=True)
+        return
+
     if getattr(args, "_liverse_skip_holyrics_theme_question", False):
         theme = str(getattr(args, "holyrics_theme", "") or "").strip()
         if theme:
@@ -330,12 +335,12 @@ def parse_holyrics_quick_duration_minutes(value: str, *, default_minutes: float 
     raw = value.strip().replace(",", ".").casefold()
     if not raw:
         return default_minutes
-    seconds_match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*(?:s|sec|secs|сек|секунд[аы]?|с)", raw)
-    if seconds_match:
-        return float(seconds_match.group(1)) / 60.0
-    minutes_match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*(?:m|min|mins|мин|минут[аы]?)?", raw)
+    minutes_match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*(?:м|m|min|mins|мин|минут[аы]?)", raw)
     if minutes_match:
         return float(minutes_match.group(1))
+    seconds_match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*(?:s|sec|secs|сек|секунд[аы]?|с)?", raw)
+    if seconds_match:
+        return float(seconds_match.group(1)) / 60.0
     return None
 
 
@@ -371,11 +376,11 @@ def ask_holyrics_quick_presentation_minutes(args: argparse.Namespace) -> None:
     print("Введите время показа цитаты.", flush=True)
     default_minutes = current if current > 0 else 1.0
     print(f"Enter — {format_holyrics_quick_duration(default_minutes)}; 0 — не закрывать автоматически.", flush=True)
-    print("Можно ввести минуты: 1, 0.5; или секунды: 30s, 30 сек.", flush=True)
+    print("Введите секунды обычным числом: 30. Для минут добавьте русскую «м»: 1м, 0,5м.", flush=True)
     while True:
         minutes = parse_holyrics_quick_duration_minutes(input("> "), default_minutes=default_minutes)
         if minutes is None:
-            print("Введите число минут, например 1 или 0.5, либо секунды, например 30s или 30 сек.", flush=True)
+            print("Введите секунды числом, например 30, либо минуты с русской «м», например 1м.", flush=True)
             continue
         if minutes < 0:
             print("Введите 0 или положительное время.", flush=True)
@@ -648,14 +653,17 @@ def ask_run_mode() -> str:
             return "auto"
 
 
-def ask_priority_run_mode(settings: dict) -> tuple[str, bool]:
+def ask_priority_run_mode(settings: dict, *, sermon_plan: bool = False) -> tuple[str, bool]:
     print("Режим работы LiVerse", flush=True)
     if settings:
         print("Остальные настройки будут взяты из прошлого запуска.", flush=True)
         print(f"Последний режим: {run_mode_label(str(settings.get('run_mode') or 'semi_auto'))}", flush=True)
         print(f"Подтверждение: {approval_ui_label(str(settings.get('approval_ui') or 'web'))}", flush=True)
-        theme = str(settings.get("holyrics_theme") or "").strip()
-        print(f"Тема Holyrics: {theme or 'Bible module по умолчанию'}", flush=True)
+        if sermon_plan:
+            print("Тема Holyrics: из текущей презентации плана проповеди", flush=True)
+        else:
+            theme = str(settings.get("holyrics_theme") or "").strip()
+            print(f"Тема Holyrics: {theme or 'Bible module по умолчанию'}", flush=True)
         try:
             quick_minutes = float(settings.get("holyrics_quick_minutes") or 0.0)
         except (TypeError, ValueError):
@@ -718,7 +726,7 @@ def configure_interactive_approval_mode(args: argparse.Namespace) -> None:
         full_setup = False
         print("Полуавтоматический режим включён параметром --semi-auto-approval.", flush=True)
     else:
-        mode, full_setup = ask_priority_run_mode(settings)
+        mode, full_setup = ask_priority_run_mode(settings, sermon_plan=args.sermon_plan)
     apply_run_mode(args, mode)
 
     setattr(args, "_liverse_full_startup_setup", full_setup)
@@ -1295,7 +1303,7 @@ def start_slide_server_if_needed(args: argparse.Namespace, pipeline: LiveReferen
                 return ok, reason
         if args.slide_output in {"web", "both"}:
             set_current_slide(candidate)
-        if action == "approve_context" and pipeline is not None:
+        if pipeline is not None and action_selects_context(action, candidate):
             pipeline.set_context_range(candidate)
         return True, ""
 
@@ -1356,6 +1364,13 @@ def approval_action(output: dict) -> str:
     if output.get("holyrics", {}).get("ok") or output.get("web", {}).get("ok"):
         return "sent"
     return "recognized"
+
+
+def action_selects_context(action: str, slide: dict) -> bool:
+    """Make a successfully shown long passage the current Bible context."""
+    if action not in {"sent", "approve", "approve_context"}:
+        return False
+    return action == "approve_context" or scripture_range(slide) is not None
 
 
 def output_failure_reason(output: dict) -> str:
@@ -1926,16 +1941,27 @@ def run_microphone(args: argparse.Namespace) -> int:
                             payload["output"] = publish_payload(output_args, payload)
                             if payload.get("slide"):
                                 action = approval_action(payload["output"])
-                                if action == "approve_context" and pipeline.set_context_range(payload["slide"]):
+                                context_selected = (
+                                    action_selects_context(action, payload["slide"])
+                                    and pipeline.set_context_range(payload["slide"])
+                                )
+                                if context_selected:
                                     logger.write(
                                         "context_range_selected",
-                                        {"ref": payload["slide"].get("ref"), "source": "popup"},
+                                        {
+                                            "ref": payload["slide"].get("ref"),
+                                            "source": (
+                                                "operator"
+                                                if action == "approve_context"
+                                                else "automatic_long_range"
+                                            ),
+                                        },
                                     )
                                 append_session_reference(session_refs, payload, action=action)
                                 ref = str((payload.get("parsed") or {}).get("ref") or payload["slide"].get("ref"))
                                 if action == "waiting":
                                     console.status(f"найдена ссылка {ref}, ожидает подтверждения")
-                                elif action == "approve_context":
+                                elif context_selected:
                                     console.status(f"контекстный отрывок запомнен: {ref}")
                                 elif action == "approve":
                                     console.status(f"отправлено в Holyrics: {ref}")
