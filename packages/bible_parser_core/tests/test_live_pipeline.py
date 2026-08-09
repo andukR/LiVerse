@@ -516,6 +516,8 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertEqual("context_range", result.get("source"))
 
     def test_context_range_resolves_spoken_subranges(self):
+        from tools.vosk_grammar_probe import action_selects_context, add_slide_payload
+
         context = {
             "book": "Колоссянам",
             "chapter": 3,
@@ -536,6 +538,33 @@ class LiveReferencePipelineTest(unittest.TestCase):
                 result = pipeline.process_text(text)
                 self.assertEqual(expected, result.get("parsed", {}).get("ref"))
                 self.assertEqual("context_range", result.get("source"))
+                slide = add_slide_payload(result)["slide"]
+                self.assertNotIn("can_set_context", slide)
+                self.assertFalse(action_selects_context("approve_context", slide))
+
+    def test_long_context_subrange_does_not_replace_main_context(self):
+        from tools.vosk_grammar_probe import action_selects_context, add_slide_payload
+
+        pipeline = LiveReferencePipeline()
+        self.assertTrue(
+            pipeline.set_context_range(
+                {
+                    "book": "Колоссянам",
+                    "chapter": 3,
+                    "start_verse": 1,
+                    "end_chapter": 3,
+                    "end_verse": 20,
+                }
+            )
+        )
+
+        payload = pipeline.process_text("прочитаем с пятого по девятый стих")
+        slide = add_slide_payload(payload)["slide"]
+
+        self.assertEqual("Колоссянам 3:5-9", slide["ref"])
+        self.assertNotIn("can_set_context", slide)
+        self.assertFalse(action_selects_context("approve", slide))
+        self.assertFalse(action_selects_context("approve_context", slide))
 
     def test_context_range_does_not_treat_compact_chapter_verse_as_subrange(self):
         pipeline = LiveReferencePipeline()

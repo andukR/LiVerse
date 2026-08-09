@@ -1177,7 +1177,10 @@ def add_slide_payload(payload: dict) -> dict:
         end_verse = int(parsed.get("end_verse") or 0)
     except (TypeError, ValueError):
         chapter = start_verse = end_chapter = end_verse = 0
-    if end_chapter > chapter or (end_chapter == chapter and end_verse > start_verse):
+    if (
+        source != "context_range"
+        and (end_chapter > chapter or (end_chapter == chapter and end_verse > start_verse))
+    ):
         payload["slide"]["can_set_context"] = True
     alternatives = []
     for alternative in payload.get("ambiguous_alternatives") or []:
@@ -1756,6 +1759,8 @@ def approval_action(output: dict) -> str:
 def action_selects_context(action: str, slide: dict) -> bool:
     """Make a successfully shown long passage the current Bible context."""
     if action not in {"sent", "approve", "approve_context"}:
+        return False
+    if str(slide.get("source") or "").removeprefix("vosk:") == "context_range":
         return False
     return action == "approve_context" or scripture_range(slide) is not None
 
