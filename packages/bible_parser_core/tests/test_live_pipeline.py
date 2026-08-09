@@ -100,6 +100,42 @@ class LiveReferencePipelineTest(unittest.TestCase):
             permissions,
         )
 
+    def test_full_startup_setup_reopens_holyrics_wizard_and_keeps_token(self):
+        import os
+        import tempfile
+
+        from tools.holyrics import load_env_file
+        from tools.vosk_grammar_probe import run_holyrics_first_setup
+
+        args = SimpleNamespace(
+            slide_output="holyrics",
+            text=None,
+            holyrics_token="saved-token",
+            holyrics_url="http://localhost:8091",
+            sermon_plan=True,
+            holyrics_theme="",
+            _liverse_full_startup_setup=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            env_path = Path(directory) / ".env"
+            env_path.write_text(
+                "HOLYRICS_TOKEN=saved-token\nHOLYRICS_PORT=8091\n",
+                encoding="utf-8",
+            )
+            fake_stdin = SimpleNamespace(isatty=lambda: True)
+            with (
+                patch.dict(os.environ, {"LIVE_VERSE_VOSK_ENV": str(env_path)}),
+                patch("tools.vosk_grammar_probe.sys.stdin", fake_stdin),
+                patch("tools.vosk_grammar_probe.getpass.getpass", return_value=""),
+                patch("tools.vosk_grammar_probe.env_setting", return_value="8091"),
+                patch("builtins.input", return_value=""),
+                patch("builtins.print"),
+            ):
+                run_holyrics_first_setup(args)
+
+            self.assertEqual("saved-token", args.holyrics_token)
+            self.assertEqual("saved-token", load_env_file(env_path)["HOLYRICS_TOKEN"])
+
     def test_holyrics_env_save_preserves_unrelated_settings(self):
         import tempfile
 

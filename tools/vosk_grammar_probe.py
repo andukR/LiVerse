@@ -238,20 +238,28 @@ def holyrics_output_enabled(args: argparse.Namespace) -> bool:
 
 
 def run_holyrics_first_setup(args: argparse.Namespace) -> None:
-    if not holyrics_output_enabled(args) or args.text or args.holyrics_token:
+    if not holyrics_output_enabled(args) or args.text:
         return
     if not sys.stdin.isatty():
         return
+    existing_token = str(getattr(args, "holyrics_token", "") or "").strip()
+    full_setup = bool(getattr(args, "_liverse_full_startup_setup", False))
+    if existing_token and not full_setup:
+        return
 
     print("", flush=True)
-    print("Первичная настройка HoLyrics для LiVerse", flush=True)
-    print("LiVerse не нашёл HOLYRICS_TOKEN в файле .env.", flush=True)
+    print("Настройка HoLyrics для LiVerse", flush=True)
+    if existing_token:
+        print("HOLYRICS_TOKEN уже записан. Повторно проверим все шаги настройки.", flush=True)
+    else:
+        print("LiVerse не нашёл HOLYRICS_TOKEN в файле .env.", flush=True)
     print("", flush=True)
     print("1. Запустите HoLyrics.", flush=True)
     print("2. Откройте File -> Settings -> API Server.", flush=True)
     print(f"3. Включите API Server Local. Обычный порт: {DEFAULT_PORT}.", flush=True)
-    print("4. Откройте Manage permissions и нажмите Add (Добавить).", flush=True)
-    print("5. Для нового token поставьте галочки в столбце Local:", flush=True)
+    print("4. Откройте Manage permissions.", flush=True)
+    print("   Выберите существующий token либо нажмите Add (Добавить) для нового.", flush=True)
+    print("5. Для выбранного token поставьте галочки в столбце Local:", flush=True)
     for permission in required_holyrics_permissions(args):
         print(f"   [ ] {permission}", flush=True)
     print("6. Сохраните разрешения и скопируйте созданный token.", flush=True)
@@ -261,9 +269,13 @@ def run_holyrics_first_setup(args: argparse.Namespace) -> None:
         "только к отмеченным действиям HoLyrics.",
         flush=True,
     )
-    print("Вставьте token. Символы при вводе не отображаются.", flush=True)
-    print("Чтобы отложить настройку до следующего запуска, нажмите Enter.", flush=True)
-    token = getpass.getpass("> ").strip()
+    if existing_token:
+        print("Enter — оставить записанный token; для замены вставьте новый.", flush=True)
+    else:
+        print("Вставьте token. Символы при вводе не отображаются.", flush=True)
+        print("Чтобы отложить настройку до следующего запуска, нажмите Enter.", flush=True)
+    entered_token = getpass.getpass("> ").strip()
+    token = entered_token or existing_token
     if not token:
         print("Настройка HoLyrics отложена. LiVerse продолжит работу без вывода слайдов.", flush=True)
         return
@@ -271,20 +283,26 @@ def run_holyrics_first_setup(args: argparse.Namespace) -> None:
         print("Token не сохранён: он должен состоять из одной строки.", flush=True)
         return
 
-    print(f"Введите порт API Server Local. Enter — {DEFAULT_PORT}.", flush=True)
+    try:
+        default_port = int(env_setting("HOLYRICS_PORT", str(DEFAULT_PORT)) or DEFAULT_PORT)
+    except ValueError:
+        default_port = DEFAULT_PORT
+    if not 1 <= default_port <= 65535:
+        default_port = DEFAULT_PORT
+    print(f"Введите порт API Server Local. Enter — {default_port}.", flush=True)
     while True:
         raw_port = input("> ").strip()
         if not raw_port:
-            port = DEFAULT_PORT
+            port = default_port
             break
         try:
             port = int(raw_port)
         except ValueError:
-            print(f"Введите целое число от 1 до 65535 или Enter для порта {DEFAULT_PORT}.", flush=True)
+            print(f"Введите целое число от 1 до 65535 или Enter для порта {default_port}.", flush=True)
             continue
         if 1 <= port <= 65535:
             break
-        print(f"Введите целое число от 1 до 65535 или Enter для порта {DEFAULT_PORT}.", flush=True)
+        print(f"Введите целое число от 1 до 65535 или Enter для порта {default_port}.", flush=True)
 
     try:
         env_path = save_holyrics_env(token, port)
