@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import queue
@@ -49,6 +50,7 @@ from bible_parser_core.text_citation_detector import (
 from bible_parser_core.verse_text_search import CANONICAL_BOOK_NAMES_BY_ID
 from bible_parser_core.version import __version__
 from tools.holyrics import (
+    DEFAULT_PORT,
     MIN_RECOMMENDED_HOLYRICS_VERSION,
     REQUIRED_HOLYRICS_PERMISSIONS,
     THEME_HOLYRICS_PERMISSIONS,
@@ -64,13 +66,14 @@ from tools.holyrics import (
     scripture_range_reading_active,
     sync_scripture_range_reading,
     post_holyrics_update,
+    required_holyrics_permissions,
+    save_holyrics_env,
 )
 
 
 DEFAULT_MODEL_PATH = Path.cwd() / "models" / "vosk-model-small-ru-0.22"
 DEFAULT_LOG_DIR = Path.cwd() / ".cache" / "liverse" / "vosk_probe"
 DEFAULT_TEXT_DETECTION_DB = PROJECT_ROOT / "bible_index" / "bible_index.db"
-HOLYRICS_SETUP_NOTICE_MARKER = Path.cwd() / ".cache" / "liverse" / "holyrics_setup_notice_shown"
 STARTUP_SETTINGS_ENV = "LIVERSE_STARTUP_SETTINGS"
 UPDATE_REPO_URL = "https://github.com/andukR/LiVerse.git"
 UPDATE_BRANCH = "main"
@@ -234,30 +237,69 @@ def holyrics_output_enabled(args: argparse.Namespace) -> bool:
     return args.slide_output in {"holyrics", "both"}
 
 
-def print_holyrics_setup_notice_once(args: argparse.Namespace) -> None:
-    if not holyrics_output_enabled(args) or HOLYRICS_SETUP_NOTICE_MARKER.exists():
+def run_holyrics_first_setup(args: argparse.Namespace) -> None:
+    if not holyrics_output_enabled(args) or args.text or args.holyrics_token:
         return
-    if os.name != "nt":
+    if not sys.stdin.isatty():
         return
 
     print("", flush=True)
-    print("Первичная настройка Holyrics для LiVerse", flush=True)
-    print("Включите Holyrics API Server Local. Порт по умолчанию: 8091.", flush=True)
-    print("Если в Holyrics указан другой порт, запишите его в .env как HOLYRICS_PORT.", flush=True)
-    print("Откройте Holyrics -> Settings -> API Server -> Manage permissions.", flush=True)
-    print("Для API token, указанного в HOLYRICS_TOKEN, включите разрешения:", flush=True)
-    for permission in REQUIRED_HOLYRICS_PERMISSIONS:
-        print(f"  - {permission}", flush=True)
+    print("Первичная настройка HoLyrics для LiVerse", flush=True)
+    print("LiVerse не нашёл HOLYRICS_TOKEN в файле .env.", flush=True)
+    print("", flush=True)
+    print("1. Запустите HoLyrics.", flush=True)
+    print("2. Откройте File -> Settings -> API Server.", flush=True)
+    print(f"3. Включите API Server Local. Обычный порт: {DEFAULT_PORT}.", flush=True)
+    print("4. Откройте Manage permissions и нажмите Add (Добавить).", flush=True)
+    print("5. Для нового token поставьте галочки в столбце Local:", flush=True)
+    for permission in required_holyrics_permissions(args):
+        print(f"   [ ] {permission}", flush=True)
+    print("6. Сохраните разрешения и скопируйте созданный token.", flush=True)
     print("", flush=True)
     print(
-        f"Проверьте версию Holyrics. Если версия ниже {MIN_RECOMMENDED_HOLYRICS_VERSION}, "
-        "обновите Holyrics с официальной страницы загрузки: https://holyrics.com.br/download.html",
+        "Token — это секретная строка, с помощью которой LiVerse получает доступ "
+        "только к отмеченным действиям HoLyrics.",
         flush=True,
     )
-    print("После проверки нажмите Enter.", flush=True)
-    input()
-    HOLYRICS_SETUP_NOTICE_MARKER.parent.mkdir(parents=True, exist_ok=True)
-    HOLYRICS_SETUP_NOTICE_MARKER.write_text("shown\n", encoding="utf-8")
+    print("Вставьте token. Символы при вводе не отображаются.", flush=True)
+    print("Чтобы отложить настройку до следующего запуска, нажмите Enter.", flush=True)
+    token = getpass.getpass("> ").strip()
+    if not token:
+        print("Настройка HoLyrics отложена. LiVerse продолжит работу без вывода слайдов.", flush=True)
+        return
+    if "\n" in token or "\r" in token:
+        print("Token не сохранён: он должен состоять из одной строки.", flush=True)
+        return
+
+    print(f"Введите порт API Server Local. Enter — {DEFAULT_PORT}.", flush=True)
+    while True:
+        raw_port = input("> ").strip()
+        if not raw_port:
+            port = DEFAULT_PORT
+            break
+        try:
+            port = int(raw_port)
+        except ValueError:
+            print(f"Введите целое число от 1 до 65535 или Enter для порта {DEFAULT_PORT}.", flush=True)
+            continue
+        if 1 <= port <= 65535:
+            break
+        print(f"Введите целое число от 1 до 65535 или Enter для порта {DEFAULT_PORT}.", flush=True)
+
+    try:
+        env_path = save_holyrics_env(token, port)
+    except OSError as exc:
+        print(f"LiVerse не смог сохранить .env: {exc}", flush=True)
+        return
+
+    args.holyrics_token = token
+    args.holyrics_url = f"http://localhost:{port}"
+    print(f"Настройки сохранены: {env_path}", flush=True)
+    print("LiVerse сейчас проверит соединение и сообщит, если какой-либо галочки не хватает.", flush=True)
+    print(
+        f"Если версия HoLyrics ниже {MIN_RECOMMENDED_HOLYRICS_VERSION}, обновите программу.",
+        flush=True,
+    )
 
 
 def ask_holyrics_theme_name(args: argparse.Namespace) -> None:
@@ -2582,7 +2624,7 @@ def main() -> int:
         check_and_offer_startup_update()
     configure_interactive_approval_mode(args)
     load_runtime_risk_model(args)
-    print_holyrics_setup_notice_once(args)
+    run_holyrics_first_setup(args)
     ask_holyrics_theme_name(args)
     ask_holyrics_quick_presentation_minutes(args)
     save_startup_settings(args)

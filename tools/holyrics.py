@@ -17,6 +17,7 @@ from urllib.parse import urlencode
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
 DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
+DEFAULT_ENV_EXAMPLE_PATH = PROJECT_ROOT / ".env.example"
 DEFAULT_HOST = "http://localhost"
 DEFAULT_PORT = 8091
 DEFAULT_TIMEOUT = 5.0
@@ -30,6 +31,7 @@ MIN_RECOMMENDED_HOLYRICS_VERSION = "2.28.1"
 HOLYRICS_JSLIB_DOC_URL = "https://github.com/holyrics/jslib/blob/main/README-en.md"
 REQUIRED_HOLYRICS_PERMISSIONS = (
     "GetAPIServerInfo",
+    "GetBibleSettings",
     "GetCurrentPresentation",
     "CloseCurrentPresentation",
     "SetBibleSettings",
@@ -138,6 +140,13 @@ def env_file_paths() -> list[Path]:
     return result
 
 
+def env_write_path() -> Path:
+    explicit_path = os.environ.get("LIVE_VERSE_VOSK_ENV")
+    if explicit_path:
+        return Path(explicit_path).expanduser()
+    return DEFAULT_ENV_PATH
+
+
 def load_env_file(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     if not path.exists():
@@ -154,6 +163,51 @@ def load_env_file(path: Path) -> dict[str, str]:
         if key:
             values[key] = parse_env_value(value)
     return values
+
+
+def save_holyrics_env(token: str, port: int, path: Path | None = None) -> Path:
+    selected_path = path or env_write_path()
+    if selected_path.exists():
+        lines = selected_path.read_text(encoding="utf-8").splitlines()
+    elif DEFAULT_ENV_EXAMPLE_PATH.exists():
+        lines = DEFAULT_ENV_EXAMPLE_PATH.read_text(encoding="utf-8").splitlines()
+    else:
+        lines = []
+
+    existing = load_env_file(selected_path)
+    values = {
+        "HOLYRICS_TOKEN": token.strip(),
+        "HOLYRICS_PORT": str(port),
+    }
+    if not existing.get("HOLYRICS_HOST") and not existing.get("HOLYRICS_URL"):
+        values["HOLYRICS_HOST"] = DEFAULT_HOST
+
+    written: set[str] = set()
+    updated_lines: list[str] = []
+    assignment_re = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
+    for line in lines:
+        match = assignment_re.match(line)
+        key = match.group(1) if match else ""
+        if key not in values:
+            updated_lines.append(line)
+            continue
+        if key not in written:
+            updated_lines.append(f"{key}={values[key]}")
+            written.add(key)
+
+    if updated_lines and updated_lines[-1].strip():
+        updated_lines.append("")
+    for key, value in values.items():
+        if key not in written:
+            updated_lines.append(f"{key}={value}")
+
+    selected_path.parent.mkdir(parents=True, exist_ok=True)
+    selected_path.write_text("\n".join(updated_lines).rstrip() + "\n", encoding="utf-8")
+    try:
+        selected_path.chmod(0o600)
+    except OSError:
+        pass
+    return selected_path
 
 
 def env_setting(name: str, default: str = "") -> str:

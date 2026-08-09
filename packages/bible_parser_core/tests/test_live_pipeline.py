@@ -39,6 +39,91 @@ class LiveReferencePipelineTest(unittest.TestCase):
             metadata["tool"]["setuptools"]["dynamic"]["version"]["attr"],
         )
 
+    def test_holyrics_first_setup_saves_env_and_updates_runtime_args(self):
+        import os
+        import tempfile
+
+        from tools.holyrics import load_env_file
+        from tools.vosk_grammar_probe import run_holyrics_first_setup
+
+        args = SimpleNamespace(
+            slide_output="holyrics",
+            text=None,
+            holyrics_token="",
+            holyrics_url="auto",
+            sermon_plan=True,
+            holyrics_theme="",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            env_path = Path(directory) / ".env"
+            fake_stdin = SimpleNamespace(isatty=lambda: True)
+            with (
+                patch.dict(os.environ, {"LIVE_VERSE_VOSK_ENV": str(env_path)}),
+                patch("tools.vosk_grammar_probe.sys.stdin", fake_stdin),
+                patch("tools.vosk_grammar_probe.getpass.getpass", return_value="secret-token"),
+                patch("builtins.input", return_value=""),
+                patch("builtins.print"),
+            ):
+                run_holyrics_first_setup(args)
+
+            self.assertEqual("secret-token", args.holyrics_token)
+            self.assertEqual("http://localhost:8091", args.holyrics_url)
+            self.assertEqual(
+                {
+                    "HOLYRICS_TOKEN": "secret-token",
+                    "HOLYRICS_HOST": "http://localhost",
+                    "HOLYRICS_PORT": "8091",
+                    "HOLYRICS_THEME": "",
+                },
+                load_env_file(env_path),
+            )
+
+    def test_holyrics_first_setup_lists_all_default_permissions(self):
+        from tools.holyrics import required_holyrics_permissions
+
+        permissions = required_holyrics_permissions(
+            SimpleNamespace(sermon_plan=True, holyrics_theme="")
+        )
+
+        self.assertEqual(
+            (
+                "GetAPIServerInfo",
+                "GetBibleSettings",
+                "GetCurrentPresentation",
+                "CloseCurrentPresentation",
+                "SetBibleSettings",
+                "ShowQuickPresentation",
+                "ShowText",
+                "ShowVerse",
+                "ActionGoToIndex",
+            ),
+            permissions,
+        )
+
+    def test_holyrics_env_save_preserves_unrelated_settings(self):
+        import tempfile
+
+        from tools.holyrics import load_env_file, save_holyrics_env
+
+        with tempfile.TemporaryDirectory() as directory:
+            env_path = Path(directory) / ".env"
+            env_path.write_text(
+                "HOLYRICS_TOKEN=old\nHOLYRICS_PORT=9000\nLIVERSE_SETTING=keep\n",
+                encoding="utf-8",
+            )
+
+            save_holyrics_env("new-token", 8091, env_path)
+
+            self.assertEqual(
+                {
+                    "HOLYRICS_TOKEN": "new-token",
+                    "HOLYRICS_PORT": "8091",
+                    "LIVERSE_SETTING": "keep",
+                    "HOLYRICS_HOST": "http://localhost",
+                },
+                load_env_file(env_path),
+            )
+
     def test_startup_update_detects_and_applies_newer_main_commit(self):
         import subprocess
         import tempfile
