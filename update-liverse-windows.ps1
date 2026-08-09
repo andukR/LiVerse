@@ -480,6 +480,10 @@ function Install-LiVerse {
     Write-Step "Installing LiVerse"
     Push-Location $TargetDir
     try {
+        $legacyMetadata = Join-Path $TargetDir "liverse.egg-info"
+        if (Test-Path $legacyMetadata) {
+            Remove-Item $legacyMetadata -Recurse -Force
+        }
         # Do not upgrade pip here. On this Windows 10 PC, replacing pip itself
         # caused intermittent access-denied and non-zero-exit errors.
         Invoke-PipInstallOrVerify `

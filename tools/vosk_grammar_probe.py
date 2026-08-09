@@ -8,6 +8,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -46,6 +47,7 @@ from bible_parser_core.text_citation_detector import (
     TextDetectionConfig,
 )
 from bible_parser_core.verse_text_search import CANONICAL_BOOK_NAMES_BY_ID
+from bible_parser_core.version import __version__
 from tools.holyrics import (
     MIN_RECOMMENDED_HOLYRICS_VERSION,
     REQUIRED_HOLYRICS_PERMISSIONS,
@@ -70,6 +72,10 @@ DEFAULT_LOG_DIR = Path.cwd() / ".cache" / "liverse" / "vosk_probe"
 DEFAULT_TEXT_DETECTION_DB = PROJECT_ROOT / "bible_index" / "bible_index.db"
 HOLYRICS_SETUP_NOTICE_MARKER = Path.cwd() / ".cache" / "liverse" / "holyrics_setup_notice_shown"
 STARTUP_SETTINGS_ENV = "LIVERSE_STARTUP_SETTINGS"
+UPDATE_REPO_URL = "https://github.com/andukR/LiVerse.git"
+UPDATE_BRANCH = "main"
+UPDATE_REMOTE_REF = f"refs/remotes/origin/{UPDATE_BRANCH}"
+UPDATE_CHECK_TIMEOUT_SECONDS = 8.0
 WELCOME_TEXT = (
     "LiVerse принимает на себя техническую задачу поиска и отображения "
     "библейских ссылок, чтобы вся церковь могла сосредоточиться на слушании, "
@@ -704,6 +710,229 @@ def read_single_key() -> str:
         return sys.stdin.read(1)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def run_update_git(
+    project_root: Path,
+    *arguments: str,
+    timeout: float = UPDATE_CHECK_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(project_root), *arguments],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+    )
+
+
+def git_commit_label(project_root: Path, revision: str) -> str:
+    result = run_update_git(
+        project_root,
+        "show",
+        "-s",
+        "--format=%h %s",
+        revision,
+    )
+    return result.stdout.strip() if result.returncode == 0 else revision[:7]
+
+
+def git_project_version(project_root: Path, revision: str) -> str:
+    for path in (
+        "packages/bible_parser_core/src/bible_parser_core/version.py",
+        "tools/__init__.py",
+        "pyproject.toml",
+    ):
+        result = run_update_git(project_root, "show", f"{revision}:{path}")
+        if result.returncode != 0:
+            continue
+        match = re.search(
+            r"(?:__version__\s*=|version\s*=)\s*[\"'](?P<version>\d+\.\d+\.\d+)[\"']",
+            result.stdout,
+        )
+        if match:
+            return match.group("version")
+    return "неизвестно"
+
+
+def check_startup_update(
+    project_root: Path = PROJECT_ROOT,
+    *,
+    repo_url: str = UPDATE_REPO_URL,
+    branch: str = UPDATE_BRANCH,
+) -> dict:
+    """Fetch the public deployment branch and describe whether it is newer."""
+    if not (project_root / ".git").exists():
+        return {"status": "not_git_repository"}
+    remote_ref = f"refs/remotes/origin/{branch}"
+    try:
+        current_branch = run_update_git(project_root, "symbolic-ref", "--short", "HEAD")
+        if current_branch.returncode != 0 or current_branch.stdout.strip() != branch:
+            return {
+                "status": "other_branch",
+                "branch": current_branch.stdout.strip(),
+            }
+        fetched = run_update_git(
+            project_root,
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            repo_url,
+            f"+refs/heads/{branch}:{remote_ref}",
+        )
+    except FileNotFoundError:
+        return {"status": "git_unavailable"}
+    except subprocess.TimeoutExpired:
+        return {"status": "network_unavailable", "reason": "timeout"}
+    if fetched.returncode != 0:
+        return {"status": "network_unavailable", "reason": fetched.stderr.strip()}
+
+    local = run_update_git(project_root, "rev-parse", "HEAD")
+    remote = run_update_git(project_root, "rev-parse", remote_ref)
+    if local.returncode != 0 or remote.returncode != 0:
+        return {"status": "version_unavailable"}
+    local_commit = local.stdout.strip()
+    remote_commit = remote.stdout.strip()
+    tracked_changes = run_update_git(
+        project_root,
+        "status",
+        "--porcelain",
+        "--untracked-files=no",
+    )
+    if tracked_changes.returncode != 0:
+        return {"status": "version_unavailable"}
+    if local_commit == remote_commit:
+        return {
+            "status": "current_with_changes" if tracked_changes.stdout.strip() else "current",
+            "local_commit": local_commit,
+            "local_version": git_project_version(project_root, local_commit),
+        }
+    local_is_ancestor = run_update_git(
+        project_root,
+        "merge-base",
+        "--is-ancestor",
+        local_commit,
+        remote_commit,
+    )
+    if local_is_ancestor.returncode != 0:
+        return {
+            "status": "not_behind",
+            "local_commit": local_commit,
+            "remote_commit": remote_commit,
+        }
+    result = {
+        "status": "available",
+        "local_commit": local_commit,
+        "remote_commit": remote_commit,
+        "local_label": git_commit_label(project_root, local_commit),
+        "remote_label": git_commit_label(project_root, remote_commit),
+        "local_version": git_project_version(project_root, local_commit),
+        "remote_version": git_project_version(project_root, remote_commit),
+        "remote_ref": remote_ref,
+    }
+    if tracked_changes.stdout.strip():
+        result["status"] = "tracked_changes"
+    return result
+
+
+def install_updated_dependencies(project_root: Path) -> bool:
+    legacy_metadata = project_root / "liverse.egg-info"
+    if legacy_metadata.is_dir():
+        shutil.rmtree(legacy_metadata)
+    commands = (
+        [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "-r", "requirements.txt"],
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "-e",
+            ".",
+            "--no-build-isolation",
+        ],
+    )
+    for command in commands:
+        if subprocess.run(command, cwd=project_root).returncode != 0:
+            return False
+    return True
+
+
+def apply_startup_update(update: dict, project_root: Path = PROJECT_ROOT) -> bool:
+    if os.name == "nt":
+        updater = project_root / "update-liverse-windows.cmd"
+        if not updater.exists():
+            return False
+        return subprocess.run(
+            ["cmd.exe", "/d", "/c", str(updater), str(project_root)],
+            cwd=project_root,
+        ).returncode == 0
+
+    remote_ref = str(update.get("remote_ref") or UPDATE_REMOTE_REF)
+    merged = subprocess.run(
+        ["git", "-C", str(project_root), "merge", "--ff-only", remote_ref],
+        cwd=project_root,
+    )
+    return merged.returncode == 0 and install_updated_dependencies(project_root)
+
+
+def check_and_offer_startup_update(project_root: Path = PROJECT_ROOT) -> None:
+    print("Проверка обновлений LiVerse...", flush=True)
+    update = check_startup_update(project_root)
+    status = str(update.get("status") or "")
+    if status in {"current", "current_with_changes"}:
+        version = __version__ if status == "current_with_changes" else update.get("local_version")
+        print(
+            f"LiVerse {version or __version__} актуален "
+            f"({str(update.get('local_commit') or '')[:7]}).",
+            flush=True,
+        )
+        if status == "current_with_changes":
+            print("Используется рабочая версия с локальными изменениями.", flush=True)
+        return
+    if status in {"network_unavailable", "git_unavailable", "not_git_repository", "version_unavailable"}:
+        print("Проверить обновления не удалось. Запускаю установленную версию.", flush=True)
+        return
+    if status == "not_behind":
+        print("Локальная версия не старее GitHub. Продолжаю запуск.", flush=True)
+        return
+    if status == "other_branch":
+        print("Проверка обновлений пропущена: открыта не основная ветка Git.", flush=True)
+        return
+    if status == "tracked_changes":
+        print("На GitHub есть обновление, но локальные файлы изменены.", flush=True)
+        print("Автоматическое обновление пропущено, чтобы не потерять эти изменения.", flush=True)
+        return
+    if status != "available":
+        return
+
+    print("Доступно обновление LiVerse:", flush=True)
+    print(
+        f"  установлено: LiVerse {update.get('local_version')} ({update.get('local_label')})",
+        flush=True,
+    )
+    print(
+        f"  на GitHub:   LiVerse {update.get('remote_version')} ({update.get('remote_label')})",
+        flush=True,
+    )
+    if not sys.stdin.isatty():
+        print("Для обновления запустите LiVerse из интерактивного терминала.", flush=True)
+        return
+    if not ask_enter_or_space(
+        "Обновить LiVerse сейчас?",
+        enter_label="обновить",
+        space_label="запустить без обновления",
+    ):
+        return
+    print("Обновляю LiVerse...", flush=True)
+    if not apply_startup_update(update, project_root):
+        print("Обновление не завершено. LiVerse остановлен; повторите запуск после проверки журнала.", flush=True)
+        raise SystemExit(1)
+    print("Обновление установлено. Перезапускаю LiVerse...", flush=True)
+    os.execv(
+        sys.executable,
+        [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
+    )
 
 
 def ask_enter_or_space(question: str, *, enter_label: str, space_label: str) -> bool:
@@ -2161,6 +2390,7 @@ def run_microphone(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Recognize and resolve Russian live Bible references.")
+    parser.add_argument("--version", action="version", version=f"LiVerse {__version__}")
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--bible", type=Path, default=DEFAULT_BIBLE)
     parser.add_argument("--samplerate", type=int, default=16000)
@@ -2218,6 +2448,11 @@ def main() -> int:
         "--ask-approval-mode",
         action="store_true",
         help="Ask whether to use automatic mode, web approval, or popup approval before microphone startup.",
+    )
+    parser.add_argument(
+        "--check-updates",
+        action="store_true",
+        help="Check the public GitHub main branch and offer a safe startup update.",
     )
     parser.add_argument("--text", nargs="+", help="Resolve text without opening the microphone.")
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR)
@@ -2343,6 +2578,8 @@ def main() -> int:
         else:
             print(grammar_json, flush=True)
         return 0
+    if args.check_updates:
+        check_and_offer_startup_update()
     configure_interactive_approval_mode(args)
     load_runtime_risk_model(args)
     print_holyrics_setup_notice_once(args)

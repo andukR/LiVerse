@@ -18,13 +18,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote, unquote
 
-
-__version__ = "0.1.0"
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
 CORE_SRC = PROJECT_ROOT / "packages" / "bible_parser_core" / "src"
 if str(CORE_SRC) not in sys.path:
     sys.path.insert(0, str(CORE_SRC))
+
+from bible_parser_core.version import __version__
 
 SLIDE_DIR = PROJECT_ROOT / "slide_display"
 DEFAULT_HOST = "127.0.0.1"

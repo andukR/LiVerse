@@ -1,3 +1,5 @@
 """LiVerse tools package."""
 
-__version__ = "1.0.0"
+from bible_parser_core.version import __version__
+
+__all__ = ["__version__"]

@@ -20,6 +20,99 @@ from tools.holyrics import (
 
 
 class LiveReferencePipelineTest(unittest.TestCase):
+    def test_liverse_version_is_consistent_across_packages_and_metadata(self):
+        import tomllib
+
+        from bible_parser_core import __version__ as core_version
+        from tools import __version__ as tools_version
+        from tools.slide_server import __version__ as slide_server_version
+
+        project_root = Path(__file__).resolve().parents[3]
+        metadata = tomllib.loads((project_root / "pyproject.toml").read_text(encoding="utf-8"))
+
+        self.assertEqual("1.1.0", core_version)
+        self.assertEqual(core_version, tools_version)
+        self.assertEqual(core_version, slide_server_version)
+        self.assertEqual(["version"], metadata["project"]["dynamic"])
+        self.assertEqual(
+            "bible_parser_core.version.__version__",
+            metadata["tool"]["setuptools"]["dynamic"]["version"]["attr"],
+        )
+
+    def test_startup_update_detects_and_applies_newer_main_commit(self):
+        import subprocess
+        import tempfile
+
+        from tools.vosk_grammar_probe import apply_startup_update, check_startup_update
+
+        def git(cwd: Path, *arguments: str) -> None:
+            subprocess.run(
+                ["git", *arguments],
+                cwd=cwd,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            remote = root / "remote.git"
+            local = root / "local"
+            source.mkdir()
+            git(source, "init", "-b", "main")
+            git(source, "config", "user.name", "LiVerse Test")
+            git(source, "config", "user.email", "liverse-test@example.invalid")
+            version_file = source / "packages" / "bible_parser_core" / "src" / "bible_parser_core" / "version.py"
+            version_file.parent.mkdir(parents=True)
+            version_file.write_text('__version__ = "1.0.1"\n', encoding="utf-8")
+            git(source, "add", str(version_file.relative_to(source)))
+            git(source, "commit", "-m", "First version")
+            git(root, "init", "--bare", str(remote))
+            git(source, "remote", "add", "origin", str(remote))
+            git(source, "push", "-u", "origin", "main")
+            git(root, "clone", "--branch", "main", str(remote), str(local))
+
+            version_file.write_text('__version__ = "1.1.0"\n', encoding="utf-8")
+            git(source, "commit", "-am", "Second version")
+            git(source, "push", "origin", "main")
+            (local / "untracked.db").write_text("preserve me\n", encoding="utf-8")
+
+            update = check_startup_update(local, repo_url=str(remote))
+
+            self.assertEqual("available", update["status"])
+            self.assertEqual("1.0.1", update["local_version"])
+            self.assertEqual("1.1.0", update["remote_version"])
+            self.assertIn("First version", update["local_label"])
+            self.assertIn("Second version", update["remote_label"])
+            with patch("tools.vosk_grammar_probe.install_updated_dependencies", return_value=True):
+                self.assertTrue(apply_startup_update(update, local))
+            installed_version = local / version_file.relative_to(source)
+            self.assertEqual('__version__ = "1.1.0"\n', installed_version.read_text(encoding="utf-8"))
+            self.assertEqual("preserve me\n", (local / "untracked.db").read_text(encoding="utf-8"))
+            self.assertEqual("current", check_startup_update(local, repo_url=str(remote))["status"])
+
+    def test_startup_update_preserves_tracked_local_changes(self):
+        from tools.vosk_grammar_probe import check_startup_update
+
+        with patch("tools.vosk_grammar_probe.run_update_git") as run_git:
+            run_git.side_effect = [
+                SimpleNamespace(returncode=0, stdout="main\n", stderr=""),
+                SimpleNamespace(returncode=0, stdout="", stderr=""),
+                SimpleNamespace(returncode=0, stdout="local\n", stderr=""),
+                SimpleNamespace(returncode=0, stdout="remote\n", stderr=""),
+                SimpleNamespace(returncode=0, stdout=" M README.md\n", stderr=""),
+                SimpleNamespace(returncode=0, stdout="", stderr=""),
+                SimpleNamespace(returncode=0, stdout="abc local", stderr=""),
+                SimpleNamespace(returncode=0, stdout="def remote", stderr=""),
+                SimpleNamespace(returncode=0, stdout='__version__ = "1.0.1"', stderr=""),
+                SimpleNamespace(returncode=0, stdout='__version__ = "1.1.0"', stderr=""),
+            ]
+            with patch("pathlib.Path.exists", return_value=True):
+                result = check_startup_update(Path("/test/repository"))
+
+        self.assertEqual("tracked_changes", result["status"])
+
     def test_popup_uses_monitor_under_pointer_instead_of_combined_desktop(self):
         from tools.vosk_grammar_probe import center_tk_window, xrandr_monitor_bounds
 

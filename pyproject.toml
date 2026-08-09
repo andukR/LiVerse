@@ -1,6 +1,6 @@
 [project]
 name = "liverse"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Vosk-based Bible reference detection with Holyrics integration."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,6 +27,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 include-package-data = true
 packages = ["tools", "bible_parser_core"]
+
+[tool.setuptools.dynamic]
+version = {attr = "bible_parser_core.version.__version__"}
 
 [tool.setuptools.package-dir]
 tools = "tools"

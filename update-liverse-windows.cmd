@@ -119,6 +119,7 @@ if errorlevel 1 exit /b 28
 
 :venv_ready
 call :step Installing LiVerse
+if exist "%TARGET_DIR%\liverse.egg-info" rmdir /s /q "%TARGET_DIR%\liverse.egg-info"
 "%VENV_PY%" -m pip install --disable-pip-version-check setuptools
 if errorlevel 1 exit /b 21
 "%VENV_PY%" -m pip install --disable-pip-version-check -r requirements.txt
