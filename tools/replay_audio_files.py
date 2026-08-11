@@ -23,15 +23,23 @@ if str(CORE_SRC) not in sys.path:
 
 from vosk import KaldiRecognizer, Model, SetLogLevel
 
+from bible_parser_core.bible_text_search import BibleTextSearcher
 from bible_parser_core.live_pipeline import LiveReferencePipeline, build_grammar, grammar_diagnostics
 from bible_parser_core.parser import DEFAULT_BIBLE
+from bible_parser_core.text_citation_detector import ScriptureTextDetector
+from bible_parser_core.verse_text_search import CANONICAL_BOOK_NAMES_BY_ID
+from tools.holyrics import scripture_range
 from tools.vosk_grammar_probe import (
     DEFAULT_LOG_DIR,
     DEFAULT_MODEL_PATH,
+    DEFAULT_TEXT_DETECTION_DB,
     JsonlLogger,
     add_slide_payload,
+    address_recognition_allowed,
     format_timecode,
     payload_summary,
+    text_citation_payload,
+    text_decision_ready_for_scripture_range,
     trigger_time_info,
 )
 
@@ -64,6 +72,49 @@ DEFAULT_SEARCH_ROOTS = (
 )
 LATEST_REPLAY_BATCH = "latest_replay_batch.json"
 DEFAULT_TARGET_ANNOTATIONS = 200
+BOOK_IDS_BY_CANONICAL_NAME = {
+    book_name: book_id for book_id, book_name in CANONICAL_BOOK_NAMES_BY_ID.items()
+}
+
+
+def replay_long_passage(payload: dict) -> dict | None:
+    """Represent a long passage that the replay assumes the operator accepted."""
+    selected = scripture_range(payload.get("parsed") or {})
+    if selected is None:
+        return None
+    book, chapter, start_verse, end_chapter, end_verse = selected
+    book_id = BOOK_IDS_BY_CANONICAL_NAME.get(book)
+    if book_id is None:
+        return None
+    return {
+        "book": book,
+        "book_id": book_id,
+        "chapter": chapter,
+        "start_verse": start_verse,
+        "end_chapter": end_chapter,
+        "end_verse": end_verse,
+        "ref": str((payload.get("parsed") or {}).get("ref") or ""),
+    }
+
+
+def replay_long_passage_match(decision: object, passage: dict) -> dict:
+    """Check whether Bible-text recognition has reached the passage's last verse."""
+    if not text_decision_ready_for_scripture_range(decision):
+        return {"active": True, "completed": False, "reason": "boundary_not_ready"}
+    candidate = getattr(decision, "top_candidate", None)
+    candidate_start = int(getattr(candidate, "start_verse", 0) or 0)
+    candidate_end = int(getattr(candidate, "end_verse", candidate_start) or candidate_start)
+    completed = bool(
+        int(getattr(candidate, "book_id", 0) or 0) == int(passage["book_id"])
+        and int(getattr(candidate, "chapter", 0) or 0) == int(passage["end_chapter"])
+        and candidate_start <= int(passage["end_verse"]) <= candidate_end
+    )
+    return {
+        "active": not completed,
+        "completed": completed,
+        "reason": "long_passage_completed" if completed else "inside_long_passage",
+        "candidate": str(getattr(candidate, "reference", "") or ""),
+    }
 
 
 def audio_duration(path: Path) -> float | None:
@@ -557,9 +608,21 @@ def pcm_chunks(path: Path, sample_rate: int, chunk_bytes: int):
             raise RuntimeError(f"ffmpeg завершился с кодом {return_code}: {path}")
 
 
-def replay_audio_file(path: Path, args: argparse.Namespace, model: Model, grammar: list[str] | None) -> Path | None:
+def replay_audio_file(
+    path: Path,
+    args: argparse.Namespace,
+    model: Model,
+    grammar: list[str] | None,
+    text_searcher: BibleTextSearcher | None,
+) -> Path | None:
     logger = JsonlLogger(args.log_dir, enabled=not args.no_log)
     pipeline = LiveReferencePipeline(args.bible, buffer_parts=args.vosk_buffer_parts)
+    text_detector = (
+        ScriptureTextDetector(text_searcher, event_callback=logger.write)
+        if text_searcher is not None
+        else None
+    )
+    replay_state: dict[str, dict | None] = {"long_passage": None}
     recognizer_args = [model, args.samplerate]
     if grammar is not None:
         recognizer_args.append(json.dumps(grammar, ensure_ascii=False))
@@ -584,6 +647,8 @@ def replay_audio_file(path: Path, args: argparse.Namespace, model: Model, gramma
             "samplerate": args.samplerate,
             "chunk_bytes": args.chunk_bytes,
             "open_vocabulary": args.open_vocabulary,
+            "citation_detection_mode": args.citation_detection_mode,
+            "text_detection_db": str(args.text_detection_db) if text_searcher is not None else None,
             "vosk_buffer_parts": args.vosk_buffer_parts,
             "audio": "audio.wav" if audio_path else "",
             "grammar": None if grammar is None else grammar_diagnostics(grammar),
@@ -608,6 +673,8 @@ def replay_audio_file(path: Path, args: argparse.Namespace, model: Model, gramma
                     replay_seconds,
                     trigger_case_count=trigger_case_count,
                     args=args,
+                    text_detector=text_detector,
+                    replay_state=replay_state,
                 )
 
         final_result = json.loads(recognizer.FinalResult())
@@ -621,6 +688,8 @@ def replay_audio_file(path: Path, args: argparse.Namespace, model: Model, gramma
                 replay_seconds,
                 trigger_case_count=trigger_case_count,
                 args=args,
+                text_detector=text_detector,
+                replay_state=replay_state,
             )
     finally:
         if audio_log:
@@ -643,18 +712,71 @@ def handle_result(
     *,
     trigger_case_count: int,
     args: argparse.Namespace,
+    text_detector: ScriptureTextDetector | None,
+    replay_state: dict[str, dict | None],
 ) -> int:
     text = str(result.get("text") or "").strip()
     logger.write("final_raw", {"result": result, "text": text, "replay_seconds": replay_seconds})
     if not text:
         return 0
 
-    payload = add_slide_payload(pipeline.process_text(
-        text,
-        asr_result=result,
-        show_candidates=args.show_candidates,
-        now_ms=int(replay_seconds * 1000),
-    ))
+    address_detection_enabled = args.citation_detection_mode != "text_only"
+    long_passage = replay_state.get("long_passage")
+    if address_recognition_allowed(address_detection_enabled, bool(long_passage)):
+        pipeline_payload = pipeline.process_text(
+            text,
+            asr_result=result,
+            show_candidates=args.show_candidates,
+            now_ms=int(replay_seconds * 1000),
+        )
+    else:
+        pipeline_payload = {
+            "text": text,
+            "matched": False,
+            "parsed": None,
+            "source": "text_only",
+        }
+
+    if text_detector is not None and pipeline_payload.get("matched"):
+        explicit_ref = str((pipeline_payload.get("parsed") or {}).get("ref") or "")
+        text_detector.suppress_after_address(explicit_ref, replay_seconds)
+
+    text_decision = None
+    if text_detector is not None and not pipeline_payload.get("matched"):
+        text_decision = text_detector.process_fragment(text, replay_seconds)
+
+    if long_passage is not None:
+        range_action = replay_long_passage_match(text_decision, long_passage)
+        logger.write(
+            "REPLAY_LONG_PASSAGE",
+            {
+                **range_action,
+                "passage": long_passage,
+                "replay_seconds": replay_seconds,
+            },
+        )
+        if range_action["completed"]:
+            replay_state["long_passage"] = None
+            if text_detector is not None:
+                text_detector.clear()
+        payload = add_slide_payload(pipeline_payload)
+    elif text_decision is not None and text_decision.accepted:
+        payload = text_citation_payload(text_decision, text)
+    else:
+        payload = add_slide_payload(pipeline_payload)
+
+    accepted_passage = replay_long_passage(payload)
+    if (
+        text_detector is not None
+        and accepted_passage is not None
+        and pipeline_payload.get("matched")
+    ):
+        if pipeline.set_context_range(payload.get("slide")):
+            replay_state["long_passage"] = accepted_passage
+            logger.write(
+                "REPLAY_CONTEXT_RANGE_SELECTED",
+                {"passage": accepted_passage, "replay_seconds": replay_seconds},
+            )
     output = {"replay": {"enabled": True, "sent": bool(payload.get("slide"))}}
     payload["output"] = output
     logger.write(
@@ -731,6 +853,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--samplerate", type=int, default=16000)
     parser.add_argument("--chunk-bytes", type=int, default=8000)
     parser.add_argument("--open-vocabulary", action="store_true")
+    parser.add_argument(
+        "--citation-detection-mode",
+        choices=["address_only", "text_only", "hybrid_auto", "hybrid_confirm"],
+        default="address_only",
+        help="Use the same address/text citation channels as the normal LiVerse launch.",
+    )
+    parser.add_argument(
+        "--text-detection-db",
+        type=Path,
+        default=DEFAULT_TEXT_DETECTION_DB,
+        help="SQLite Bible text index used outside address_only mode.",
+    )
     parser.add_argument("--vosk-buffer-parts", type=int, default=3)
     parser.add_argument("--vosk-log-level", type=int, default=-1)
     parser.add_argument("--show-candidates", action="store_true")
@@ -818,13 +952,21 @@ def main() -> int:
 
     SetLogLevel(args.vosk_log_level)
     model = Model(str(args.model))
-    grammar = None if args.open_vocabulary else build_grammar()
+    text_detection_enabled = args.citation_detection_mode != "address_only"
+    grammar = None if (args.open_vocabulary or text_detection_enabled) else build_grammar()
+    text_searcher = None
+    if text_detection_enabled:
+        text_searcher = BibleTextSearcher(args.text_detection_db)
     run_dirs: list[Path] = []
-    for index, path in enumerate(files, start=1):
-        print(f"\nReplay {index}/{len(files)}: {path}", flush=True)
-        run_dir = replay_audio_file(path, args, model, grammar)
-        if run_dir:
-            run_dirs.append(run_dir)
+    try:
+        for index, path in enumerate(files, start=1):
+            print(f"\nReplay {index}/{len(files)}: {path}", flush=True)
+            run_dir = replay_audio_file(path, args, model, grammar, text_searcher)
+            if run_dir:
+                run_dirs.append(run_dir)
+    finally:
+        if text_searcher is not None:
+            text_searcher.close()
     batch_path = write_latest_replay_batch(args.log_dir, run_dirs)
     print_annotation_summary(
         args.log_dir,

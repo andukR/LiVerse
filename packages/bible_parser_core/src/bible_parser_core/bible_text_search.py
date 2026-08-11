@@ -67,20 +67,30 @@ def _ngrams(tokens: Sequence[str], size: int) -> set[tuple[str, ...]]:
 class BibleTextSearcher:
     """Search a prebuilt ``bible_index.db`` without reopening it per query."""
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, *, use_database_lemmas: bool = False) -> None:
         self.db_path = Path(db_path)
         if not self.db_path.is_file():
             raise FileNotFoundError(f"Индекс библейского текста не найден: {self.db_path}")
-        try:
-            import pymorphy3
-        except ImportError as exc:
-            raise RuntimeError(
-                "Для текстового поиска установите pymorphy3 и pymorphy3-dicts-ru."
-            ) from exc
-        self._morph = pymorphy3.MorphAnalyzer()
-        self._lemma_cache: dict[str, str] = {}
         self._connection = sqlite3.connect(str(self.db_path))
         self._connection.row_factory = sqlite3.Row
+        self._use_database_lemmas = bool(use_database_lemmas)
+        self._morph = None
+        if self._use_database_lemmas:
+            try:
+                self._connection.execute("SELECT wordform, lemma FROM tokens LIMIT 1").fetchone()
+            except sqlite3.DatabaseError as exc:
+                self.close()
+                raise ValueError("Индекс не содержит словаря форм слов: таблица tokens.") from exc
+        else:
+            try:
+                import pymorphy3
+            except ImportError as exc:
+                self.close()
+                raise RuntimeError(
+                    "Для текстового поиска установите pymorphy3 и pymorphy3-dicts-ru."
+                ) from exc
+            self._morph = pymorphy3.MorphAnalyzer()
+        self._lemma_cache: dict[str, str] = {}
         self._total_documents = int(
             self._connection.execute("SELECT COUNT(*) FROM verses").fetchone()[0]
         )
@@ -105,7 +115,15 @@ class BibleTextSearcher:
             return cached
         if token.isdigit():
             lemma = token
+        elif self._use_database_lemmas:
+            row = self._connection.execute(
+                "SELECT lemma, COUNT(*) AS c FROM tokens "
+                "WHERE wordform=? GROUP BY lemma ORDER BY c DESC LIMIT 1",
+                (token,),
+            ).fetchone()
+            lemma = str(row[0]) if row is not None else token
         else:
+            assert self._morph is not None
             parses = self._morph.parse(token)
             lemma = parses[0].normal_form if parses else token
         self._lemma_cache[token] = lemma
@@ -148,7 +166,7 @@ class BibleTextSearcher:
         limit: int = 5,
         candidate_limit: int = 100,
         min_score: float = 0.0,
-        max_range_verses: int = 2,
+        max_range_verses: int = 3,
     ) -> tuple[list[str], list[BibleTextSearchResult]]:
         """Return query lemmas and ranked candidates for one spoken window."""
         tokens = normalize_bible_text(text)
@@ -156,10 +174,12 @@ class BibleTextSearcher:
         candidate_ids, frequencies = self._candidate_ids(lemmas, candidate_limit)
         if not candidate_ids:
             return lemmas, []
+        max_range_verses = max(1, int(max_range_verses))
         expanded_ids = set(candidate_ids)
         if max_range_verses >= 2:
+            radius = max_range_verses - 1
             for verse_id in candidate_ids:
-                expanded_ids.update((verse_id - 1, verse_id + 1))
+                expanded_ids.update(range(verse_id - radius, verse_id + radius + 1))
         selected_ids = sorted(verse_id for verse_id in expanded_ids if verse_id > 0)
         placeholders = ",".join("?" for _ in selected_ids)
         rows = self._connection.execute(
@@ -174,41 +194,51 @@ class BibleTextSearcher:
             if verse_id in rows_by_id
         ]
         if max_range_verses >= 2:
-            range_starts = set(candidate_ids) | {verse_id - 1 for verse_id in candidate_ids}
+            range_starts = {
+                verse_id - offset
+                for verse_id in candidate_ids
+                for offset in range(max_range_verses)
+            }
+            query_bigrams = _ngrams(lemmas, 2)
             for verse_id in sorted(range_starts):
                 first = rows_by_id.get(verse_id)
-                second = rows_by_id.get(verse_id + 1)
-                if first is None or second is None:
+                if first is None:
                     continue
-                if (
-                    int(first["book_id"]) != int(second["book_id"])
-                    or int(first["chapter"]) != int(second["chapter"])
-                    or int(second["verse"]) != int(first["verse"]) + 1
-                ):
-                    continue
-                first_lemmas = str(first["lemma_text"]).split()
-                second_lemmas = str(second["lemma_text"]).split()
-                if (
-                    not first_lemmas
-                    or not second_lemmas
-                    or (first_lemmas[-1], second_lemmas[0]) not in _ngrams(lemmas, 2)
-                ):
-                    continue
-                reference_prefix = str(first["reference"]).rsplit(":", 1)[0]
-                combined = {
-                    "reference": (
-                        f"{reference_prefix}:{int(first['verse'])}-{int(second['verse'])}"
-                    ),
-                    "text": f"{str(first['text']).strip()} {str(second['text']).strip()}",
-                    "lemma_text": (
-                        f"{str(first['lemma_text']).strip()} {str(second['lemma_text']).strip()}"
-                    ),
-                    "book_id": int(first["book_id"]),
-                    "chapter": int(first["chapter"]),
-                    "verse": int(first["verse"]),
-                    "end_verse": int(second["verse"]),
-                }
-                results.append(self._score_candidate(lemmas, combined, frequencies))
+                rows_in_range = [first]
+                for offset in range(1, max_range_verses):
+                    previous = rows_in_range[-1]
+                    current = rows_by_id.get(verse_id + offset)
+                    if current is None or (
+                        int(first["book_id"]) != int(current["book_id"])
+                        or int(first["chapter"]) != int(current["chapter"])
+                        or int(current["verse"]) != int(previous["verse"]) + 1
+                    ):
+                        break
+                    previous_lemmas = str(previous["lemma_text"]).split()
+                    current_lemmas = str(current["lemma_text"]).split()
+                    if (
+                        not previous_lemmas
+                        or not current_lemmas
+                        or (previous_lemmas[-1], current_lemmas[0]) not in query_bigrams
+                    ):
+                        break
+                    rows_in_range.append(current)
+                    last = rows_in_range[-1]
+                    reference_prefix = str(first["reference"]).rsplit(":", 1)[0]
+                    combined = {
+                        "reference": (
+                            f"{reference_prefix}:{int(first['verse'])}-{int(last['verse'])}"
+                        ),
+                        "text": " ".join(str(row["text"]).strip() for row in rows_in_range),
+                        "lemma_text": " ".join(
+                            str(row["lemma_text"]).strip() for row in rows_in_range
+                        ),
+                        "book_id": int(first["book_id"]),
+                        "chapter": int(first["chapter"]),
+                        "verse": int(first["verse"]),
+                        "end_verse": int(last["verse"]),
+                    }
+                    results.append(self._score_candidate(lemmas, combined, frequencies))
         results = [item for item in results if item.score >= min_score]
         results.sort(key=lambda item: item.score, reverse=True)
         return lemmas, results[:limit]

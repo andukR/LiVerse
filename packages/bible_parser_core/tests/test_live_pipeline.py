@@ -1587,6 +1587,25 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertEqual("medium", result.get("risk_level"))
         self.assertIn("compact_reference_without_markers", result.get("risk_reasons"))
 
+    def test_ordinary_numbered_statements_do_not_become_compact_references(self):
+        samples = (
+            (
+                "ещё раз первый пункт сегодняшний проповеди слышания это первая реакция "
+                "на божье слово что говорить яков он говорит возлюбленной"
+            ),
+            "интересные яков выделяют три три вещи слышания слова и гнев",
+        )
+
+        for text in samples:
+            with self.subTest(text=text):
+                result = LiveReferencePipeline().process_text(text)
+
+                self.assertIsNone(result.get("parsed"))
+                self.assertEqual(
+                    "compact_reference_numbers_not_after_book",
+                    result.get("blocked_weak_context"),
+                )
+
     def test_bare_verse_number_after_chapter_has_extra_risk(self):
         pipeline = LiveReferencePipeline()
 

@@ -12,6 +12,8 @@ from bible_parser_core.bible_text_search import (
     BibleTextSearchResult,
     normalize_bible_text,
 )
+from bible_parser_core.parser import parse_live_reference
+from bible_parser_core.verse_text_search import CANONICAL_BOOK_NAMES_BY_ID
 
 
 COMMON_SPEECH_LEMMAS = {
@@ -20,6 +22,47 @@ COMMON_SPEECH_LEMMAS = {
     "на", "не", "но", "о", "он", "она", "они", "от", "по", "при", "с", "со",
     "так", "то", "у", "что", "это", "я",
 }
+
+
+def _reference_key(reference: str) -> tuple[str, int, int, int, int] | str:
+    parsed = parse_live_reference(reference)
+    if parsed is None:
+        return reference.casefold().strip()
+    return (
+        parsed.book,
+        parsed.chapter,
+        parsed.start_verse,
+        parsed.end_chapter or parsed.chapter,
+        parsed.end_verse,
+    )
+
+
+def _candidate_key(candidate: BibleTextSearchResult) -> tuple[str, int, int, int, int]:
+    return (
+        CANONICAL_BOOK_NAMES_BY_ID.get(candidate.book_id, str(candidate.book_id)),
+        candidate.chapter,
+        candidate.start_verse,
+        candidate.chapter,
+        candidate.end_verse or candidate.start_verse,
+    )
+
+
+def _candidate_contains(
+    outer: BibleTextSearchResult,
+    inner: BibleTextSearchResult,
+) -> bool:
+    outer_end = outer.end_verse or outer.start_verse
+    inner_end = inner.end_verse or inner.start_verse
+    return bool(
+        outer.book_id == inner.book_id
+        and outer.chapter == inner.chapter
+        and outer.start_verse <= inner.start_verse
+        and outer_end >= inner_end
+    )
+
+
+def _candidate_span(candidate: BibleTextSearchResult) -> int:
+    return (candidate.end_verse or candidate.start_verse) - candidate.start_verse + 1
 
 
 @dataclass(frozen=True)
@@ -61,7 +104,7 @@ class TextDetectionConfig:
     duplicate_cooldown_seconds: float = 30.0
     address_suppression_seconds: float = 8.0
     search_interval_ms: int = 300
-    max_range_verses: int = 2
+    max_range_verses: int = 3
 
 
 class SlidingSpeechBuffer:
@@ -137,7 +180,7 @@ class ScriptureTextDetector:
         self._pending_window = ""
         self._pending_at = float("-inf")
         self._confirmations = 0
-        self._shown_at: dict[str, float] = {}
+        self._shown_at: dict[tuple[str, int, int, int, int] | str, float] = {}
         self._search_cache: dict[str, tuple[list[str], list[BibleTextSearchResult]]] = {}
 
     def clear(self) -> None:
@@ -150,13 +193,13 @@ class ScriptureTextDetector:
             now + self.config.address_suppression_seconds,
         )
         if reference:
-            self._shown_at[reference] = now
+            self._shown_at[_reference_key(reference)] = now
         self._reset_pending()
         self._emit("TEXT_SUPPRESSED", {"reason": "explicit_address", "reference": reference})
 
     def mark_shown(self, reference: str, now: float) -> None:
         if reference:
-            self._shown_at[reference] = now
+            self._shown_at[_reference_key(reference)] = now
 
     def process_fragment(self, text: str, now: float) -> TextCitationDecision:
         windows = self.buffer.add(text)
@@ -199,8 +242,24 @@ class ScriptureTextDetector:
                 len(item.window_text.split()),
             ),
         )
+        if best.accepted and best.top_candidate is not None:
+            broader = [
+                item
+                for item in evaluated
+                if item.accepted
+                and item.top_candidate is not None
+                and _candidate_span(item.top_candidate) > _candidate_span(best.top_candidate)
+                and _candidate_contains(item.top_candidate, best.top_candidate)
+                and item.score >= best.score - 5.0
+            ]
+            if broader:
+                best = max(
+                    broader,
+                    key=lambda item: (_candidate_span(item.top_candidate), item.score),
+                )
         if best.accepted:
-            self._shown_at[str(best.reference)] = now
+            assert best.top_candidate is not None
+            self._shown_at[_candidate_key(best.top_candidate)] = now
             self._reset_pending()
             self._emit("TEXT_ACCEPTED", self._event_payload(best))
             return best
@@ -235,7 +294,14 @@ class ScriptureTextDetector:
         if not results:
             return self._decision(window_text=window_text, reason="no_candidates")
         top = results[0]
-        second = results[1] if len(results) > 1 else None
+        second = next(
+            (
+                candidate
+                for candidate in results[1:]
+                if not _candidate_contains(top, candidate)
+            ),
+            None,
+        )
         margin = top.score - (second.score if second else 0.0)
         content_lemmas = {lemma for lemma in lemmas if lemma not in COMMON_SPEECH_LEMMAS}
         matched_words = sum(
@@ -243,7 +309,7 @@ class ScriptureTextDetector:
             for lemma in top.matched_lemmas
             if lemma in content_lemmas and lemma not in COMMON_SPEECH_LEMMAS
         )
-        shown_at = self._shown_at.get(top.reference)
+        shown_at = self._shown_at.get(_candidate_key(top))
         if shown_at is not None and now - shown_at < self.config.duplicate_cooldown_seconds:
             return self._decision(
                 reference=top.reference, score=top.score, margin=margin,
@@ -264,7 +330,7 @@ class ScriptureTextDetector:
             and strong_phrase_evidence
             and top.trigram_overlap > 0
         )
-        strong_two_verse_range = (
+        strong_range = (
             top.end_verse > top.start_verse
             and top.score >= max(0.0, self.config.acceptance_score - 8.0)
             and margin >= self.config.minimum_margin + 3.0
@@ -272,13 +338,13 @@ class ScriptureTextDetector:
             and top.bigram_overlap >= 60.0
             and top.trigram_overlap >= 45.0
         )
-        if immediate or strong_two_verse_range:
+        if immediate or strong_range:
             return self._decision(
                 accepted=True, reference=top.reference, score=top.score, margin=margin,
                 matched_words=matched_words, window_text=window_text,
                 reason=(
                     "immediate_strong_range_match"
-                    if strong_two_verse_range and not immediate
+                    if strong_range and not immediate
                     else "immediate_strong_match"
                 ),
                 confirmations=1, top=top, second=second,
@@ -323,7 +389,8 @@ class ScriptureTextDetector:
                 confirmations=self._confirmations, top=decision.top_candidate,
                 second=decision.second_candidate,
             )
-            self._shown_at[str(accepted.reference)] = now
+            assert accepted.top_candidate is not None
+            self._shown_at[_candidate_key(accepted.top_candidate)] = now
             self._reset_pending()
             self._emit("TEXT_ACCEPTED", self._event_payload(accepted))
             return accepted

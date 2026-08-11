@@ -957,6 +957,16 @@ def has_reference_marker(text: str) -> bool:
     )
 
 
+def compact_numbers_follow_book(text: str, book: str) -> bool:
+    normalized = normalize_text(text)
+    return any(
+        candidate.book == book
+        and candidate.score >= 0.999
+        and re.match(r"\s+\d{1,3}\s+\d{1,3}\b", normalized[candidate.end :])
+        for candidate in book_candidates(normalized)
+    )
+
+
 def should_block_matched_payload(payload: dict) -> str | None:
     parsed = payload.get("parsed") or {}
     if not parsed:
@@ -1134,6 +1144,16 @@ def should_block_matched_payload(payload: dict) -> str | None:
         and not re.search(r"\b(?:книг|глав|стих)\w*\b", raw_text)
     ):
         return "weak_compact_ezra_hundred_context"
+
+    if (
+        source == "parser"
+        and parsed.get("start_verse") == parsed.get("end_verse")
+        and len(words) >= 7
+        and not has_reference_marker(text)
+        and len(re.findall(r"\b\d+\b", normalized)) >= 2
+        and not compact_numbers_follow_book(text, str(parsed.get("book") or ""))
+    ):
+        return "compact_reference_numbers_not_after_book"
 
     return None
 

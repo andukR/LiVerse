@@ -2498,7 +2498,7 @@ def main() -> int:
     parser.add_argument("--text-duplicate-cooldown-seconds", type=float, default=30.0)
     parser.add_argument("--text-address-suppression-seconds", type=float, default=8.0)
     parser.add_argument("--text-search-interval-ms", type=int, default=300)
-    parser.add_argument("--text-max-range-verses", type=int, choices=[1, 2], default=2)
+    parser.add_argument("--text-max-range-verses", type=int, choices=[1, 2, 3], default=3)
     parser.add_argument(
         "--vosk-buffer-parts",
         type=int,

@@ -197,6 +197,59 @@ class ScriptureTextDetectorTest(unittest.TestCase):
         self.assertEqual("Пс. 22:1-2", decision.reference)
         self.assertEqual("immediate_strong_range_match", decision.reason)
 
+    def test_broader_three_verse_range_wins_over_stronger_contained_suffix(self) -> None:
+        short_range = hit(
+            "Лк. 14:29-30", 83.6,
+            matched=("смеяться", "над", "они", "говорить", "человек"),
+            bigram=65.0,
+            trigram=55.0,
+            book_id=42,
+            chapter=14,
+            verse=29,
+        )
+        short_range = BibleTextSearchResult(
+            **{**short_range.__dict__, "end_verse": 30}
+        )
+        broad_range = hit(
+            "Лк. 14:28-30", 80.5,
+            matched=("построить", "башня", "издержка", "основание", "смеяться"),
+            bigram=69.0,
+            trigram=58.0,
+            book_id=42,
+            chapter=14,
+            verse=28,
+        )
+        broad_range = BibleTextSearchResult(
+            **{**broad_range.__dict__, "end_verse": 30}
+        )
+        contained = BibleTextSearchResult(
+            **{**broad_range.__dict__, "reference": "Лк. 14:28-29", "score": 76.7, "end_verse": 29}
+        )
+        unrelated = hit(
+            "Есф. 4:17", 28.0,
+            matched=("человек",),
+            bigram=0.0,
+            trigram=0.0,
+            book_id=17,
+            chapter=4,
+            verse=17,
+        )
+        detector = ScriptureTextDetector(
+            FakeSearcher([
+                [short_range, unrelated],
+                [broad_range, contained, short_range, unrelated],
+            ]),
+            self.config(window_sizes=(5, 10), buffer_words=10),
+        )
+
+        decision = detector.process_fragment(
+            "построить башня считать издержка основание смеяться над они говорить человек",
+            now=0.0,
+        )
+
+        self.assertTrue(decision.accepted)
+        self.assertEqual("Лк. 14:28-30", decision.reference)
+
     def test_weak_two_verse_range_does_not_use_relaxed_range_rule(self) -> None:
         weak_range = hit(
             "Пс. 22:1-2", 65.0,
@@ -268,6 +321,29 @@ class ScriptureTextDetectorTest(unittest.TestCase):
         self.assertFalse(decision.accepted)
         self.assertEqual("address_suppression", decision.reason)
 
+    def test_full_and_abbreviated_reference_share_duplicate_cooldown(self) -> None:
+        strong = hit(
+            "Иак. 1:26", 96.0,
+            matched=("думать", "благочестивый", "обуздывать", "язык", "сердце"),
+            trigram=75.0,
+            book_id=59,
+            chapter=1,
+            verse=26,
+        )
+        detector = ScriptureTextDetector(
+            FakeSearcher([[strong]]),
+            self.config(immediate_score=90.0),
+        )
+        detector.suppress_after_address("Иаков 1:26", now=0.0)
+
+        duplicate = detector.process_fragment(
+            "думать благочестивый обуздывать язык сердце",
+            now=9.0,
+        )
+
+        self.assertFalse(duplicate.accepted)
+        self.assertEqual("duplicate_cooldown", duplicate.reason)
+
 
 class ReplayTranscriptTest(unittest.TestCase):
     def test_jsonl_fragments_are_replayed_in_order(self) -> None:
@@ -317,6 +393,39 @@ class ReplayTranscriptTest(unittest.TestCase):
 
 
 class TextCitationIntegrationTest(unittest.TestCase):
+    def test_replay_long_passage_waits_for_its_final_verse(self) -> None:
+        from tools.replay_audio_files import replay_long_passage, replay_long_passage_match
+
+        passage = replay_long_passage({
+            "parsed": {
+                "book": "Иаков",
+                "chapter": 1,
+                "start_verse": 19,
+                "end_chapter": 1,
+                "end_verse": 27,
+                "ref": "Иаков 1:19-27",
+            },
+        })
+        self.assertIsNotNone(passage)
+
+        verse_26 = hit(
+            "Иак. 1:26", 80.0, matched=("язык",),
+            book_id=59, chapter=1, verse=26,
+        )
+        verse_27 = hit(
+            "Иак. 1:27", 80.0, matched=("благочестие",),
+            book_id=59, chapter=1, verse=27,
+        )
+        decision_26 = SimpleNamespace(
+            accepted=False, reason="pending_confirmation", top_candidate=verse_26,
+        )
+        decision_27 = SimpleNamespace(
+            accepted=False, reason="pending_confirmation", top_candidate=verse_27,
+        )
+
+        self.assertFalse(replay_long_passage_match(decision_26, passage)["completed"])
+        self.assertTrue(replay_long_passage_match(decision_27, passage)["completed"])
+
     def test_pending_candidate_can_advance_known_long_passage_boundary(self) -> None:
         from tools.vosk_grammar_probe import text_decision_ready_for_scripture_range
 
