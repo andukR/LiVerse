@@ -11,7 +11,7 @@ if not defined LIVERSE_CMD_REEXEC (
   set "LIVERSE_CMD_REEXEC=1"
   set "TEMP_SCRIPT=%TEMP%\update-liverse-windows.cmd"
   copy "%~f0" "%TEMP_SCRIPT%" >nul
-  cmd /d /c ""%TEMP_SCRIPT%" "%TARGET_DIR%""
+  call "%TEMP_SCRIPT%" "%TARGET_DIR%"
   exit /b %ERRORLEVEL%
 )
 
