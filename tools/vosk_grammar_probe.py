@@ -91,6 +91,19 @@ EDIT_SETTINGS_KEYS = {"e", "E"}
 QUIT_KEYS = {"q", "Q"}
 
 
+def text_detection_database_startup_message(mode: str, database_path: Path) -> str:
+    """Return an actionable startup message when text search has no database."""
+    if mode == "address_only" or database_path.is_file():
+        return ""
+    return (
+        "LiVerse: база поиска цитат по тексту не найдена.\n"
+        f"Ожидаемый файл: {database_path}\n"
+        f"Скопируйте bible_index.db в папку: {database_path.parent}\n"
+        "Либо укажите другой путь в .env через LIVERSE_TEXT_DETECTION_DB.\n"
+        "Без этой базы LiVerse не может распознавать цитаты по произнесённому тексту."
+    )
+
+
 def parse_window_sizes(value: str) -> tuple[int, ...]:
     try:
         sizes = tuple(int(part.strip()) for part in value.split(",") if part.strip())
@@ -2709,6 +2722,14 @@ def main() -> int:
             ref = (payload.get("parsed") or {}).get("ref")
             print(f"Результат: {ref or payload.get('message') or 'ссылка не найдена'}", flush=True)
         return 0 if payload["parsed"] else 1
+
+    database_message = text_detection_database_startup_message(
+        args.citation_detection_mode,
+        args.text_detection_db,
+    )
+    if database_message:
+        print(database_message, file=sys.stderr, flush=True)
+        return 2
 
     return run_microphone(args)
 

@@ -393,6 +393,67 @@ class ReplayTranscriptTest(unittest.TestCase):
 
 
 class TextCitationIntegrationTest(unittest.TestCase):
+    def test_startup_explains_how_to_install_missing_text_database(self) -> None:
+        from tools.vosk_grammar_probe import text_detection_database_startup_message
+
+        with tempfile.TemporaryDirectory() as temporary:
+            database_path = Path(temporary) / "bible_index" / "bible_index.db"
+            message = text_detection_database_startup_message(
+                "hybrid_confirm",
+                database_path,
+            )
+
+        self.assertIn("база поиска цитат по тексту не найдена", message)
+        self.assertIn(str(database_path), message)
+        self.assertIn("LIVERSE_TEXT_DETECTION_DB", message)
+
+    def test_startup_database_notice_is_not_shown_when_unneeded_or_installed(self) -> None:
+        from tools.vosk_grammar_probe import text_detection_database_startup_message
+
+        with tempfile.TemporaryDirectory() as temporary:
+            database_path = Path(temporary) / "bible_index.db"
+            self.assertEqual(
+                "",
+                text_detection_database_startup_message("address_only", database_path),
+            )
+            database_path.touch()
+            self.assertEqual(
+                "",
+                text_detection_database_startup_message("hybrid_confirm", database_path),
+            )
+
+    def test_replay_summary_labels_address_and_text_detection(self) -> None:
+        from tools.replay_audio_files import citation_summary_lines
+
+        lines = citation_summary_lines([
+            {
+                "timecode": "00:01:02.000",
+                "ref": "Иоанн 3:16",
+                "payload": {"source": "parser"},
+            },
+            {
+                "timecode": "00:02:03.000",
+                "ref": "Матфей 7:21",
+                "payload": {"source": "text_citation"},
+            },
+            {
+                "timecode": "00:03:04.000",
+                "ref": "Иаков 1:27",
+                "payload": {"source": "context_range"},
+            },
+        ])
+
+        self.assertTrue(lines[0].startswith(
+            "1. 00:01:02.000  Иоанн 3:16 — по адресу\n   Текст:"
+        ))
+        self.assertIn("Ибо так возлюбил Бог мир", lines[0])
+        self.assertTrue(lines[1].startswith(
+            "2. 00:02:03.000  Матфей 7:21 — по тексту\n   Текст:"
+        ))
+        self.assertTrue(lines[2].startswith(
+            "3. 00:03:04.000  Иаков 1:27 — по адресу\n   Текст:"
+        ))
+
     def test_replay_long_passage_waits_for_its_final_verse(self) -> None:
         from tools.replay_audio_files import replay_long_passage, replay_long_passage_match
 

@@ -25,7 +25,7 @@ from vosk import KaldiRecognizer, Model, SetLogLevel
 
 from bible_parser_core.bible_text_search import BibleTextSearcher
 from bible_parser_core.live_pipeline import LiveReferencePipeline, build_grammar, grammar_diagnostics
-from bible_parser_core.parser import DEFAULT_BIBLE
+from bible_parser_core.parser import DEFAULT_BIBLE, parse_live_reference
 from bible_parser_core.text_citation_detector import ScriptureTextDetector
 from bible_parser_core.verse_text_search import CANONICAL_BOOK_NAMES_BY_ID
 from tools.holyrics import scripture_range
@@ -419,6 +419,54 @@ def load_jsonl(path: Path) -> list[dict]:
         if isinstance(row, dict):
             rows.append(row)
     return rows
+
+
+def citation_detection_label(case: dict) -> str:
+    payload = case.get("payload") if isinstance(case.get("payload"), dict) else {}
+    return "по тексту" if payload.get("source") == "text_citation" else "по адресу"
+
+
+def citation_summary_lines(
+    cases: list[dict],
+    bible_path: Path = DEFAULT_BIBLE,
+) -> list[str]:
+    lines: list[str] = []
+    for case in cases:
+        ref = str(case.get("ref") or "").strip()
+        if not ref:
+            continue
+        timecode = str(case.get("timecode") or "").strip()
+        prefix = f"{timecode}  " if timecode else ""
+        line = f"{len(lines) + 1}. {prefix}{ref} — {citation_detection_label(case)}"
+        parsed = parse_live_reference(ref, bible_path=bible_path)
+        if parsed is not None and parsed.verse_text:
+            line += f"\n   Текст: {parsed.verse_text}"
+        lines.append(line)
+    return lines
+
+
+def latest_replay_cases(log_dir: Path) -> list[dict]:
+    batch_path = log_dir / LATEST_REPLAY_BATCH
+    if not batch_path.exists():
+        return []
+    try:
+        batch = json.loads(batch_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    cases: list[dict] = []
+    for run_dir in batch.get("runs") or []:
+        cases.extend(load_jsonl(Path(str(run_dir)) / "trigger_cases.jsonl"))
+    return cases
+
+
+def print_latest_citation_summary(log_dir: Path, bible_path: Path = DEFAULT_BIBLE) -> None:
+    print("Найденные цитаты:", flush=True)
+    lines = citation_summary_lines(latest_replay_cases(log_dir), bible_path=bible_path)
+    if not lines:
+        print("  цитаты не найдены", flush=True)
+        return
+    for line in lines:
+        print(f"  {line}", flush=True)
 
 
 def is_unreviewed_case(case: dict) -> bool:
@@ -871,6 +919,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR)
     parser.add_argument("--no-log", action="store_true")
     parser.add_argument(
+        "--results-only",
+        action="store_true",
+        help="Print citations from the latest saved replay without recognizing audio again.",
+    )
+    parser.add_argument(
         "--target-annotations",
         type=int,
         default=DEFAULT_TARGET_ANNOTATIONS,
@@ -881,6 +934,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.results_only:
+        print_latest_citation_summary(args.log_dir, bible_path=args.bible)
+        return 0
     search_roots = args.search_root or list(DEFAULT_SEARCH_ROOTS)
     subtitle_roots = args.subtitle_root or [PROJECTS_ROOT]
     download_urls = list(args.download_url)
