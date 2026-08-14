@@ -2350,6 +2350,11 @@ def run_microphone(args: argparse.Namespace) -> int:
                                             "длинный отрывок завершён, ошибка возврата к плану: "
                                             f"{range_reading_action.get('reason')}"
                                         )
+                                elif range_reading_action.get("completion_failed"):
+                                    console.status(
+                                        "не удалось закрыть длинный отрывок; LiVerse повторит попытку: "
+                                        f"{range_reading_action.get('reason')}"
+                                    )
                             if long_passage_reading:
                                 payload = add_slide_payload(pipeline_payload)
                             elif text_decision is not None and text_decision.accepted:

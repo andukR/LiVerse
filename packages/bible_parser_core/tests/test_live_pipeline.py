@@ -90,6 +90,8 @@ class LiveReferencePipelineTest(unittest.TestCase):
                 "GetAPIServerInfo",
                 "GetBibleSettings",
                 "GetCurrentPresentation",
+                "GetCurrentQuickPresentation",
+                "CloseCurrentQuickPresentation",
                 "CloseCurrentPresentation",
                 "SetBibleSettings",
                 "ShowQuickPresentation",
@@ -489,6 +491,85 @@ class LiveReferencePipelineTest(unittest.TestCase):
             "http://127.0.0.1:8091",
             "ShowText",
             {"id": "sermon-plan", "initial_index": 3},
+        )
+
+    def test_long_passage_closes_quick_overlay_before_restoring_plan(self):
+        from tools.holyrics import restore_sermon_plan_after_quick_presentation
+
+        args = SimpleNamespace()
+        presentation = {"type": "text", "text_id": "sermon-plan"}
+        responses = [
+            (True, "", '{"status":"ok"}'),
+            (True, "", '{"status":"ok","data":null}'),
+            (True, "", '{"status":"ok"}'),
+            (
+                True,
+                "",
+                '{"status":"ok","data":{"type":"text","id":"sermon-plan","slide_number":3}}',
+            ),
+        ]
+
+        with (
+            patch("tools.holyrics.post_holyrics_api", side_effect=responses) as api,
+            patch("tools.holyrics.time.sleep"),
+        ):
+            ok, reason, diagnostics = restore_sermon_plan_after_quick_presentation(
+                args,
+                "http://127.0.0.1:8091",
+                presentation,
+                2,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual("sermon_plan_restore_verified", reason)
+        self.assertEqual(3, presentation["slide_number"])
+        self.assertEqual(
+            [
+                ("CloseCurrentQuickPresentation", {}),
+                ("GetCurrentQuickPresentation", {}),
+                ("ShowText", {"id": "sermon-plan", "initial_index": 2}),
+                ("GetCurrentPresentation", {}),
+            ],
+            [(item.args[2], item.args[3]) for item in api.call_args_list],
+        )
+        self.assertIsNone(diagnostics["quick_states"][0]["data"])
+        self.assertEqual("text", diagnostics["presentation_states"][0]["data"]["type"])
+
+    def test_long_passage_retries_quick_close_when_overlay_remains(self):
+        from tools.holyrics import restore_sermon_plan_after_quick_presentation
+
+        args = SimpleNamespace()
+        presentation = {"type": "text", "text_id": "sermon-plan"}
+        responses = [
+            (True, "", '{"status":"ok"}'),
+            (True, "", '{"status":"ok","data":{"id":"quick","slide_number":2}}'),
+            (True, "", '{"status":"ok"}'),
+            (True, "", '{"status":"ok","data":null}'),
+            (True, "", '{"status":"ok"}'),
+            (
+                True,
+                "",
+                '{"status":"ok","data":{"type":"text","id":"sermon-plan","slide_number":1}}',
+            ),
+        ]
+
+        with (
+            patch("tools.holyrics.post_holyrics_api", side_effect=responses) as api,
+            patch("tools.holyrics.time.sleep"),
+        ):
+            ok, reason, diagnostics = restore_sermon_plan_after_quick_presentation(
+                args,
+                "http://127.0.0.1:8091",
+                presentation,
+                0,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual("sermon_plan_restore_verified", reason)
+        self.assertEqual(2, len(diagnostics["close_responses"]))
+        self.assertEqual(
+            2,
+            sum(item.args[2] == "CloseCurrentQuickPresentation" for item in api.call_args_list),
         )
 
     def test_context_range_resolves_chapter_and_verse_without_book(self):
@@ -1461,10 +1542,15 @@ class LiveReferencePipelineTest(unittest.TestCase):
             {"index": 1},
         )
 
-        completed = handle_scripture_range_reading_match(args, verse_eleven)
+        with patch(
+            "tools.holyrics.close_holyrics_quick_presentation_verified",
+            return_value=(True, "quick_presentation_closed", {"verified": True}),
+        ) as close_quick:
+            completed = handle_scripture_range_reading_match(args, verse_eleven)
 
         self.assertTrue(completed["completed"])
         self.assertFalse(scripture_range_reading_active(args))
+        close_quick.assert_called_once_with(args, "http://127.0.0.1:8091")
 
     def test_non_boundary_verse_is_consumed_without_advancing_long_range(self):
         args = SimpleNamespace(
@@ -1546,8 +1632,8 @@ class LiveReferencePipelineTest(unittest.TestCase):
         verse_twenty = SimpleNamespace(book_id=62, chapter=2, start_verse=20, end_verse=20)
 
         with patch(
-            "tools.holyrics.show_holyrics_text_slide",
-            return_value=(True, "sermon_plan_show_text"),
+            "tools.holyrics.restore_sermon_plan_after_quick_presentation",
+            return_value=(True, "sermon_plan_restore_verified", {"verified": True}),
         ) as show:
             result = handle_scripture_range_reading_match(args, verse_twenty)
 
@@ -1560,6 +1646,39 @@ class LiveReferencePipelineTest(unittest.TestCase):
             presentation,
             2,
         )
+
+    def test_failed_final_restore_keeps_long_passage_active_for_retry(self):
+        presentation = {
+            "type": "text",
+            "text_id": "sermon-plan",
+            "current_index": 0,
+        }
+        state = {
+            "ref": "1 Иоанна 2:1-20",
+            "book": "1 Иоанна",
+            "book_id": 62,
+            "current_index": 0,
+            "targets": [
+                {"slide_index": 0, "chapter": 2, "verse": 20, "text": "конец"},
+            ],
+        }
+        args = SimpleNamespace(
+            holyrics_url="http://127.0.0.1:8091",
+            _holyrics_sermon_plan_presentation=presentation,
+            _holyrics_scripture_range_reading=state,
+        )
+        verse_twenty = SimpleNamespace(book_id=62, chapter=2, start_verse=20, end_verse=20)
+
+        with patch(
+            "tools.holyrics.restore_sermon_plan_after_quick_presentation",
+            return_value=(False, "quick_presentation_still_active", {"quick_states": []}),
+        ):
+            result = handle_scripture_range_reading_match(args, verse_twenty)
+
+        self.assertFalse(result["completed"])
+        self.assertTrue(result["completion_failed"])
+        self.assertTrue(scripture_range_reading_active(args))
+        self.assertIs(state, args._holyrics_scripture_range_reading)
 
     def test_complete_single_verse_after_chapter_still_matches(self):
         pipeline = LiveReferencePipeline()

@@ -7,6 +7,7 @@ import json
 import os
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Any
 from urllib import request
@@ -33,6 +34,8 @@ REQUIRED_HOLYRICS_PERMISSIONS = (
     "GetAPIServerInfo",
     "GetBibleSettings",
     "GetCurrentPresentation",
+    "GetCurrentQuickPresentation",
+    "CloseCurrentQuickPresentation",
     "CloseCurrentPresentation",
     "SetBibleSettings",
     "ShowQuickPresentation",
@@ -592,21 +595,136 @@ def get_holyrics_current_presentation(
     *,
     include_slides: bool = False,
 ) -> dict[str, Any] | None:
-    ok, reason, body = post_holyrics_api(
+    state_ok, current, _response = get_holyrics_presentation_state(
         args,
         base_url,
         "GetCurrentPresentation",
         {"include_slides": include_slides},
     )
+    return current if state_ok else None
+
+
+def get_holyrics_presentation_state(
+    args: Any,
+    base_url: str,
+    endpoint: str,
+    body: dict[str, Any] | None = None,
+) -> tuple[bool, dict[str, Any] | None, str]:
+    """Return both API success and the presentation state for verification."""
+    ok, reason, response = post_holyrics_api(args, base_url, endpoint, body or {})
+    response_summary = response or reason or ("ok" if ok else "failed")
     if not ok:
-        holyrics_log(f"GetCurrentPresentation response={body or reason or 'failed'}")
-        return None
+        holyrics_log(f"{endpoint} response={response_summary}")
+        return False, None, response_summary
     try:
-        parsed = json.loads(body)
+        parsed = json.loads(response)
     except json.JSONDecodeError:
-        return None
+        holyrics_log(f"{endpoint} returned invalid JSON: {response_summary}")
+        return False, None, response_summary
     data = parsed.get("data") if isinstance(parsed, dict) else None
-    return data if isinstance(data, dict) else None
+    if data is None:
+        return True, None, response_summary
+    if isinstance(data, dict):
+        return True, data, response_summary
+    holyrics_log(f"{endpoint} returned unexpected data: {response_summary}")
+    return False, None, response_summary
+
+
+def close_holyrics_quick_presentation_verified(
+    args: Any,
+    base_url: str,
+) -> tuple[bool, str, dict[str, Any]]:
+    """Close a quick presentation and verify that its overlay disappeared."""
+    diagnostics: dict[str, Any] = {"close_responses": [], "quick_states": []}
+    for attempt in range(2):
+        ok, reason, body = post_holyrics_api(
+            args,
+            base_url,
+            "CloseCurrentQuickPresentation",
+            {},
+        )
+        response_summary = body or reason or ("ok" if ok else "failed")
+        diagnostics["close_responses"].append(response_summary)
+        holyrics_log(f"CloseCurrentQuickPresentation response={response_summary}")
+        if not ok:
+            return False, reason or "quick_presentation_close_failed", diagnostics
+
+        state_ok, current, state_response = get_holyrics_presentation_state(
+            args,
+            base_url,
+            "GetCurrentQuickPresentation",
+        )
+        diagnostics["quick_states"].append(
+            {"ok": state_ok, "data": current, "response": state_response}
+        )
+        if not state_ok:
+            return False, "quick_presentation_state_unavailable", diagnostics
+        if not current:
+            return True, "quick_presentation_closed", diagnostics
+        if attempt == 0:
+            time.sleep(0.15)
+
+    return False, "quick_presentation_still_active", diagnostics
+
+
+def restore_sermon_plan_after_quick_presentation(
+    args: Any,
+    base_url: str,
+    presentation: dict[str, Any],
+    slide_index: int,
+) -> tuple[bool, str, dict[str, Any]]:
+    """Close a Bible quick presentation and verify the sermon-plan return."""
+    text_id = str(presentation.get("text_id") or presentation.get("id") or "").strip()
+    if not text_id:
+        return False, "sermon_plan_text_id_missing", {}
+
+    closed, close_reason, diagnostics = close_holyrics_quick_presentation_verified(
+        args,
+        base_url,
+    )
+    if not closed:
+        return False, close_reason, diagnostics
+
+    diagnostics["show_text_responses"] = []
+    diagnostics["presentation_states"] = []
+    cancel_holyrics_restore_timer()
+    for attempt in range(2):
+        ok, reason, body = post_holyrics_api(
+            args,
+            base_url,
+            "ShowText",
+            {"id": text_id, "initial_index": slide_index},
+        )
+        response_summary = body or reason or ("ok" if ok else "failed")
+        diagnostics["show_text_responses"].append(response_summary)
+        holyrics_log(f"ShowText long-passage restore response={response_summary}")
+        if not ok:
+            return False, reason or "sermon_plan_show_text_failed", diagnostics
+
+        time.sleep(0.15)
+        state_ok, current, state_response = get_holyrics_presentation_state(
+            args,
+            base_url,
+            "GetCurrentPresentation",
+        )
+        diagnostics["presentation_states"].append(
+            {"ok": state_ok, "data": current, "response": state_response}
+        )
+        current_type = str((current or {}).get("type") or "").strip()
+        current_text_id = str(
+            (current or {}).get("text_id") or (current or {}).get("id") or ""
+        ).strip()
+        try:
+            current_index = max(0, int((current or {}).get("slide_number") or 1) - 1)
+        except (TypeError, ValueError):
+            current_index = -1
+        if state_ok and current_type == "text" and current_text_id == text_id and current_index == slide_index:
+            presentation["slide_number"] = slide_index + 1
+            return True, "sermon_plan_restore_verified", diagnostics
+        if attempt == 0:
+            time.sleep(0.15)
+
+    return False, "sermon_plan_restore_not_verified", diagnostics
 
 
 def restore_holyrics_presentation(args: Any, base_url: str, previous: dict[str, Any] | None) -> None:
@@ -1099,27 +1217,48 @@ def handle_scripture_range_reading_match(args: Any, candidate: Any) -> dict:
         }
     next_index = current_index + 1
     if next_index >= len(targets):
-        clear_scripture_range_reading(args)
+        base_url = str(getattr(args, "holyrics_url", "")).rstrip("/")
         presentation = getattr(args, "_holyrics_sermon_plan_presentation", None)
-        restored = False
-        restore_reason = "sermon_plan_not_loaded"
         if isinstance(presentation, dict):
             try:
                 return_index = max(0, int(presentation.get("current_index") or 0))
             except (TypeError, ValueError):
                 return_index = 0
-            restored, restore_reason = show_holyrics_text_slide(
-                args,
-                str(getattr(args, "holyrics_url", "")).rstrip("/"),
-                presentation,
-                return_index,
+            restored, restore_reason, restore_diagnostics = (
+                restore_sermon_plan_after_quick_presentation(
+                    args,
+                    base_url,
+                    presentation,
+                    return_index,
+                )
             )
+        else:
+            restored, restore_reason, restore_diagnostics = (
+                close_holyrics_quick_presentation_verified(
+                    args,
+                    base_url,
+                )
+            )
+        if not restored:
+            return {
+                "active": True,
+                "matched_boundary": True,
+                "completed": False,
+                "completion_failed": True,
+                "restored_sermon_plan": False,
+                "reason": restore_reason,
+                "restore_diagnostics": restore_diagnostics,
+                "current_index": current_index,
+                "target": target,
+            }
+        clear_scripture_range_reading(args)
         return {
             "active": False,
             "matched_boundary": True,
             "completed": True,
-            "restored_sermon_plan": restored,
+            "restored_sermon_plan": isinstance(presentation, dict),
             "reason": restore_reason if isinstance(presentation, dict) else "long_passage_completed",
+            "restore_diagnostics": restore_diagnostics,
             "current_index": current_index,
             "target": target,
         }
