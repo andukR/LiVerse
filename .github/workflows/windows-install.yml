@@ -15,12 +15,14 @@ jobs:
 
       - name: Install LiVerse with Windows updater
         shell: powershell
+        env:
+          LIVERSE_TEST_BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
           $target = Join-Path $env:RUNNER_TEMP "LiVerse"
           .\update-liverse-windows.ps1 `
             -TargetDir $target `
             -RepoUrl "https://github.com/${{ github.repository }}.git" `
-            -Branch "${{ github.ref_name }}"
+            -Branch $env:LIVERSE_TEST_BRANCH
 
       - name: Verify installed LiVerse
         shell: powershell
