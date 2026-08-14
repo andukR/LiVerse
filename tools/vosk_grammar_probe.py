@@ -91,6 +91,46 @@ EDIT_SETTINGS_KEYS = {"e", "E"}
 QUIT_KEYS = {"q", "Q"}
 
 
+def audio_input_candidate_indices(
+    devices: list[dict],
+    *,
+    preferred_name: str = "",
+    explicit_index: int | None = None,
+    default_index: int | None = None,
+) -> list[int]:
+    """Rank usable input devices without relying only on unstable indexes."""
+    result: list[int] = []
+
+    def add(index: object) -> None:
+        if not isinstance(index, int) or index < 0 or index >= len(devices):
+            return
+        try:
+            input_channels = int(devices[index].get("max_input_channels") or 0)
+        except (AttributeError, TypeError, ValueError):
+            input_channels = 0
+        if input_channels > 0 and index not in result:
+            result.append(index)
+
+    selected_name = preferred_name.strip().casefold()
+    if selected_name:
+        exact: list[int] = []
+        partial: list[int] = []
+        for index, device in enumerate(devices):
+            name = str(device.get("name") or "").strip().casefold()
+            if name == selected_name:
+                exact.append(index)
+            elif selected_name in name:
+                partial.append(index)
+        for index in [*exact, *partial]:
+            add(index)
+
+    add(explicit_index)
+    add(default_index)
+    for index in range(len(devices)):
+        add(index)
+    return result
+
+
 def text_detection_database_startup_message(mode: str, database_path: Path) -> str:
     """Return an actionable startup message when text search has no database."""
     if mode == "address_only" or database_path.is_file():
@@ -2044,28 +2084,17 @@ def run_microphone(args: argparse.Namespace) -> int:
 
     def input_device_candidates() -> tuple[list[int], list[dict]]:
         devices = list(sd.query_devices())
-        result: list[int] = []
-
-        def add(index: object) -> None:
-            if not isinstance(index, int) or index < 0 or index >= len(devices):
-                return
-            if index not in result:
-                result.append(index)
-
-        add(args.device)
         default_device = sd.default.device
         if isinstance(default_device, (list, tuple)):
-            add(default_device[0])
+            default_input = default_device[0]
         else:
-            add(default_device)
-
-        for index, device in enumerate(devices):
-            try:
-                input_channels = int(device.get("max_input_channels") or 0)
-            except (TypeError, ValueError):
-                input_channels = 0
-            if input_channels > 0:
-                add(index)
+            default_input = default_device
+        result = audio_input_candidate_indices(
+            devices,
+            preferred_name=args.device_name,
+            explicit_index=args.device,
+            default_index=default_input,
+        )
         return result, devices
 
     def find_working_audio_input() -> tuple[dict | None, list[dict], list[str]]:
@@ -2506,6 +2535,14 @@ def main() -> int:
     parser.add_argument("--samplerate", type=int, default=16000)
     parser.add_argument("--blocksize", type=int, default=8000)
     parser.add_argument("--device", type=int)
+    parser.add_argument(
+        "--device-name",
+        default=env_setting("LIVERSE_AUDIO_DEVICE", ""),
+        help=(
+            "Prefer an input device by stable name (case-insensitive substring); "
+            "falls back to --device, the system default, then other inputs."
+        ),
+    )
     parser.add_argument("--list-audio-devices", action="store_true", help="Print microphone/input device list and exit.")
     parser.add_argument("--open-vocabulary", action="store_true", help="Run Vosk without generated grammar.")
     parser.add_argument(
