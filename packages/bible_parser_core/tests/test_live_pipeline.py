@@ -20,6 +20,49 @@ from tools.holyrics import (
 
 
 class LiveReferencePipelineTest(unittest.TestCase):
+    def test_audio_input_candidates_prefer_stable_name_over_indexes(self):
+        from tools.vosk_grammar_probe import audio_input_candidate_indices
+
+        devices = [
+            {"name": "Microsoft Sound Mapper", "max_input_channels": 2},
+            {"name": "Virtual Mic for AudioRelay", "max_input_channels": 2},
+            {"name": "Microphone (USB2.0 Device)", "max_input_channels": 1},
+            {"name": "HDMI Output", "max_input_channels": 0},
+        ]
+
+        result = audio_input_candidate_indices(
+            devices,
+            preferred_name="usb2.0 device",
+            explicit_index=1,
+            default_index=0,
+        )
+
+        self.assertEqual([2, 1, 0], result)
+
+    def test_audio_input_candidates_fall_back_from_missing_name(self):
+        from tools.vosk_grammar_probe import audio_input_candidate_indices
+
+        devices = [
+            {"name": "Default microphone", "max_input_channels": 1},
+            {"name": "Speakers", "max_input_channels": 0},
+            {"name": "Backup microphone", "max_input_channels": 1},
+        ]
+
+        result = audio_input_candidate_indices(
+            devices,
+            preferred_name="disconnected headset",
+            default_index=0,
+        )
+
+        self.assertEqual([0, 2], result)
+
+    def test_windows_updater_reexec_uses_call_without_broken_nested_quotes(self):
+        project_root = Path(__file__).resolve().parents[3]
+        updater = (project_root / "update-liverse-windows.cmd").read_text(encoding="utf-8")
+
+        self.assertIn('call "%TEMP_SCRIPT%" "%TARGET_DIR%"', updater)
+        self.assertNotIn('cmd /d /c ""%TEMP_SCRIPT%" "%TARGET_DIR%""', updater)
+
     def test_liverse_version_is_consistent_across_packages_and_metadata(self):
         import tomllib
 
