@@ -11,3 +11,11 @@ if "%~1"=="" (
 ) else (
   python tools\vosk_grammar_probe.py %*
 )
+set "LIVERSE_EXIT=%ERRORLEVEL%"
+if not "%LIVERSE_EXIT%"=="0" (
+  echo.
+  echo LiVerse stopped with error code %LIVERSE_EXIT%.
+  echo The error message is shown above. Press any key to close this window.
+  pause >nul
+)
+exit /b %LIVERSE_EXIT%

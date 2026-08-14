@@ -102,6 +102,48 @@ class LiveReferencePipelineTest(unittest.TestCase):
             permissions,
         )
 
+    def test_holyrics_startup_waits_until_server_is_available(self):
+        from tools.vosk_grammar_probe import wait_for_holyrics_startup
+
+        args = SimpleNamespace()
+        fake_stdin = SimpleNamespace(isatty=lambda: True)
+        with (
+            patch(
+                "tools.vosk_grammar_probe.check_holyrics_startup",
+                side_effect=[False, True],
+            ) as check,
+            patch("tools.vosk_grammar_probe.sys.stdin", fake_stdin),
+            patch("tools.vosk_grammar_probe.read_single_key", return_value="\r"),
+            patch("builtins.print"),
+        ):
+            result = wait_for_holyrics_startup(args)
+
+        self.assertEqual("ready", result)
+        self.assertEqual(2, check.call_count)
+
+    def test_holyrics_startup_can_be_closed_explicitly(self):
+        from tools.vosk_grammar_probe import wait_for_holyrics_startup
+
+        args = SimpleNamespace()
+        fake_stdin = SimpleNamespace(isatty=lambda: True)
+        with (
+            patch("tools.vosk_grammar_probe.check_holyrics_startup", return_value=False),
+            patch("tools.vosk_grammar_probe.sys.stdin", fake_stdin),
+            patch("tools.vosk_grammar_probe.read_single_key", return_value="q"),
+            patch("builtins.print"),
+        ):
+            result = wait_for_holyrics_startup(args)
+
+        self.assertEqual("quit", result)
+
+    def test_windows_runner_keeps_console_open_after_error(self):
+        project_root = Path(__file__).resolve().parents[3]
+        runner = (project_root / "run-liverse.cmd").read_text(encoding="utf-8")
+
+        self.assertIn('set "LIVERSE_EXIT=%ERRORLEVEL%"', runner)
+        self.assertIn('if not "%LIVERSE_EXIT%"=="0"', runner)
+        self.assertIn("pause >nul", runner)
+
     def test_full_startup_setup_reopens_holyrics_wizard_and_keeps_token(self):
         import os
         import tempfile

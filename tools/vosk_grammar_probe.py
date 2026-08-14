@@ -474,15 +474,15 @@ def ask_holyrics_quick_presentation_minutes(args: argparse.Namespace) -> None:
         return
 
 
-def check_holyrics_startup(args: argparse.Namespace, logger: JsonlLogger | None = None) -> None:
+def check_holyrics_startup(args: argparse.Namespace, logger: JsonlLogger | None = None) -> bool:
     if not holyrics_output_enabled(args):
-        return
+        return True
 
     if not args.holyrics_token:
         print("", flush=True)
         print("Holyrics: HOLYRICS_TOKEN не задан. Вывод в Holyrics работать не будет.", flush=True)
         print("Укажите token из Holyrics -> Settings -> API Server -> Manage permissions в файле .env.", flush=True)
-        return
+        return True
 
     result = check_holyrics_api_server(args)
     if logger:
@@ -504,7 +504,7 @@ def check_holyrics_startup(args: argparse.Namespace, logger: JsonlLogger | None 
                 for permission in THEME_HOLYRICS_PERMISSIONS:
                     print(f"  - {permission}", flush=True)
             print(f"Техническая причина: {result.get('token_info_reason')}", flush=True)
-            return
+            return True
 
         version = str(result.get("version") or "").strip()
         if version:
@@ -522,7 +522,7 @@ def check_holyrics_startup(args: argparse.Namespace, logger: JsonlLogger | None 
             for permission in missing_permissions:
                 print(f"  - {permission}", flush=True)
             print("Откройте Holyrics -> Settings -> API Server -> Manage permissions.", flush=True)
-        return
+        return True
 
     print("", flush=True)
     print("Holyrics: API Server сейчас недоступен.", flush=True)
@@ -535,6 +535,29 @@ def check_holyrics_startup(args: argparse.Namespace, logger: JsonlLogger | None 
         for permission in THEME_HOLYRICS_PERMISSIONS:
             print(f"  - {permission}", flush=True)
     print(f"Техническая причина: {result.get('reason')}", flush=True)
+    return False
+
+
+def wait_for_holyrics_startup(
+    args: argparse.Namespace,
+    logger: JsonlLogger | None = None,
+) -> str:
+    """Keep an interactive launch open until Holyrics is ready or the user quits."""
+    while not check_holyrics_startup(args, logger):
+        if not sys.stdin.isatty():
+            return "unavailable"
+        print("", flush=True)
+        print("Запустите HoLyrics и дождитесь открытия его главного окна.", flush=True)
+        print("Enter — проверить снова; Q — закрыть LiVerse.", flush=True)
+        while True:
+            key = read_single_key()
+            if key in ENTER_KEYS:
+                print("Повторная проверка HoLyrics...", flush=True)
+                break
+            if key in QUIT_KEYS:
+                print("LiVerse закрыт пользователем.", flush=True)
+                return "quit"
+    return "ready"
 
 
 class ConsoleStatus:
@@ -1886,7 +1909,11 @@ def run_microphone(args: argparse.Namespace) -> int:
             "grammar": None if grammar is None else grammar_diagnostics(grammar),
         }
     )
-    check_holyrics_startup(args, logger)
+    holyrics_state = wait_for_holyrics_startup(args, logger)
+    if holyrics_state == "quit":
+        return 0
+    if holyrics_state != "ready":
+        return 2
     SetLogLevel(args.vosk_log_level)
     model = Model(str(args.model))
     sermon_plan = None
