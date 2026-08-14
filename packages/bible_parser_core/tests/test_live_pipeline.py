@@ -572,6 +572,49 @@ class LiveReferencePipelineTest(unittest.TestCase):
             sum(item.args[2] == "CloseCurrentQuickPresentation" for item in api.call_args_list),
         )
 
+    def test_finished_quick_presentation_still_restores_sermon_plan(self):
+        from tools.holyrics import restore_sermon_plan_after_quick_presentation
+
+        args = SimpleNamespace()
+        presentation = {"type": "text", "text_id": "sermon-plan"}
+        responses = [
+            (
+                False,
+                "holyrics_error:No quick presentation available",
+                '{"status":"error","error":"No quick presentation available"}',
+            ),
+            (True, "", '{"status":"ok"}'),
+            (
+                True,
+                "",
+                '{"status":"ok","data":{"type":"text","id":"sermon-plan","slide_number":3}}',
+            ),
+        ]
+
+        with (
+            patch("tools.holyrics.post_holyrics_api", side_effect=responses) as api,
+            patch("tools.holyrics.time.sleep"),
+        ):
+            ok, reason, diagnostics = restore_sermon_plan_after_quick_presentation(
+                args,
+                "http://127.0.0.1:8091",
+                presentation,
+                2,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual("sermon_plan_restore_verified", reason)
+        self.assertEqual(
+            [
+                "CloseCurrentQuickPresentation",
+                "ShowText",
+                "GetCurrentPresentation",
+            ],
+            [item.args[2] for item in api.call_args_list],
+        )
+        self.assertEqual(1, len(diagnostics["close_responses"]))
+        self.assertEqual([], diagnostics["quick_states"])
+
     def test_context_range_resolves_chapter_and_verse_without_book(self):
         pipeline = LiveReferencePipeline()
         context = pipeline.process_text("первое послание иоанна вторая глава с двенадцатого по семнадцатый стих")

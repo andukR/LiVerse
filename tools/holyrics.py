@@ -647,6 +647,11 @@ def close_holyrics_quick_presentation_verified(
         diagnostics["close_responses"].append(response_summary)
         holyrics_log(f"CloseCurrentQuickPresentation response={response_summary}")
         if not ok:
+            no_quick_presentation = "no quick presentation available" in (
+                f"{reason} {body}".casefold()
+            )
+            if no_quick_presentation:
+                return True, "quick_presentation_already_closed", diagnostics
             return False, reason or "quick_presentation_close_failed", diagnostics
 
         state_ok, current, state_response = get_holyrics_presentation_state(
