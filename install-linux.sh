@@ -21,6 +21,9 @@ if [ "$desktop_only" = false ]; then
     .venv/bin/pip install --upgrade pip
     .venv/bin/pip install -r requirements.txt
     .venv/bin/pip install -e .
+    .venv/bin/python -c \
+        'import sys; from pathlib import Path; from bible_parser_core.sherpa_streaming import ensure_sherpa_model; ensure_sherpa_model(Path(sys.argv[1]))' \
+        "$project_dir/.cache/liverse/models/vosk-model-small-streaming-ru-0.54"
 fi
 
 apps_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
@@ -37,10 +40,11 @@ Type=Application
 Name=LiVerse
 Comment=Распознавание библейских ссылок и показ через Holyrics
 Categories=Utility;
-Terminal=true
+Terminal=false
 Path=$project_dir
-Exec=make liverse
+Exec=$project_dir/.venv/bin/python $project_dir/tools/liverse_gui.py
 Icon=$icon_file
+StartupWMClass=Liverse
 StartupNotify=false
 EOF
 chmod +x "$desktop_file"
@@ -50,5 +54,7 @@ if command -v update-desktop-database >/dev/null 2>&1; then
 fi
 
 printf '\nГотово. Запускайте так:\n'
+printf '  make gui\n'
+printf '\nДиагностический запуск с консолью:\n'
 printf '  make liverse\n'
 printf '\nТакже создан ярлык в меню приложений: LiVerse\n'

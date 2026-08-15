@@ -7,7 +7,9 @@ requires-python = ">=3.10"
 dependencies = [
   "sounddevice",
   "vosk",
+  "sherpa-onnx==1.13.4",
   "qrcode[pil]",
+  "pystray==0.19.5",
   "pymorphy3",
   "pymorphy3-dicts-ru",
   "rapidfuzz",
@@ -16,6 +18,7 @@ dependencies = [
 
 [project.scripts]
 liverse = "tools.vosk_grammar_probe:main"
+liverse-gui = "tools.liverse_gui:main"
 liverse-analyze = "tools.analyze_vosk_probe_logs:main"
 liverse-slide-server = "tools.slide_server:main"
 liverse-replay-transcript = "tools.replay_transcript:main"

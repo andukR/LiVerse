@@ -1,6 +1,8 @@
 sounddevice
 vosk
+sherpa-onnx==1.13.4
 qrcode[pil]
+pystray==0.19.5
 pysword
 pymorphy3
 pymorphy3-dicts-ru

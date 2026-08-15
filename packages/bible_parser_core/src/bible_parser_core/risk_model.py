@@ -237,6 +237,25 @@ def score_payload_with_model(payload: dict, model: dict, asr_result: dict | None
     if payload.get("source") == "parser_missing_twenty_range":
         needs_confirmation = True
         decision_reasons.append("missing_tens_range_repair")
+    text = f"{payload.get('text') or ''} {payload.get('vosk_text') or ''}".lower().replace("ё", "е")
+    context_blockers = {
+        "contains_unk",
+        "very_fast_speech",
+        "assembled_from_buffer",
+        "blocked_weak_context",
+        "confusable_book_alternative",
+        "confusable_number_alternative",
+    }
+    if (
+        payload.get("source") == "context_range"
+        and re.search(r"\bстих\w*\b", text)
+        and parsed.get("ref")
+        and not payload.get("ambiguous_alternatives")
+        and not payload.get("invalid_reference")
+        and not (risk_reasons & context_blockers)
+    ):
+        needs_confirmation = False
+        decision_reasons.append("trusted_explicit_context_verse")
     if (
         parsed.get("ref") == "Иоанн 3:16"
         and payload.get("source") == "parser"

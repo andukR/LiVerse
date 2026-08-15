@@ -996,6 +996,13 @@ def should_block_matched_payload(payload: dict) -> str | None:
             return "gospel_book_conflict"
 
     if (
+        str(parsed.get("book") or "") in {"Матфей", "Марк", "Лука", "Иоанн"}
+        and re.search(r"\bгод\w*\b", normalized)
+        and not re.search(r"\b(?:глав|стих)\w*\b", raw_text)
+    ):
+        return "gospel_history_year_not_reference"
+
+    if (
         re.search(r"\bпослани[ея]\s+сям\b", normalized)
         and not re.search(r"\bкол\s+сям\b", raw_text)
     ):
@@ -1323,8 +1330,14 @@ def score_reference_risk(payload: dict, asr_result: dict | None = None) -> dict:
         score += 0.1
         reasons.append("repeated_range_end_repair")
     if payload.get("source") == "context_range":
-        score += 0.5
-        reasons.append("context_range_reference")
+        if re.search(r"\bстих\w*\b", normalized):
+            # The already confirmed range fixes the book, chapter and allowed
+            # verse boundaries.  An explicit verse marker is therefore a
+            # strong cue, not an extra source of risk.
+            reasons.append("explicit_context_range_reference")
+        else:
+            score += 0.5
+            reasons.append("context_range_reference")
     if payload.get("ambiguous_alternatives"):
         score += 0.15
         alternative_books = {
@@ -1367,6 +1380,18 @@ def add_risk_score(payload: dict, asr_result: dict | None = None) -> dict:
     return payload
 
 
+def unconnected_spoken_verse_range(normalized: str) -> tuple[int, int] | None:
+    match = re.search(
+        r"\b(?P<start>\d{1,3})\s+(?P<end>\d{1,3})\s+стих\w*\b",
+        normalized,
+    )
+    if not match:
+        return None
+    start_verse = int(match.group("start"))
+    end_verse = int(match.group("end"))
+    return (start_verse, end_verse) if start_verse < end_verse else None
+
+
 def same_place_candidates(candidates: list[str], last_parsed: dict | ParsedReference | None) -> list[str]:
     if isinstance(last_parsed, ParsedReference):
         book = last_parsed.book
@@ -1380,9 +1405,22 @@ def same_place_candidates(candidates: list[str], last_parsed: dict | ParsedRefer
     if not book or not chapter:
         return candidates
 
+    has_explicit_book_context = any(
+        any(book.score >= 0.95 for book in book_candidates(normalize_text(candidate)))
+        for candidate in candidates
+    )
     expanded: list[str] = []
     for candidate in candidates:
         expanded.append(candidate)
+        normalized = normalize_text(candidate)
+        unconnected_range = unconnected_spoken_verse_range(normalized)
+        if (
+            unconnected_range
+            and not has_explicit_book_context
+            and not re.search(r"\b(?:глав|псал)\w*\b", normalized)
+            and unconnected_range[0] != int(chapter)
+        ):
+            expanded.append(f"{book} {chapter} глава {candidate}")
         if not re.search(r"\bтам\s+же\b", candidate.lower().replace("ё", "е")):
             continue
         suffix = re.sub(r"\bтам\s+же\b", "", candidate, flags=re.IGNORECASE).strip()
@@ -1432,19 +1470,30 @@ def reference_range_context(reference: dict | ParsedReference | None) -> dict | 
 
 
 def book_family(book: str) -> str:
-    return re.sub(r"^[1234]\s+", "", book).strip().lower().replace("ё", "е")
+    family = re.sub(r"^[1234]\s+", "", book).strip().lower().replace("ё", "е")
+    # «Иоанн» может означать автора послания из текущего контекста,
+    # тогда как каноническое имя послания хранится как «1 Иоанна».
+    if family == "иоанна":
+        return "иоанн"
+    return family
 
 
 def has_explicit_other_book_marker(normalized: str, context: dict) -> bool:
     if re.search(r"\b(?:евангелие|книга|книги|пророк|пророка|псал\w*)\b", normalized):
         return True
-    if not re.search(r"\bпослани\w*\b", normalized):
-        return False
-    context_family = book_family(str(context.get("book") or ""))
-    candidates = book_candidates(normalized)
+    candidates = [candidate for candidate in book_candidates(normalized) if candidate.score >= 0.95]
     if not candidates:
         return False
-    return not any(book_family(candidate.book) == context_family for candidate in candidates)
+    candidate = candidates[0]
+    context_book = str(context.get("book") or "").strip()
+    if candidate.book == context_book:
+        return False
+    context_family = book_family(str(context.get("book") or ""))
+    if book_family(candidate.book) != context_family:
+        return True
+    candidate_number = re.match(r"^([1234])\s+", candidate.book)
+    context_number = re.match(r"^([1234])\s+", context_book)
+    return bool(candidate_number and candidate_number.group(1) != (context_number.group(1) if context_number else None))
 
 
 def context_range_contains(context: dict, chapter: int, verse: int) -> bool:
@@ -1508,6 +1557,19 @@ def contextual_spoken_verse_range(text: str, normalized: str) -> tuple[int, int]
     if connected:
         return int(connected.group("start")), int(connected.group("end"))
 
+    adjacent = re.search(
+        r"\b(?P<start>\d{1,3})\s+(?P<end>\d{1,3})\s+стих\w*\b",
+        normalized,
+    )
+    if adjacent:
+        return int(adjacent.group("start")), int(adjacent.group("end"))
+
+    # Compound ordinals such as "двадцать первом" are already normalized to
+    # one number ("21").  Re-reading their two source words here would turn
+    # them into a false reversed range 20-1.
+    if re.search(r"\b\d{1,3}\s+стих\w*\b", normalized):
+        return None
+
     raw_words = re.findall(r"[а-я]+", text.lower().replace("ё", "е"))
     for start_word, end_word, marker in zip(raw_words, raw_words[1:], raw_words[2:]):
         if not marker.startswith("стих"):
@@ -1538,6 +1600,9 @@ def contextual_short_reference(
     spoken_range = contextual_spoken_verse_range(text, normalized)
     if spoken_range:
         start_verse, end_verse = spoken_range
+    explicit_chapter = re.search(r"\b(?P<chapter>\d{1,3})\s+глав\w*\b", normalized)
+    if explicit_chapter:
+        chapter = int(explicit_chapter.group("chapter"))
     for pattern in (
         r"\b(?P<verse>\d{1,3})\s+стих\w*\s+(?P<chapter>\d{1,3})\s+глав\w*\b",
         r"\b(?P<chapter>\d{1,3})\s+глав\w*\s+(?P<verse>\d{1,3})(?:\s+стих\w*)?\b",
@@ -1824,7 +1889,15 @@ class LiveReferencePipeline:
             bible_path=self.bible_path,
             preferred_chapter=self.context_current_chapter,
         )
-        if context_payload:
+        explicit_buffered_reference = bool(
+            payload.get("matched")
+            and context_payload
+            and acceptable_buffer_context(
+                str(payload.get("text") or ""),
+                str(context_payload.get("text") or ""),
+            )
+        )
+        if context_payload and not explicit_buffered_reference:
             payload = context_payload
         payload["vosk_text"] = text
         payload["vosk_buffer"] = list(self.text_buffer.parts)

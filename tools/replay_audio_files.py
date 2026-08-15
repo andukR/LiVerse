@@ -26,6 +26,12 @@ from vosk import KaldiRecognizer, Model, SetLogLevel
 from bible_parser_core.bible_text_search import BibleTextSearcher
 from bible_parser_core.live_pipeline import LiveReferencePipeline, build_grammar, grammar_diagnostics
 from bible_parser_core.parser import DEFAULT_BIBLE, parse_live_reference
+from bible_parser_core.sherpa_streaming import (
+    DEFAULT_SHERPA_THREADS,
+    SherpaReplayRecognizer,
+    load_sherpa_recognizer,
+    sherpa_result_to_vosk_result,
+)
 from bible_parser_core.text_citation_detector import ScriptureTextDetector
 from bible_parser_core.verse_text_search import CANONICAL_BOOK_NAMES_BY_ID
 from tools.holyrics import scripture_range
@@ -72,6 +78,13 @@ DEFAULT_SEARCH_ROOTS = (
 )
 LATEST_REPLAY_BATCH = "latest_replay_batch.json"
 DEFAULT_TARGET_ANNOTATIONS = 200
+DEFAULT_SHERPA_MODEL_PATH = (
+    PROJECT_ROOT
+    / ".cache"
+    / "liverse"
+    / "models"
+    / "vosk-model-small-streaming-ru-0.54"
+)
 BOOK_IDS_BY_CANONICAL_NAME = {
     book_name: book_id for book_id, book_name in CANONICAL_BOOK_NAMES_BY_ID.items()
 }
@@ -445,6 +458,91 @@ def citation_summary_lines(
     return lines
 
 
+def citation_event_groups(cases: list[dict], *, merge_window_seconds: float = 15.0) -> list[dict]:
+    """Group overlapping detections that belong to one continuous quotation."""
+    groups: list[dict] = []
+    ordered = sorted(cases, key=lambda case: float_value(case.get("timecode_seconds")))
+    for case in ordered:
+        payload = case.get("payload") if isinstance(case.get("payload"), dict) else {}
+        book = str(payload.get("book") or "").strip()
+        chapter = int(payload.get("chapter") or 0)
+        end_chapter = int(payload.get("end_chapter") or chapter)
+        start_verse = int(payload.get("start_verse") or 0)
+        end_verse = int(payload.get("end_verse") or start_verse)
+        timecode_seconds = float_value(case.get("timecode_seconds"))
+        ref = str(case.get("ref") or "").strip()
+        source = citation_detection_label(case)
+
+        can_merge = False
+        if groups:
+            previous = groups[-1]
+            same_location = bool(
+                book
+                and book == previous["book"]
+                and chapter == previous["chapter"]
+                and end_chapter == previous["end_chapter"]
+            )
+            overlaps = bool(
+                start_verse
+                and previous["start_verse"]
+                and start_verse <= previous["end_verse"]
+                and end_verse >= previous["start_verse"]
+            )
+            same_reference = bool(ref and ref == previous["refs"][-1])
+            recent = timecode_seconds - previous["last_time"] <= merge_window_seconds
+            can_merge = recent and ((same_location and overlaps) or same_reference)
+
+        if can_merge:
+            previous = groups[-1]
+            previous["last_time"] = timecode_seconds
+            previous["start_verse"] = min(previous["start_verse"], start_verse)
+            previous["end_verse"] = max(previous["end_verse"], end_verse)
+            previous["refs"].append(ref)
+            if source not in previous["sources"]:
+                previous["sources"].append(source)
+            continue
+
+        groups.append(
+            {
+                "timecode": str(case.get("timecode") or ""),
+                "first_time": timecode_seconds,
+                "last_time": timecode_seconds,
+                "book": book,
+                "chapter": chapter,
+                "end_chapter": end_chapter,
+                "start_verse": start_verse,
+                "end_verse": end_verse,
+                "refs": [ref],
+                "sources": [source],
+            }
+        )
+    return groups
+
+
+def citation_event_reference(group: dict) -> str:
+    book = str(group.get("book") or "").strip()
+    chapter = int(group.get("chapter") or 0)
+    start_verse = int(group.get("start_verse") or 0)
+    end_verse = int(group.get("end_verse") or start_verse)
+    if book and chapter and start_verse:
+        suffix = str(start_verse) if end_verse == start_verse else f"{start_verse}-{end_verse}"
+        return f"{book} {chapter}:{suffix}"
+    refs = [str(ref) for ref in group.get("refs") or [] if str(ref).strip()]
+    return refs[0] if refs else ""
+
+
+def citation_event_summary_lines(cases: list[dict]) -> list[str]:
+    lines: list[str] = []
+    for index, group in enumerate(citation_event_groups(cases), start=1):
+        ref = citation_event_reference(group)
+        timecode = str(group.get("timecode") or "").strip()
+        sources = " + ".join(group.get("sources") or [])
+        merged_count = len(group.get("refs") or [])
+        suffix = f"; объединено окон: {merged_count}" if merged_count > 1 else ""
+        lines.append(f"{index}. {timecode}  {ref} — {sources}{suffix}")
+    return lines
+
+
 def latest_replay_cases(log_dir: Path) -> list[dict]:
     batch_path = log_dir / LATEST_REPLAY_BATCH
     if not batch_path.exists():
@@ -461,12 +559,23 @@ def latest_replay_cases(log_dir: Path) -> list[dict]:
 
 def print_latest_citation_summary(log_dir: Path, bible_path: Path = DEFAULT_BIBLE) -> None:
     print("Найденные цитаты:", flush=True)
-    lines = citation_summary_lines(latest_replay_cases(log_dir), bible_path=bible_path)
+    cases = latest_replay_cases(log_dir)
+    lines = citation_summary_lines(cases, bible_path=bible_path)
     if not lines:
         print("  цитаты не найдены", flush=True)
         return
     for line in lines:
         print(f"  {line}", flush=True)
+    event_lines = citation_event_summary_lines(cases)
+    print("", flush=True)
+    print(
+        f"Смысловых цитирований без перекрывающихся повторов: {len(event_lines)} "
+        f"(окон распознавания: {len(lines)})",
+        flush=True,
+    )
+    if len(event_lines) < len(lines):
+        for line in event_lines:
+            print(f"  {line}", flush=True)
 
 
 def is_unreviewed_case(case: dict) -> bool:
@@ -659,7 +768,7 @@ def pcm_chunks(path: Path, sample_rate: int, chunk_bytes: int):
 def replay_audio_file(
     path: Path,
     args: argparse.Namespace,
-    model: Model,
+    model: object,
     grammar: list[str] | None,
     text_searcher: BibleTextSearcher | None,
 ) -> Path | None:
@@ -671,11 +780,14 @@ def replay_audio_file(
         else None
     )
     replay_state: dict[str, dict | None] = {"long_passage": None}
-    recognizer_args = [model, args.samplerate]
-    if grammar is not None:
-        recognizer_args.append(json.dumps(grammar, ensure_ascii=False))
-    recognizer = KaldiRecognizer(*recognizer_args)
-    recognizer.SetWords(True)
+    if args.asr_engine == "sherpa-0.54":
+        recognizer = SherpaReplayRecognizer(model, args.samplerate)
+    else:
+        recognizer_args = [model, args.samplerate]
+        if grammar is not None:
+            recognizer_args.append(json.dumps(grammar, ensure_ascii=False))
+        recognizer = KaldiRecognizer(*recognizer_args)
+        recognizer.SetWords(True)
 
     audio_path = ""
     audio_log = None
@@ -690,7 +802,16 @@ def replay_audio_file(
         {
             "mode": "audio_replay",
             "source_audio": str(path),
-            "model": str(args.model),
+            "asr_engine": args.asr_engine,
+            "model": str(args.sherpa_model if args.asr_engine == "sherpa-0.54" else args.model),
+            "sherpa_threads": (
+                args.sherpa_threads if args.asr_engine == "sherpa-0.54" else None
+            ),
+            "asr_confidence": (
+                "derived_from_subword_probabilities"
+                if args.asr_engine == "sherpa-0.54"
+                else "vosk_word_confidence"
+            ),
             "bible": str(args.bible),
             "samplerate": args.samplerate,
             "chunk_bytes": args.chunk_bytes,
@@ -711,8 +832,13 @@ def replay_audio_file(
                 audio_log.writeframes(data)
             audio_bytes_seen += len(data)
             replay_seconds = audio_bytes_seen / float(args.samplerate * 2)
-            if recognizer.AcceptWaveform(data):
-                result = json.loads(recognizer.Result())
+            if args.asr_engine == "sherpa-0.54":
+                results = recognizer.accept_waveform(data, replay_seconds)
+            elif recognizer.AcceptWaveform(data):
+                results = [json.loads(recognizer.Result())]
+            else:
+                results = []
+            for result in results:
                 trigger_case_count += handle_result(
                     result,
                     pipeline,
@@ -725,9 +851,14 @@ def replay_audio_file(
                     replay_state=replay_state,
                 )
 
-        final_result = json.loads(recognizer.FinalResult())
-        if final_result.get("text"):
-            replay_seconds = audio_bytes_seen / float(args.samplerate * 2)
+        replay_seconds = audio_bytes_seen / float(args.samplerate * 2)
+        if args.asr_engine == "sherpa-0.54":
+            final_results = recognizer.final_results()
+        else:
+            final_results = [json.loads(recognizer.FinalResult())]
+        for final_result in final_results:
+            if not final_result.get("text"):
+                continue
             trigger_case_count += handle_result(
                 final_result,
                 pipeline,
@@ -897,6 +1028,14 @@ def parse_args() -> argparse.Namespace:
         help="Where downloaded audio files are stored.",
     )
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL_PATH)
+    parser.add_argument(
+        "--asr-engine",
+        choices=["vosk-0.22", "sherpa-0.54"],
+        default="vosk-0.22",
+        help="Speech engine used for replay; normal LiVerse remains on vosk-0.22.",
+    )
+    parser.add_argument("--sherpa-model", type=Path, default=DEFAULT_SHERPA_MODEL_PATH)
+    parser.add_argument("--sherpa-threads", type=int, default=DEFAULT_SHERPA_THREADS)
     parser.add_argument("--bible", type=Path, default=DEFAULT_BIBLE)
     parser.add_argument("--samplerate", type=int, default=16000)
     parser.add_argument("--chunk-bytes", type=int, default=8000)
@@ -1006,8 +1145,15 @@ def main() -> int:
     if not files:
         raise SystemExit("Нет аудиофайлов для replay.")
 
-    SetLogLevel(args.vosk_log_level)
-    model = Model(str(args.model))
+    if args.asr_engine == "sherpa-0.54":
+        model = load_sherpa_recognizer(
+            args.sherpa_model,
+            sample_rate=args.samplerate,
+            num_threads=args.sherpa_threads,
+        )
+    else:
+        SetLogLevel(args.vosk_log_level)
+        model = Model(str(args.model))
     text_detection_enabled = args.citation_detection_mode != "address_only"
     grammar = None if (args.open_vocabulary or text_detection_enabled) else build_grammar()
     text_searcher = None

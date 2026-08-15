@@ -496,7 +496,7 @@ function Install-LiVerse {
             -VenvPython $VenvPython `
             -PipArgs @("install", "--disable-pip-version-check", "-r", "requirements.txt") `
             -Description "requirements installation" `
-            -VerifyImports "import vosk, sounddevice, qrcode, pysword; print('requirements import OK')"
+            -VerifyImports "import vosk, sherpa_onnx, sounddevice, qrcode, pysword; print('requirements import OK')"
 
         # Avoid an isolated temporary build environment: it caused WinError 5.
         Invoke-PipInstallOrVerify `
@@ -505,7 +505,7 @@ function Install-LiVerse {
             -Description "LiVerse editable installation" `
             -VerifyImports "import bible_parser_core; print('bible_parser_core import OK')"
 
-        & $VenvPython -c "import vosk, sounddevice, bible_parser_core; print('Import check OK')"
+        & $VenvPython -c "import vosk, sherpa_onnx, sounddevice, bible_parser_core; print('Import check OK')"
         if ($LASTEXITCODE -ne 0) { Fail "Import check failed." }
 
         if (-not (Test-Path ".env")) {
@@ -523,19 +523,36 @@ function Install-LiVerse {
     }
 }
 
+function Ensure-SpeechModel {
+    param([string]$VenvPython)
+
+    Write-Step "Installing the Vosk 0.54 speech model"
+    $modelDir = Join-Path $TargetDir ".cache\liverse\models\vosk-model-small-streaming-ru-0.54"
+    $modelCode = "import sys; from pathlib import Path; from bible_parser_core.sherpa_streaming import ensure_sherpa_model; ensure_sherpa_model(Path(sys.argv[1]))"
+    & $VenvPython -c $modelCode $modelDir
+    if ($LASTEXITCODE -ne 0) {
+        Fail "Could not install the Vosk 0.54 speech model."
+    }
+}
+
 function New-DesktopShortcut {
     Write-Step "Creating the desktop shortcut"
 
-    $runner = Join-Path $TargetDir "run-liverse.cmd"
-    if (-not (Test-Path $runner)) {
-        Fail "Launcher not found: $runner"
+    $pythonw = Join-Path $TargetDir ".venv\Scripts\pythonw.exe"
+    $guiScript = Join-Path $TargetDir "tools\liverse_gui.py"
+    if (-not (Test-Path $pythonw)) {
+        Fail "Graphical Python launcher not found: $pythonw"
+    }
+    if (-not (Test-Path $guiScript)) {
+        Fail "LiVerse graphical interface not found: $guiScript"
     }
 
     $desktop = [Environment]::GetFolderPath("Desktop")
     $shortcutPath = Join-Path $desktop "LiVerse.lnk"
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $shell.CreateShortcut($shortcutPath)
-    $shortcut.TargetPath = $runner
+    $shortcut.TargetPath = $pythonw
+    $shortcut.Arguments = '"' + $guiScript + '"'
     $shortcut.WorkingDirectory = $TargetDir
     $shortcut.Description = "Start LiVerse"
     $icon = Join-Path $TargetDir "LiVerse.ico"
@@ -564,6 +581,7 @@ try {
         $venvPython = Ensure-Venv -PythonSpec $pythonSpec -Force
         Install-LiVerse -VenvPython $venvPython
     }
+    Ensure-SpeechModel -VenvPython $venvPython
     New-DesktopShortcut
 
     Write-Host ""

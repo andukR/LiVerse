@@ -454,6 +454,82 @@ class TextCitationIntegrationTest(unittest.TestCase):
             "3. 00:03:04.000  Иаков 1:27 — по адресу\n   Текст:"
         ))
 
+    def test_sherpa_subwords_are_converted_to_timed_vosk_words(self) -> None:
+        from bible_parser_core.sherpa_streaming import DEFAULT_SHERPA_THREADS
+        from tools.replay_audio_files import sherpa_result_to_vosk_result
+
+        self.assertEqual(1, DEFAULT_SHERPA_THREADS)
+
+        result = SimpleNamespace(
+            text="иаков четвёртая глава",
+            tokens=[" и", "а", "ко", "в", " че", "т", "вёр", "та", "я", " глава"],
+            timestamps=[0.4, 0.5, 0.6, 0.7, 1.0, 1.1, 1.2, 1.3, 1.4, 1.8],
+            ys_probs=[-0.1] * 10,
+        )
+
+        converted = sherpa_result_to_vosk_result(result, time_offset=10.0)
+
+        self.assertEqual(converted["text"], "иаков четвёртая глава")
+        self.assertEqual(
+            [item["word"] for item in converted["result"]],
+            ["иаков", "четвёртая", "глава"],
+        )
+        self.assertEqual(converted["result"][0]["start"], 10.4)
+        self.assertEqual(converted["result"][0]["end"], 11.0)
+        self.assertGreater(converted["result"][0]["conf"], 0.9)
+
+    def test_replay_summary_groups_overlapping_windows_into_one_citation_event(self) -> None:
+        from tools.replay_audio_files import citation_event_summary_lines
+
+        cases = [
+            {
+                "timecode": "00:26:52.000",
+                "timecode_seconds": 1612.0,
+                "ref": "Иаков 1:22-23",
+                "payload": {
+                    "book": "Иаков", "chapter": 1,
+                    "start_verse": 22, "end_verse": 23,
+                    "source": "text_citation",
+                },
+            },
+            {
+                "timecode": "00:27:03.000",
+                "timecode_seconds": 1623.0,
+                "ref": "Иаков 1:23-24",
+                "payload": {
+                    "book": "Иаков", "chapter": 1,
+                    "start_verse": 23, "end_verse": 24,
+                    "source": "text_citation",
+                },
+            },
+            {
+                "timecode": "00:34:15.000",
+                "timecode_seconds": 2055.0,
+                "ref": "Матфей 7:21",
+                "payload": {
+                    "book": "Матфей", "chapter": 7,
+                    "start_verse": 21, "end_verse": 21,
+                    "source": "text_citation",
+                },
+            },
+            {
+                "timecode": "00:34:19.000",
+                "timecode_seconds": 2059.0,
+                "ref": "Матфей 7:21",
+                "payload": {
+                    "book": "Матфей", "chapter": 7,
+                    "start_verse": 21, "end_verse": 21,
+                    "source": "parser",
+                },
+            },
+        ]
+
+        lines = citation_event_summary_lines(cases)
+
+        self.assertEqual(len(lines), 2)
+        self.assertIn("Иаков 1:22-24 — по тексту; объединено окон: 2", lines[0])
+        self.assertIn("Матфей 7:21 — по тексту + по адресу; объединено окон: 2", lines[1])
+
     def test_replay_long_passage_waits_for_its_final_verse(self) -> None:
         from tools.replay_audio_files import replay_long_passage, replay_long_passage_match
 

@@ -345,6 +345,8 @@ ASR_REPLACEMENTS = (
     (r"\bвторозакон[а-я]*\s+ста[ея]\s+глава\b", "второзаконие 6 глава"),
     (r"\bи\s+лова\b", "иова"),
     (r"\bиоф\b", "иов"),
+    (r"\bкнига\s+(?:рощ|ров)\b", "книга руфь"),
+    (r"\b(?:рощ|ров|воров)\b(?=\s+\S+\s+глав[аеуы]\b)", "руфь"),
     (r"\b(книга|пророка)\s+ио\s+иль\b", r"\1 иоиля"),
     (r"\bио\s+иль\b", "иоиль"),
     (r"\b(книга|книги)\s+ио\b", r"\1 иова"),
@@ -421,7 +423,7 @@ ASR_REPLACEMENTS = (
         "2 фессалоникийцам",
     ),
     (r"\bантрите\s+огова\b", "3 глава"),
-    (r"\bсолм[а-я]*\b", "псалом"),
+    (r"\b(?:солм|салм)[а-я]*\b", "псалом"),
     (r"\bаге[яй]\b", "аггей"),
     (r"\b(\d+)\s+агла\b", r"\1 глава"),
     (r"\bпервоглава\b", "1 глава"),
@@ -515,6 +517,31 @@ def normalize_text(text: str) -> str:
     normalized = re.sub(r"\b(\d+)\s+лас\b", r"\1 глава", normalized)
     normalized = re.sub(r"\b(\d+)\s+рюмке\b", r"\1 глава", normalized)
     normalized = re.sub(r"\b(\d+)\s+из\s+них\b", r"\1 стих", normalized)
+    normalized = re.sub(r"\b(\d+)\s+из\s+тех\b", r"\1 стих", normalized)
+    normalized = re.sub(r"\b(\d{1,3})\s+стезе\b", r"\1 стих", normalized)
+    normalized = re.sub(r"\b(\d{1,3})\s+там\s+стих\b", r"\1 стих", normalized)
+    normalized = re.sub(
+        r"\b(\d{1,3})\s+стейси\s+(?=(?:яков|иаков)\b)",
+        r"\1 стих ",
+        normalized,
+    )
+    normalized = re.sub(r"\bдесертом\s+стих\b", "10 стих", normalized)
+    normalized = re.sub(
+        r"\b(\d{1,3})\s+сессия\s+(?=(?:яков|иаков|и\s+орков)\b)",
+        r"\1 стих ",
+        normalized,
+    )
+    normalized = re.sub(
+        r"\b(прочитаем\s+)(\d{1,3})\s+1000\s+тех\b",
+        r"\1\2 стих",
+        normalized,
+    )
+    normalized = re.sub(r"\bвсем\s+нация\s+там\s+стих\b", "17 стих", normalized)
+    normalized = re.sub(
+        r"\b(?:рощ|ров|воров)\s+(\d+)\s+(\d+)\s+(\d+)\b",
+        r"руфь \1 \2 \3",
+        normalized,
+    )
     normalized = re.sub(
         r"\b(\d+)\s+глава\s+\d+\s+(\d+)\s+стих\s+(\d+)\s+(давайте|прочитаем)\b",
         r"\1 глава \3 \2 стих \4",
@@ -943,6 +970,7 @@ def ref_candidates(normalized: str, book: str, bible: dict[str, dict[int, dict[i
         (r"с\s+(\d+)\s+(?:из\s+тех|из)\s+(\d+)\s+глава", 2, 1, None, 0.96),
         (r"(\d+)\s+псалом\s+(\d+)\s+стих", 1, 2, None, 0.98),
         (r"(?:с\s+)?(\d+)\s+по\s+(\d+)\s+стих\s+псал\w*\s+(\d+)", 3, 1, 2, 1.02),
+        (r"(?:с\s+)?(\d+)\s+по\s+(\d+)\s+стих\s+(\d+)\s+псал\w*", 3, 1, 2, 1.03),
         (r"(?:с\s+)?(\d+)\s+по\s+(\d+)\s+7\s+(\d+)\s+псал\w*", 3, 1, 2, 0.99),
         (r"(\d+)\s+(\d+)\s+стих\s+(\d+)\s+псал", 3, 1, 2, 0.985),
         (r"(\d+)\s+стих\s+(\d+)\s+псал", 2, 1, None, 0.98),

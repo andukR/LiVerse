@@ -20,6 +20,118 @@ from tools.holyrics import (
 
 
 class LiveReferencePipelineTest(unittest.TestCase):
+    def test_regression_suite_does_not_shrink_silently(self):
+        tests_dir = Path(__file__).resolve().parent
+        suite = unittest.defaultTestLoader.discover(str(tests_dir), pattern="test_*.py")
+
+        self.assertGreaterEqual(
+            suite.countTestCases(),
+            218,
+            "Набор регрессионных тестов уменьшился; проверьте, какие проверки были удалены.",
+        )
+
+    def test_gui_engine_command_uses_saved_settings_without_exposing_token(self):
+        from tools.liverse_gui import GuiConfig, engine_command
+
+        config = GuiConfig(
+            run_mode="semi_auto",
+            approval_ui="popup",
+            audio_device_name="Microphone (USB2.0 Device)",
+            citation_detection_mode="hybrid_confirm",
+            holyrics_token="secret-token",
+            holyrics_port=8091,
+            quick_seconds=5,
+            open_operator_qr=False,
+            text_detection_db=Path("bible_index.db"),
+        )
+        command = engine_command(
+            config,
+            project_root=Path("C:/LiVerse"),
+            python_executable="pythonw.exe",
+        )
+
+        self.assertEqual("pythonw.exe", command[0])
+        self.assertIn("--semi-auto-approval", command)
+        self.assertIn("--device-name", command)
+        self.assertIn("Microphone (USB2.0 Device)", command)
+        self.assertIn("--no-open-operator-qr", command)
+        self.assertNotIn("secret-token", command)
+
+    def test_gui_keeps_taskbar_fallback_for_linux_wayland(self):
+        from tools.liverse_gui import tray_can_hide_window
+
+        self.assertTrue(tray_can_hide_window(platform="win32", session_type=""))
+        self.assertFalse(tray_can_hide_window(platform="linux", session_type="wayland"))
+        self.assertTrue(
+            tray_can_hide_window(
+                platform="linux",
+                session_type="wayland",
+                backend="pystray._appindicator",
+            )
+        )
+        self.assertTrue(tray_can_hide_window(platform="linux", session_type="x11"))
+
+    def test_full_setup_can_select_microphone_by_stable_name(self):
+        from tools.vosk_grammar_probe import ask_audio_input_device
+
+        devices = [
+            {"name": "Built-in microphone", "max_input_channels": 1},
+            {"name": "Microphone (USB2.0 Device)", "max_input_channels": 1},
+            {"name": "Speakers", "max_input_channels": 0},
+        ]
+        fake_sounddevice = SimpleNamespace(
+            query_devices=lambda: devices,
+            default=SimpleNamespace(device=(0, 2)),
+        )
+        args = SimpleNamespace(text=None, device_name="", device=7)
+        with (
+            patch.dict("sys.modules", {"sounddevice": fake_sounddevice}),
+            patch("tools.vosk_grammar_probe.sys.stdin", SimpleNamespace(isatty=lambda: True)),
+            patch("builtins.input", return_value="2"),
+            patch("builtins.print"),
+        ):
+            ask_audio_input_device(args)
+
+        self.assertEqual("Microphone (USB2.0 Device)", args.device_name)
+        self.assertIsNone(args.device)
+
+    def test_startup_settings_save_and_restore_microphone_name(self):
+        import os
+        import tempfile
+
+        from tools.vosk_grammar_probe import (
+            apply_saved_startup_settings,
+            load_startup_settings,
+            save_startup_settings,
+        )
+
+        saved_args = SimpleNamespace(
+            _liverse_startup_settings_enabled=True,
+            require_approval=False,
+            semi_auto_approval=True,
+            approval_ui="popup",
+            device_name="Microphone (USB2.0 Device)",
+            holyrics_theme="",
+            holyrics_quick_minutes=5 / 60,
+        )
+        restored_args = SimpleNamespace(
+            approval_ui="web",
+            device_name="",
+            holyrics_theme="",
+            holyrics_quick_minutes=0.0,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            with (
+                patch.dict(os.environ, {"LIVERSE_STARTUP_SETTINGS": str(path)}, clear=False),
+                patch("tools.vosk_grammar_probe.sys.argv", ["vosk_grammar_probe.py"]),
+            ):
+                save_startup_settings(saved_args)
+                settings = load_startup_settings()
+                apply_saved_startup_settings(restored_args, settings)
+
+        self.assertEqual("Microphone (USB2.0 Device)", restored_args.device_name)
+
     def test_audio_input_candidates_prefer_stable_name_over_indexes(self):
         from tools.vosk_grammar_probe import audio_input_candidate_indices
 
@@ -186,6 +298,17 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertIn('set "LIVERSE_EXIT=%ERRORLEVEL%"', runner)
         self.assertIn('if not "%LIVERSE_EXIT%"=="0"', runner)
         self.assertIn("pause >nul", runner)
+
+    def test_windows_shortcut_uses_graphical_python_without_console(self):
+        project_root = Path(__file__).resolve().parents[3]
+        updater = (project_root / "update-liverse-windows.ps1").read_text(encoding="utf-8")
+        cmd_updater = (project_root / "update-liverse-windows.cmd").read_text(encoding="utf-8")
+
+        self.assertIn('.venv\\Scripts\\pythonw.exe', updater)
+        self.assertIn('tools\\liverse_gui.py', updater)
+        self.assertIn("$shortcut.TargetPath = $pythonw", updater)
+        self.assertIn('shortcut.TargetPath = "%TARGET_DIR%\\.venv\\Scripts\\pythonw.exe"', cmd_updater)
+        self.assertIn('%TARGET_DIR%\\tools\\liverse_gui.py', cmd_updater)
 
     def test_full_startup_setup_reopens_holyrics_wizard_and_keeps_token(self):
         import os
@@ -410,6 +533,33 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertFalse(payload["ml_risk"]["needs_confirmation"])
 
+    def test_high_risk_context_range_requires_confirmation_instead_of_auto_reject(self):
+        from tools.vosk_grammar_probe import apply_ml_risk
+
+        args = SimpleNamespace(
+            require_approval=False,
+            semi_auto_approval=True,
+            risk_model_data={"loaded": True},
+            risk_auto_reject_threshold=0.9,
+        )
+        payload = {
+            "source": "context_range",
+            "slide": {"ref": "Иаков 4:15"},
+            "risk_score": 0.9,
+        }
+        with patch(
+            "tools.vosk_grammar_probe.score_payload_with_model",
+            return_value={"needs_confirmation": False, "decision_reasons": []},
+        ):
+            apply_ml_risk(args, payload)
+
+        self.assertFalse(payload["ml_risk"].get("auto_reject"))
+        self.assertTrue(payload["ml_risk"]["needs_confirmation"])
+        self.assertIn(
+            "manual_high_risk_context_requires_confirmation",
+            payload["ml_risk"]["decision_reasons"],
+        )
+
     def test_sermon_plan_startup_does_not_request_theme_list(self):
         from tools.vosk_grammar_probe import ask_holyrics_theme_name
 
@@ -501,6 +651,38 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertFalse(action_selects_context("sent", slide))
         self.assertTrue(action_selects_context("approve_context", slide))
+
+    def test_operator_feedback_keeps_only_unambiguous_training_labels(self):
+        from tools.vosk_grammar_probe import approval_action, operator_feedback
+
+        corrected = {
+            "approval": {
+                "action": "approve_alternative",
+                "proposed_ref": "Иаков 3:3",
+                "selected_ref": "Притчи 10:3",
+            },
+            "holyrics": {"ok": True},
+        }
+        not_citation = {
+            "approval": {
+                "action": "not_citation",
+                "proposed_ref": "Марк 1:1",
+                "selected_ref": "",
+            }
+        }
+
+        self.assertEqual("approve", approval_action(corrected))
+        self.assertEqual(
+            {
+                "action": "approve_alternative",
+                "label": "corrected_reference",
+                "proposed_ref": "Иаков 3:3",
+                "selected_ref": "Притчи 10:3",
+            },
+            operator_feedback(corrected),
+        )
+        self.assertEqual("not_a_citation", operator_feedback(not_citation)["label"])
+        self.assertIsNone(operator_feedback({"approval": {"action": "skip"}}))
 
     def test_sermon_plan_candidate_keeps_slide_data_and_operator_wording(self):
         from tools import slide_server
@@ -712,7 +894,7 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertEqual("1 Иоанна 2:17", result.get("parsed", {}).get("ref"))
         self.assertEqual("context_range", result.get("source"))
-        self.assertIn("context_range_reference", result.get("risk_reasons") or [])
+        self.assertIn("explicit_context_range_reference", result.get("risk_reasons") or [])
 
     def test_context_range_resolves_bare_verse_inside_current_context_chapter(self):
         pipeline = LiveReferencePipeline()
@@ -723,6 +905,156 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertEqual("1 Иоанна 2:12", result.get("parsed", {}).get("ref"))
         self.assertEqual("context_range", result.get("source"))
+
+    def test_context_range_resolves_compound_ordinals_above_twenty_as_single_verses(self):
+        for verse, ordinal in (
+            (21, "двадцать первом"),
+            (22, "двадцать втором"),
+            (23, "двадцать третьем"),
+            (24, "двадцать четвертом"),
+            (25, "двадцать пятом"),
+            (26, "двадцать шестом"),
+        ):
+            with self.subTest(verse=verse):
+                pipeline = LiveReferencePipeline()
+                self.assertTrue(
+                    pipeline.set_context_range(
+                        {
+                            "book": "Иаков",
+                            "chapter": 2,
+                            "start_verse": 15,
+                            "end_chapter": 2,
+                            "end_verse": 26,
+                        }
+                    )
+                )
+
+                result = pipeline.process_text(f"в {ordinal} стихе Иаков пишет")
+
+                self.assertEqual(f"Иаков 2:{verse}", result.get("parsed", {}).get("ref"))
+                self.assertEqual("context_range", result.get("source"))
+
+    def test_explicit_verse_inside_confirmed_context_is_automatic_in_semi_auto_mode(self):
+        from tools.vosk_grammar_probe import add_slide_payload, apply_ml_risk, approval_required_for_payload
+
+        pipeline = LiveReferencePipeline()
+        self.assertTrue(
+            pipeline.set_context_range(
+                {
+                    "book": "Иаков",
+                    "chapter": 2,
+                    "start_verse": 15,
+                    "end_chapter": 2,
+                    "end_verse": 26,
+                }
+            )
+        )
+        asr_result = {
+            "text": "в двадцать первом стихе Иаков пишет",
+            "result": [
+                {"word": "в", "start": 0.0, "end": 0.2, "conf": 0.7},
+                {"word": "двадцать", "start": 0.2, "end": 0.7, "conf": 0.55},
+                {"word": "первом", "start": 0.7, "end": 1.2, "conf": 0.65},
+                {"word": "стихе", "start": 1.2, "end": 1.7, "conf": 0.75},
+                {"word": "Иаков", "start": 1.7, "end": 2.2, "conf": 0.6},
+                {"word": "пишет", "start": 2.2, "end": 2.7, "conf": 0.7},
+            ],
+        }
+        payload = add_slide_payload(
+            pipeline.process_text(asr_result["text"], asr_result=asr_result)
+        )
+        model = load_risk_model(
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "bible_parser_core"
+            / "data"
+            / "risk_model.json"
+        )
+        args = SimpleNamespace(
+            require_approval=False,
+            semi_auto_approval=True,
+            risk_model_data=model,
+            risk_auto_reject_threshold=0.9,
+        )
+
+        apply_ml_risk(args, payload, asr_result=asr_result)
+
+        self.assertEqual("Иаков 2:21", payload.get("parsed", {}).get("ref"))
+        self.assertEqual(0.4, payload.get("risk_score"))
+        self.assertFalse(payload["ml_risk"]["needs_confirmation"])
+        self.assertIn(
+            "trusted_explicit_context_verse",
+            payload["ml_risk"]["decision_reasons"],
+        )
+        self.assertFalse(approval_required_for_payload(args, payload))
+
+    def test_bare_number_inside_confirmed_context_still_requires_confirmation(self):
+        from tools.vosk_grammar_probe import add_slide_payload, apply_ml_risk, approval_required_for_payload
+
+        pipeline = LiveReferencePipeline()
+        self.assertTrue(
+            pipeline.set_context_range(
+                {
+                    "book": "Иаков",
+                    "chapter": 2,
+                    "start_verse": 15,
+                    "end_chapter": 2,
+                    "end_verse": 26,
+                }
+            )
+        )
+        payload = add_slide_payload(pipeline.process_text("21"))
+        model = load_risk_model(
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "bible_parser_core"
+            / "data"
+            / "risk_model.json"
+        )
+        args = SimpleNamespace(
+            require_approval=False,
+            semi_auto_approval=True,
+            risk_model_data=model,
+            risk_auto_reject_threshold=0.9,
+        )
+
+        apply_ml_risk(args, payload)
+
+        self.assertEqual("Иаков 2:21", payload.get("parsed", {}).get("ref"))
+        self.assertTrue(payload["ml_risk"]["needs_confirmation"])
+        self.assertTrue(approval_required_for_payload(args, payload))
+
+    def test_context_range_repairs_observed_vosk_ordinal_distortions(self):
+        for chapter, start_verse, end_verse, text, expected in (
+            (4, 10, 17, "в десятом стезе яков пишет", "Иаков 4:10"),
+            (4, 10, 17, "в четырнадцатая сессия яков пишет", "Иаков 4:14"),
+            (4, 10, 17, "всем нация там стихи", "Иаков 4:17"),
+            (4, 10, 17, "в шестнадцать там стихи в пишет", "Иаков 4:16"),
+            (4, 10, 17, "в шестнадцатая стейси яков пишет", "Иаков 4:16"),
+            (4, 10, 17, "я ещё раз прочитаем шестнадцать тысяч тех", "Иаков 4:16"),
+            (2, 1, 15, "во втором стейси иаков пишут", "Иаков 2:2"),
+            (2, 1, 15, "в десертом стихи иаков пишет", "Иаков 2:10"),
+            (2, 1, 15, "в одиннадцать там стихи яков пишет", "Иаков 2:11"),
+            (2, 1, 15, "в девятая сессия и орков пишет", "Иаков 2:9"),
+        ):
+            with self.subTest(text=text):
+                pipeline = LiveReferencePipeline()
+                self.assertTrue(
+                    pipeline.set_context_range(
+                        {
+                            "book": "Иаков",
+                            "chapter": chapter,
+                            "start_verse": start_verse,
+                            "end_chapter": chapter,
+                            "end_verse": end_verse,
+                        }
+                    )
+                )
+
+                result = pipeline.process_text(text)
+
+                self.assertEqual(expected, result.get("parsed", {}).get("ref"))
+                self.assertEqual("context_range", result.get("source"))
 
     def test_context_range_resolves_spoken_subranges(self):
         from tools.vosk_grammar_probe import action_selects_context, add_slide_payload
@@ -803,6 +1135,44 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertEqual("Иоанн 2:17", result.get("parsed", {}).get("ref"))
         self.assertNotEqual("context_range", result.get("source"))
+
+    def test_context_range_yields_to_any_explicit_full_address(self):
+        from tools.vosk_grammar_probe import add_slide_payload
+
+        for text, expected in (
+            ("бытие десятая глава с третьего по четвёртый стих", "Бытие 10:3-4"),
+            ("притчи десятая глава с третьего по седьмой стих", "Притчи 10:3-7"),
+            ("евангелие от матфея пятая глава с первого по второй стих", "Матфей 5:1-2"),
+            ("римлянам восьмая глава с первого по третий стих", "Римлянам 8:1-3"),
+            ("евреям одиннадцатая глава с первого по второй стих", "Евреям 11:1-2"),
+            ("второе послание тимофею третья глава с первого по второй стих", "2 Тимофею 3:1-2"),
+            ("откровение вторая глава с первого по третий стих", "Откровение 2:1-3"),
+            ("иакова вторая глава с первого по второй стих", "Иаков 2:1-2"),
+        ):
+            with self.subTest(text=text):
+                pipeline = LiveReferencePipeline()
+                context = pipeline.process_text("послания якова первая глава с первого по десятое стих")
+                self.assertTrue(pipeline.set_context_range(context))
+
+                result = pipeline.process_text(text)
+                slide = add_slide_payload(result)["slide"]
+
+                self.assertEqual(expected, result.get("parsed", {}).get("ref"))
+                self.assertEqual("parser", result.get("source"))
+                if expected == "Притчи 10:3-7":
+                    self.assertTrue(slide.get("can_set_context"))
+
+    def test_context_range_yields_to_explicit_reference_split_between_chunks(self):
+        pipeline = LiveReferencePipeline()
+        context = pipeline.process_text("послание иакова третья глава с десятого по восемнадцатый стих")
+        self.assertTrue(pipeline.set_context_range(context))
+
+        first = pipeline.process_text("книга русь третья глава")
+        second = pipeline.process_text("десятый одиннадцатый стих")
+
+        self.assertFalse(first.get("matched"))
+        self.assertEqual("Руфь 3:10-11", second.get("parsed", {}).get("ref"))
+        self.assertEqual("parser", second.get("source"))
 
     def assert_book_only_fragment_does_not_reuse_previous_numbers(self, fragment):
         with self.subTest(fragment=fragment):
@@ -1089,6 +1459,23 @@ class LiveReferencePipelineTest(unittest.TestCase):
         result = pipeline.process_text("евангелие от иоанна пятнадцать тринадцать")
 
         self.assertEqual("Иоанн 15:13", result.get("parsed", {}).get("ref"))
+
+    def test_gospel_history_year_does_not_create_reference(self):
+        pipeline = LiveReferencePipeline()
+
+        history = pipeline.process_text(
+            "первыми появились послания потому что евангелие самое первое евангелие "
+            "это евангелие от марка нам было написании где-то шестидесятый "
+            "шестьдесят пятый год поражеству христово то есть"
+        )
+        explicit = pipeline.process_text("евангелие от марка первая глава первый стих")
+
+        self.assertFalse(history.get("matched"))
+        self.assertEqual(
+            "gospel_history_year_not_reference",
+            history.get("blocked_weak_context"),
+        )
+        self.assertEqual("Марк 1:1", explicit.get("parsed", {}).get("ref"))
 
     def test_gospel_book_conflict_does_not_auto_match(self):
         pipeline = LiveReferencePipeline()
@@ -2232,6 +2619,38 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertEqual("Псалтирь 72:4-12", result.get("parsed", {}).get("ref"))
 
+    def test_psalm_range_accepts_psalm_number_after_stich(self):
+        for text, expected in (
+            (
+                "с пятого по тринадцатый стих семьдесят второго псалма",
+                "Псалтирь 72:5-13",
+            ),
+            (
+                "с четвёртого по двенадцатый стих семьдесят второго псалма",
+                "Псалтирь 72:4-12",
+            ),
+            (
+                "с четвёртого по двенадцатый стих семьдесят второго салма",
+                "Псалтирь 72:4-12",
+            ),
+        ):
+            with self.subTest(text=text):
+                result = LiveReferencePipeline().process_text(text)
+
+                self.assertEqual(expected, result.get("parsed", {}).get("ref"))
+
+    def test_unconnected_verse_range_reuses_last_book_and_chapter(self):
+        pipeline = LiveReferencePipeline()
+        previous = pipeline.process_text("псалом семьдесят второй первый стих")
+
+        result = pipeline.process_text(
+            "двадцать третий двадцать шестой стих но я всегда с тобою "
+            "ты держишь меня за правую руку"
+        )
+
+        self.assertEqual("Псалтирь 72:1", previous.get("parsed", {}).get("ref"))
+        self.assertEqual("Псалтирь 72:23-26", result.get("parsed", {}).get("ref"))
+
     def test_psalm_without_stich_keeps_ordinal_tens_as_compound_psalm_number(self):
         pipeline = LiveReferencePipeline()
 
@@ -2553,6 +2972,24 @@ class LiveReferencePipelineTest(unittest.TestCase):
         normal = pipeline.process_text("книга руфь третья глава четвёртый пятый стих")
 
         self.assertEqual("Руфь 3:4-5", normal.get("parsed", {}).get("ref"))
+
+        for distorted, expected in (
+            ("книга рощ третья глава десятый одиннадцатый из тех", "Руфь 3:10-11"),
+            ("воров третья глава пятая шестой из тех", "Руфь 3:5-6"),
+            ("ров три пять шесть", "Руфь 3:5-6"),
+        ):
+            with self.subTest(distorted=distorted):
+                result = pipeline.process_text(distorted)
+                self.assertEqual(expected, result.get("parsed", {}).get("ref"))
+
+    def test_paralipomenon_range_survives_vosk_stikh_distortion(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text(
+            "первая книга паралипоменон шестая глава десятая одиннадцатая из тех"
+        )
+
+        self.assertEqual("1 Паралипоменон 6:10-11", result.get("parsed", {}).get("ref"))
 
     def test_numbered_kingdoms_range_waits_for_chapter_context(self):
         pipeline = LiveReferencePipeline()

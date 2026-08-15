@@ -41,6 +41,11 @@ from bible_parser_core.live_pipeline import (
 )
 from bible_parser_core.parser import DEFAULT_BIBLE
 from bible_parser_core.risk_model import load_risk_model, score_payload_with_model
+from bible_parser_core.sherpa_streaming import (
+    DEFAULT_SHERPA_THREADS,
+    SherpaStreamingRecognizer,
+    load_sherpa_recognizer,
+)
 from bible_parser_core.bible_text_search import BibleTextSearcher
 from bible_parser_core.text_citation_detector import (
     ScriptureTextDetector,
@@ -72,6 +77,13 @@ from tools.holyrics import (
 
 
 DEFAULT_MODEL_PATH = Path.cwd() / "models" / "vosk-model-small-ru-0.22"
+DEFAULT_SHERPA_MODEL_PATH = (
+    PROJECT_ROOT
+    / ".cache"
+    / "liverse"
+    / "models"
+    / "vosk-model-small-streaming-ru-0.54"
+)
 DEFAULT_LOG_DIR = Path.cwd() / ".cache" / "liverse" / "vosk_probe"
 DEFAULT_TEXT_DETECTION_DB = PROJECT_ROOT / "bible_index" / "bible_index.db"
 STARTUP_SETTINGS_ENV = "LIVERSE_STARTUP_SETTINGS"
@@ -183,6 +195,12 @@ def save_startup_settings(args: argparse.Namespace) -> None:
         "version": 1,
         "run_mode": current_run_mode(args),
         "approval_ui": str(getattr(args, "approval_ui", "web") or "web"),
+        "audio_device_name": str(getattr(args, "device_name", "") or ""),
+        "citation_detection_mode": str(
+            getattr(args, "citation_detection_mode", "address_only") or "address_only"
+        ),
+        "open_operator_qr": bool(getattr(args, "open_operator_qr", True)),
+        "gui_auto_hide": bool(getattr(args, "gui_auto_hide", True)),
         "holyrics_theme": str(getattr(args, "holyrics_theme", "") or ""),
         "holyrics_quick_minutes": float(getattr(args, "holyrics_quick_minutes", 0.0) or 0.0),
     }
@@ -231,6 +249,65 @@ def run_mode_label(mode: str) -> str:
 
 def approval_ui_label(value: str) -> str:
     return "всплывающее окно" if value == "popup" else "web-интерфейс"
+
+
+def audio_device_label(value: str) -> str:
+    return value.strip() or "автоматический выбор"
+
+
+def ask_audio_input_device(args: argparse.Namespace) -> None:
+    """Let the operator select a stable microphone name during full setup."""
+    if args.text or not sys.stdin.isatty():
+        return
+    try:
+        import sounddevice as sd
+
+        devices = list(sd.query_devices())
+        default_device = sd.default.device
+    except Exception as exc:
+        print(f"Микрофоны: не удалось получить список устройств: {exc}", flush=True)
+        return
+
+    default_input = default_device[0] if isinstance(default_device, (list, tuple)) else default_device
+    inputs = [
+        (index, str(device.get("name") or f"Устройство {index}"))
+        for index, device in enumerate(devices)
+        if int(device.get("max_input_channels") or 0) > 0
+    ]
+    if not inputs:
+        print("Микрофоны: входные устройства не найдены.", flush=True)
+        return
+
+    current_name = str(getattr(args, "device_name", "") or "").strip()
+    print("", flush=True)
+    print("Выбор микрофона", flush=True)
+    print("0. Автоматический выбор", flush=True)
+    for choice, (device_index, name) in enumerate(inputs, start=1):
+        marker = " (системный по умолчанию)" if device_index == default_input else ""
+        print(f"{choice}. {name}{marker}", flush=True)
+    print(f"Текущий выбор: {audio_device_label(current_name)}", flush=True)
+    print("Введите номер микрофона. Enter — оставить текущий выбор.", flush=True)
+
+    while True:
+        choice_text = input("> ").strip()
+        if not choice_text:
+            return
+        try:
+            choice = int(choice_text)
+        except ValueError:
+            print("Введите номер из списка или нажмите Enter.", flush=True)
+            continue
+        if choice == 0:
+            args.device_name = ""
+            args.device = None
+            print("Микрофон: автоматический выбор.", flush=True)
+            return
+        if 1 <= choice <= len(inputs):
+            args.device_name = inputs[choice - 1][1]
+            args.device = None
+            print(f"Микрофон: {args.device_name}", flush=True)
+            return
+        print("Введите номер из списка или нажмите Enter.", flush=True)
 
 
 def format_timecode(seconds: float) -> str:
@@ -991,17 +1068,30 @@ def install_updated_dependencies(project_root: Path) -> bool:
     for command in commands:
         if subprocess.run(command, cwd=project_root).returncode != 0:
             return False
+    linux_installer = project_root / "install-linux.sh"
+    if sys.platform.startswith("linux") and linux_installer.is_file():
+        if subprocess.run(["bash", str(linux_installer), "--desktop-only"], cwd=project_root).returncode != 0:
+            return False
     return True
 
 
-def apply_startup_update(update: dict, project_root: Path = PROJECT_ROOT) -> bool:
+def apply_startup_update(
+    update: dict,
+    project_root: Path = PROJECT_ROOT,
+    *,
+    hide_console: bool = False,
+) -> bool:
     if os.name == "nt":
         updater = project_root / "update-liverse-windows.cmd"
         if not updater.exists():
             return False
+        run_options: dict[str, object] = {}
+        if hide_console:
+            run_options["creationflags"] = subprocess.CREATE_NO_WINDOW
         return subprocess.run(
             ["cmd.exe", "/d", "/c", str(updater), str(project_root)],
             cwd=project_root,
+            **run_options,
         ).returncode == 0
 
     remote_ref = str(update.get("remote_ref") or UPDATE_REMOTE_REF)
@@ -1106,6 +1196,7 @@ def ask_priority_run_mode(settings: dict, *, sermon_plan: bool = False) -> tuple
         print("Остальные настройки будут взяты из прошлого запуска.", flush=True)
         print(f"Последний режим: {run_mode_label(str(settings.get('run_mode') or 'semi_auto'))}", flush=True)
         print(f"Подтверждение: {approval_ui_label(str(settings.get('approval_ui') or 'web'))}", flush=True)
+        print(f"Микрофон: {audio_device_label(str(settings.get('audio_device_name') or ''))}", flush=True)
         if sermon_plan:
             print("Тема Holyrics: из текущей презентации плана проповеди", flush=True)
         else:
@@ -1147,6 +1238,17 @@ def apply_saved_startup_settings(args: argparse.Namespace, settings: dict) -> No
         approval_ui = str(settings.get("approval_ui") or "").strip()
         if approval_ui in {"web", "popup"}:
             args.approval_ui = approval_ui
+    if not setting_was_explicit("--device-name", "--device", env_name="LIVERSE_AUDIO_DEVICE"):
+        args.device_name = str(settings.get("audio_device_name") or "")
+    if not setting_was_explicit(
+        "--citation-detection-mode",
+        env_name="LIVERSE_CITATION_DETECTION_MODE",
+    ):
+        detection_mode = str(settings.get("citation_detection_mode") or "").strip()
+        if detection_mode in {"address_only", "text_only", "hybrid_auto", "hybrid_confirm"}:
+            args.citation_detection_mode = detection_mode
+    if not setting_was_explicit("--open-operator-qr", "--no-open-operator-qr"):
+        args.open_operator_qr = bool(settings.get("open_operator_qr", True))
     if not setting_was_explicit("--holyrics-theme", env_name="HOLYRICS_THEME"):
         args.holyrics_theme = str(settings.get("holyrics_theme") or "")
         setattr(args, "_holyrics_theme_id", "")
@@ -1184,15 +1286,17 @@ def configure_interactive_approval_mode(args: argparse.Namespace) -> None:
     if not full_setup:
         setattr(args, "_liverse_skip_holyrics_theme_question", True)
         setattr(args, "_liverse_skip_holyrics_quick_question", True)
-    if mode == "auto" or not full_setup:
+    if not full_setup:
         return
 
-    use_web = ask_enter_or_space(
-        "Подтверждение через веб-интерфейс или во всплывающем окне?",
-        enter_label="веб-интерфейс",
-        space_label="всплывающее окно",
-    )
-    args.approval_ui = "web" if use_web else "popup"
+    if mode != "auto":
+        use_web = ask_enter_or_space(
+            "Подтверждение через веб-интерфейс или во всплывающем окне?",
+            enter_label="веб-интерфейс",
+            space_label="всплывающее окно",
+        )
+        args.approval_ui = "web" if use_web else "popup"
+    ask_audio_input_device(args)
 
 
 def default_risk_model_path() -> Path:
@@ -1418,7 +1522,7 @@ def popup_approval_decision(slide: dict) -> str:
     except Exception as exc:
         raise RuntimeError(f"popup_unavailable:{exc}") from exc
 
-    decision = {"action": "reject"}
+    decision = {"action": "skip"}
     root = tk.Tk()
     root.title("LiVerse")
     root.attributes("-topmost", True)
@@ -1427,18 +1531,17 @@ def popup_approval_decision(slide: dict) -> str:
 
     alternatives = [item for item in slide.get("alternatives") or [] if isinstance(item, dict)]
     has_context_button = bool(slide.get("can_set_context"))
-    width = 980
-    if alternatives and has_context_button:
-        height = 520
-    elif alternatives or has_context_button:
-        height = 430
-    else:
-        height = 360
+    is_sermon_plan = slide.get("source") == "sermon_plan"
+    screen_width = int(root.winfo_screenwidth())
+    screen_height = int(root.winfo_screenheight())
+    row_count = 1 + len(alternatives) + int(has_context_button) + (1 if is_sermon_plan else 3)
+    width = min(760, max(520, screen_width - 80))
+    height = min(max(500, 245 + row_count * 62), max(500, screen_height - 100))
     center_tk_window(root, width, height)
 
-    ref_font = tkfont.Font(family="Segoe UI", size=54, weight="bold")
-    hint_font = tkfont.Font(family="Segoe UI", size=24, weight="bold")
-    button_font = tkfont.Font(family="Segoe UI", size=22, weight="bold")
+    ref_font = tkfont.Font(family="Segoe UI", size=38, weight="bold")
+    hint_font = tkfont.Font(family="Segoe UI", size=17, weight="bold")
+    button_font = tkfont.Font(family="Segoe UI", size=18, weight="bold")
 
     tk.Label(
         root,
@@ -1446,30 +1549,30 @@ def popup_approval_decision(slide: dict) -> str:
         bg="#101820",
         fg="#ffd166",
         font=ref_font,
-        wraplength=900,
+        wraplength=max(440, width - 72),
         justify="center",
-    ).pack(fill="x", padx=36, pady=(34, 12))
+    ).pack(fill="x", padx=30, pady=(24, 8))
 
     tk.Label(
         root,
         text=(
-            "Enter - основной вариант     C - принять как контекст     1/2/... - альтернативы     Esc или Space - отклонить"
-            if alternatives
+            "Enter — показать    1/2/... — другой вариант    Esc — пропустить"
+            if is_sermon_plan
             else (
-                "Enter - принять     C - принять как контекст     Esc или Space - отклонить"
-                if slide.get("can_set_context")
-                else "Enter - принять     Esc или Space - отклонить"
+                "Enter — показать    1/2/... — другой вариант"
+                + ("    0 — запомнить отрывок" if has_context_button else "")
+                + "\nSpace — это не цитата    Tab — ссылка неверна    Esc — пропустить"
             )
         ),
         bg="#101820",
         fg="#c8d2dc",
         font=hint_font,
-        wraplength=900,
+        wraplength=max(440, width - 72),
         justify="center",
-    ).pack(fill="x", padx=36, pady=(8, 18))
+    ).pack(fill="x", padx=30, pady=(6, 12))
 
     buttons = tk.Frame(root, bg="#101820")
-    buttons.pack(fill="x", padx=36, pady=(0, 12 if has_context_button else 30))
+    buttons.pack(fill="both", expand=True, padx=30, pady=(0, 20))
 
     def close(action: str) -> None:
         decision["action"] = action
@@ -1477,7 +1580,7 @@ def popup_approval_decision(slide: dict) -> str:
 
     approve = tk.Button(
         buttons,
-        text=str(slide.get("ref") or "Принять"),
+        text=f"Enter — показать {str(slide.get('ref') or '')}".strip(),
         command=lambda: close("approve"),
         bg="#148447",
         fg="white",
@@ -1485,15 +1588,15 @@ def popup_approval_decision(slide: dict) -> str:
         activeforeground="white",
         font=button_font,
         relief="flat",
-        padx=24,
-        pady=16,
+        padx=18,
+        pady=10,
     )
-    approve.pack(side="left", fill="x", expand=True, padx=(0, 10))
+    approve.pack(fill="x", pady=(0, 7))
 
     for index, alternative in enumerate(alternatives, start=1):
         button = tk.Button(
             buttons,
-            text=str(alternative.get("ref") or f"Вариант {index}"),
+            text=f"{index} — показать {str(alternative.get('ref') or f'вариант {index}')}",
             command=lambda choice=index - 1: close(f"alternative:{choice}"),
             bg="#315a99",
             fg="white",
@@ -1501,32 +1604,15 @@ def popup_approval_decision(slide: dict) -> str:
             activeforeground="white",
             font=button_font,
             relief="flat",
-            padx=24,
-            pady=16,
+            padx=18,
+            pady=10,
         )
-        button.pack(side="left", fill="x", expand=True, padx=(0, 10))
-
-    reject = tk.Button(
-        buttons,
-        text="Отклонить",
-        command=lambda: close("reject"),
-        bg="#9b3030",
-        fg="white",
-        activebackground="#b73a3a",
-        activeforeground="white",
-        font=button_font,
-        relief="flat",
-        padx=24,
-        pady=16,
-    )
-    reject.pack(side="left", fill="x", expand=True, padx=(10, 0))
+        button.pack(fill="x", pady=(0, 7))
 
     if has_context_button:
-        context_row = tk.Frame(root, bg="#101820")
-        context_row.pack(fill="x", padx=36, pady=(0, 30))
         context_button = tk.Button(
-            context_row,
-            text="Принять и запомнить как контекстный отрывок",
+            buttons,
+            text="0 — показать и запомнить как контекстный отрывок",
             command=lambda: close("approve_context"),
             bg="#8a6d16",
             fg="white",
@@ -1534,20 +1620,68 @@ def popup_approval_decision(slide: dict) -> str:
             activeforeground="white",
             font=button_font,
             relief="flat",
-            padx=24,
-            pady=16,
+            padx=18,
+            pady=10,
         )
-        context_button.pack(fill="x", expand=True)
+        context_button.pack(fill="x", pady=(0, 7))
+
+    if not is_sermon_plan:
+        tk.Button(
+            buttons,
+            text="Space — это не цитата",
+            command=lambda: close("not_citation"),
+            bg="#9b3030",
+            fg="white",
+            activebackground="#b73a3a",
+            activeforeground="white",
+            font=button_font,
+            relief="flat",
+            padx=18,
+            pady=10,
+        ).pack(fill="x", pady=(0, 7))
+        tk.Button(
+            buttons,
+            text="Tab — цитата есть, но ссылка неверна",
+            command=lambda: close("wrong_reference"),
+            bg="#a45d13",
+            fg="white",
+            activebackground="#c27118",
+            activeforeground="white",
+            font=button_font,
+            relief="flat",
+            padx=18,
+            pady=10,
+        ).pack(fill="x", pady=(0, 7))
+
+    tk.Button(
+        buttons,
+        text="Esc — пропустить без обучения",
+        command=lambda: close("skip"),
+        bg="#4d5964",
+        fg="white",
+        activebackground="#63717e",
+        activeforeground="white",
+        font=button_font,
+        relief="flat",
+        padx=18,
+        pady=10,
+    ).pack(fill="x")
 
     root.bind("<Return>", lambda _event: close("approve"))
     if has_context_button:
-        root.bind("c", lambda _event: close("approve_context"))
-        root.bind("C", lambda _event: close("approve_context"))
+        root.bind("0", lambda _event: close("approve_context"))
+        root.bind("<KP_0>", lambda _event: close("approve_context"))
+        root.bind("<KP_Insert>", lambda _event: close("approve_context"))
     for index, _alternative in enumerate(alternatives, start=1):
         root.bind(str(index), lambda _event, choice=index - 1: close(f"alternative:{choice}"))
-    root.bind("<Escape>", lambda _event: close("reject"))
-    root.bind("<space>", lambda _event: close("reject"))
-    root.protocol("WM_DELETE_WINDOW", lambda: close("reject"))
+    if not is_sermon_plan:
+        root.bind("<space>", lambda _event: close("not_citation"))
+        root.bind(
+            "<Tab>",
+            lambda _event: (close("wrong_reference"), "break")[1],
+        )
+    root.bind("<Escape>", lambda _event: close("skip"))
+    root.protocol("WM_DELETE_WINDOW", lambda: close("skip"))
     root.after(100, root.focus_force)
     root.after(150, root.lift)
     root.mainloop()
@@ -1645,6 +1779,7 @@ def approve_with_popup(args: argparse.Namespace, payload: dict) -> dict:
     slide = payload.get("slide")
     if not slide:
         return {"enabled": False}
+    proposed_ref = str(slide.get("ref") or "")
     try:
         action = popup_approval_decision(slide)
     except Exception as exc:
@@ -1656,11 +1791,31 @@ def approve_with_popup(args: argparse.Namespace, payload: dict) -> dict:
         except (ValueError, IndexError, TypeError):
             return {"enabled": True, "ok": False, "reason": "invalid_alternative_selection"}
         output = publish_after_approval(args, payload)
-        return {"enabled": True, "ok": True, "action": "approve_alternative", **output}
+        return {
+            "enabled": True,
+            "ok": True,
+            "action": "approve_alternative",
+            "proposed_ref": proposed_ref,
+            "selected_ref": str(payload["slide"].get("ref") or ""),
+            **output,
+        }
     if action not in {"approve", "approve_context"}:
-        return {"enabled": True, "ok": True, "action": "reject"}
+        return {
+            "enabled": True,
+            "ok": True,
+            "action": action,
+            "proposed_ref": proposed_ref,
+            "selected_ref": "",
+        }
     output = publish_after_approval(args, payload)
-    return {"enabled": True, "ok": True, "action": action, **output}
+    return {
+        "enabled": True,
+        "ok": True,
+        "action": action,
+        "proposed_ref": proposed_ref,
+        "selected_ref": proposed_ref,
+        **output,
+    }
 
 
 def submit_for_approval(args: argparse.Namespace, payload: dict) -> dict:
@@ -1707,11 +1862,21 @@ def apply_ml_risk(args: argparse.Namespace, payload: dict, asr_result: dict | No
     except (TypeError, ValueError):
         risk_score = 0.0
     decision_reasons = list(ml_risk.get("decision_reasons") or [])
+    trusted_explicit_context = "trusted_explicit_context_verse" in decision_reasons
     auto_reject_threshold = float(getattr(args, "risk_auto_reject_threshold", 0.9) or 0.0)
     if auto_reject_threshold > 0 and risk_score >= auto_reject_threshold:
-        ml_risk["auto_reject"] = True
-        ml_risk["needs_confirmation"] = False
-        decision_reasons.append("manual_very_high_risk_auto_reject")
+        if payload.get("source") == "context_range":
+            # The confirmed long range already fixes the book, chapter and
+            # allowed verse boundaries.  A low-confidence ASR result should
+            # therefore be offered to the operator, not discarded silently.
+            ml_risk["auto_reject"] = False
+            if not trusted_explicit_context:
+                ml_risk["needs_confirmation"] = True
+                decision_reasons.append("manual_high_risk_context_requires_confirmation")
+        else:
+            ml_risk["auto_reject"] = True
+            ml_risk["needs_confirmation"] = False
+            decision_reasons.append("manual_very_high_risk_auto_reject")
     if (
         not ml_risk.get("auto_reject")
         and payload.get("source") != "context_range"
@@ -1819,17 +1984,38 @@ def publish_payload(args: argparse.Namespace, payload: dict) -> dict:
 def approval_action(output: dict) -> str:
     approval = output.get("approval") or {}
     action = str(approval.get("action") or "")
-    if action == "reject":
-        return "reject"
-    if action in {"approve", "approve_context"}:
+    if action in {"reject", "not_citation", "wrong_reference", "skip"}:
+        return action
+    if action in {"approve", "approve_context", "approve_alternative"}:
         if output.get("holyrics", {}).get("ok") or output.get("web", {}).get("ok"):
-            return action
+            return "approve" if action == "approve_alternative" else action
         return "output_failed"
     if approval.get("reason") == "waiting_for_approval" or output.get("holyrics", {}).get("reason") == "waiting_for_approval":
         return "waiting"
     if output.get("holyrics", {}).get("ok") or output.get("web", {}).get("ok"):
         return "sent"
     return "recognized"
+
+
+def operator_feedback(output: dict) -> dict | None:
+    """Return an unambiguous local training label for an operator decision."""
+    approval = output.get("approval") or {}
+    action = str(approval.get("action") or "")
+    labels = {
+        "approve": "correct_reference",
+        "approve_context": "correct_reference",
+        "approve_alternative": "corrected_reference",
+        "not_citation": "not_a_citation",
+        "wrong_reference": "citation_but_wrong_reference",
+    }
+    if action not in labels:
+        return None
+    return {
+        "action": action,
+        "label": labels[action],
+        "proposed_ref": str(approval.get("proposed_ref") or ""),
+        "selected_ref": str(approval.get("selected_ref") or ""),
+    }
 
 
 def action_selects_context(action: str, slide: dict) -> bool:
@@ -1905,19 +2091,31 @@ def list_audio_devices() -> int:
 
 def run_microphone(args: argparse.Namespace) -> int:
     import sounddevice as sd
-    from vosk import KaldiRecognizer, Model, SetLogLevel
+
+    if args.asr_engine == "vosk-0.22":
+        from vosk import KaldiRecognizer, Model, SetLogLevel
 
     audio_queue: queue.Queue[bytes] = queue.Queue()
     console = ConsoleStatus(debug=args.debug_console)
     session_refs: list[dict] = []
     address_detection_enabled = args.citation_detection_mode != "text_only"
     text_detection_enabled = args.citation_detection_mode != "address_only"
-    grammar = None if (args.open_vocabulary or text_detection_enabled) else build_grammar()
+    grammar = (
+        None
+        if args.asr_engine == "sherpa-0.54" or args.open_vocabulary or text_detection_enabled
+        else build_grammar()
+    )
     logger = JsonlLogger(Path(args.log_dir), enabled=not args.no_log)
     logger.write_session(
         {
             "command": " ".join(sys.argv),
-            "model": str(args.model),
+            "asr_engine": args.asr_engine,
+            "model": str(
+                args.sherpa_model if args.asr_engine == "sherpa-0.54" else args.model
+            ),
+            "sherpa_threads": (
+                args.sherpa_threads if args.asr_engine == "sherpa-0.54" else None
+            ),
             "bible": str(args.bible),
             "samplerate": args.samplerate,
             "blocksize": args.blocksize,
@@ -1954,8 +2152,10 @@ def run_microphone(args: argparse.Namespace) -> int:
         return 0
     if holyrics_state != "ready":
         return 2
-    SetLogLevel(args.vosk_log_level)
-    model = Model(str(args.model))
+    model = None
+    if args.asr_engine == "vosk-0.22":
+        SetLogLevel(args.vosk_log_level)
+        model = Model(str(args.model))
     sermon_plan = None
     if args.sermon_plan and address_detection_enabled:
         active = get_holyrics_current_presentation(
@@ -1988,7 +2188,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                     )
                 setattr(args, "_holyrics_sermon_plan_theme_id", sermon_plan_theme_id)
                 setattr(args, "_holyrics_sermon_plan_presentation", sermon_plan)
-                if grammar is not None:
+                if grammar is not None and model is not None:
                     grammar = sorted(
                         set(grammar)
                         | set(
@@ -2212,11 +2412,27 @@ def run_microphone(args: argparse.Namespace) -> int:
 
         logger.write("audio_input_selected", audio_input)
         print(f"Микрофон: {audio_input['name']}, {audio_input['samplerate']} Hz", flush=True)
-        recognizer_args = [model, audio_input["samplerate"]]
-        if grammar is not None:
-            recognizer_args.append(json.dumps(grammar, ensure_ascii=False))
-        recognizer = KaldiRecognizer(*recognizer_args)
-        recognizer.SetWords(True)
+        if args.asr_engine == "sherpa-0.54":
+            try:
+                sherpa_recognizer = load_sherpa_recognizer(
+                    args.sherpa_model,
+                    sample_rate=audio_input["samplerate"],
+                    num_threads=args.sherpa_threads,
+                )
+            except RuntimeError as exc:
+                logger.write("asr_startup_error", {"engine": args.asr_engine, "error": str(exc)})
+                print(f"LiVerse: {exc}", file=sys.stderr, flush=True)
+                return 2
+            recognizer = SherpaStreamingRecognizer(
+                sherpa_recognizer,
+                audio_input["samplerate"],
+            )
+        else:
+            recognizer_args = [model, audio_input["samplerate"]]
+            if grammar is not None:
+                recognizer_args.append(json.dumps(grammar, ensure_ascii=False))
+            recognizer = KaldiRecognizer(*recognizer_args)
+            recognizer.SetWords(True)
         audio_bytes_seen = 0
         audio_path = ""
         if args.log_audio and logger.run_dir:
@@ -2423,6 +2639,17 @@ def run_microphone(args: argparse.Namespace) -> int:
                             payload["output"] = publish_payload(output_args, payload)
                             if payload.get("slide"):
                                 action = approval_action(payload["output"])
+                                feedback = operator_feedback(payload["output"])
+                                if feedback is not None:
+                                    logger.write(
+                                        "operator_feedback",
+                                        {
+                                            **feedback,
+                                            "vosk_text": text,
+                                            "asr": result,
+                                            "payload": payload_summary(payload),
+                                        },
+                                    )
                                 context_selected = (
                                     action_selects_context(action, payload["slide"])
                                     and pipeline.set_context_range(payload["slide"])
@@ -2440,7 +2667,10 @@ def run_microphone(args: argparse.Namespace) -> int:
                                         },
                                     )
                                 append_session_reference(session_refs, payload, action=action)
-                                ref = str((payload.get("parsed") or {}).get("ref") or payload["slide"].get("ref"))
+                                ref = str(
+                                    payload["slide"].get("ref")
+                                    or (payload.get("parsed") or {}).get("ref")
+                                )
                                 if action == "waiting":
                                     console.status(f"найдена ссылка {ref}, ожидает подтверждения")
                                 elif context_selected:
@@ -2451,6 +2681,12 @@ def run_microphone(args: argparse.Namespace) -> int:
                                     console.status(f"ошибка Holyrics: {output_failure_reason(payload['output'])}")
                                 elif action == "reject":
                                     console.status(f"отклонено: {ref}")
+                                elif action == "not_citation":
+                                    console.status(f"оператор отметил: это не цитата ({ref})")
+                                elif action == "wrong_reference":
+                                    console.status(f"оператор отметил неверную ссылку: {ref}")
+                                elif action == "skip":
+                                    console.status(f"пропущено без обучения: {ref}")
                                 else:
                                     console.status(f"найдена ссылка: {ref}")
                                 trigger_case_count += 1
@@ -2465,6 +2701,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                                         "audio": audio_path,
                                         **time_info,
                                         "action": action,
+                                        "operator_feedback": feedback or {},
                                         "ref": ref,
                                         "vosk_text": text,
                                         "vosk_buffer": list(payload.get("vosk_buffer") or []),
@@ -2530,7 +2767,15 @@ def run_microphone(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Recognize and resolve Russian live Bible references.")
     parser.add_argument("--version", action="version", version=f"LiVerse {__version__}")
+    parser.add_argument(
+        "--asr-engine",
+        choices=["sherpa-0.54", "vosk-0.22"],
+        default=env_setting("LIVERSE_ASR_ENGINE", "sherpa-0.54"),
+        help="Speech recognizer. Default: the newer streaming Vosk 0.54 model.",
+    )
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL_PATH)
+    parser.add_argument("--sherpa-model", type=Path, default=DEFAULT_SHERPA_MODEL_PATH)
+    parser.add_argument("--sherpa-threads", type=int, default=DEFAULT_SHERPA_THREADS)
     parser.add_argument("--bible", type=Path, default=DEFAULT_BIBLE)
     parser.add_argument("--samplerate", type=int, default=16000)
     parser.add_argument("--blocksize", type=int, default=8000)
@@ -2741,7 +2986,13 @@ def main() -> int:
             {
                 "command": " ".join(sys.argv),
                 "mode": "text",
-                "model": str(args.model),
+                "asr_engine": args.asr_engine,
+                "model": str(
+                    args.sherpa_model if args.asr_engine == "sherpa-0.54" else args.model
+                ),
+                "sherpa_threads": (
+                    args.sherpa_threads if args.asr_engine == "sherpa-0.54" else None
+                ),
                 "bible": str(args.bible),
                 "open_vocabulary": args.open_vocabulary,
                 "slide_output": args.slide_output,
