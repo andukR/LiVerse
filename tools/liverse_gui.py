@@ -753,7 +753,9 @@ class LiVerseGui:
                     self._handle_engine_exit(int(payload))
                 elif event == "tray_error":
                     self.tray_available = False
-                    self._append_diagnostic(f"Системный трей недоступен: {payload}")
+                    message = f"Системный трей недоступен: {payload}"
+                    self._append_diagnostic(message)
+                    write_gui_log(message)
                 elif event == "update_result":
                     self._handle_update_result(payload)
                 elif event == "update_installed":
@@ -933,20 +935,14 @@ class LiVerseGui:
                 pystray.MenuItem("Завершить LiVerse", lambda _icon, _item: self._tray_call(self.quit_application)),
             )
             self.tray_icon = pystray.Icon("liverse", image, "LiVerse", menu)
-
-            def run_tray() -> None:
-                try:
-                    self.tray_icon.run(setup=self._tray_ready)
-                except Exception as exc:
-                    self.output_queue.put(("tray_error", str(exc)))
-
-            threading.Thread(target=run_tray, daemon=True).start()
+            self.tray_icon.run_detached(setup=self._tray_ready)
         except Exception as exc:
             self.output_queue.put(("tray_error", str(exc)))
 
     def _tray_ready(self, icon) -> None:
         self.tray_available = True
         icon.visible = True
+        write_gui_log(f"Системный трей запущен: {self.tray_backend}")
 
     def _tray_call(self, callback) -> None:
         self.root.after(0, callback)
