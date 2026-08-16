@@ -810,6 +810,31 @@ def expand_nehemiah_confusable_candidates(
     return expanded
 
 
+def james_confusable_texts(text: str) -> list[str]:
+    """Repair recurring Vosk forms of the Russian book name James."""
+    replacements: list[str] = []
+    patterns = (
+        (r"\b(послани\w*\s+)и\s+около\b", r"\1иакова"),
+        (r"\bякого\b", "иакова"),
+    )
+    for pattern, replacement in patterns:
+        candidate = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+        if candidate != text and candidate not in replacements:
+            replacements.append(candidate)
+    return replacements
+
+
+def expand_james_confusable_candidates(candidates: list[str]) -> list[str]:
+    expanded: list[str] = []
+    for candidate in candidates:
+        for replacement in james_confusable_texts(candidate):
+            if replacement not in expanded:
+                expanded.append(replacement)
+        if candidate not in expanded:
+            expanded.append(candidate)
+    return expanded
+
+
 def joel_confusable_texts(text: str) -> list[str]:
     replacements: list[str] = []
     patterns = (
@@ -1432,7 +1457,11 @@ def reference_range_context(reference: dict | ParsedReference | None) -> dict | 
 
 
 def book_family(book: str) -> str:
-    return re.sub(r"^[1234]\s+", "", book).strip().lower().replace("ё", "е")
+    family = re.sub(r"^[1234]\s+", "", book).strip().lower().replace("ё", "е")
+    return {
+        "иоанна": "иоанн",
+        "петра": "петр",
+    }.get(family, family)
 
 
 def has_explicit_other_book_marker(normalized: str, context: dict) -> bool:
@@ -1599,6 +1628,16 @@ def contextual_short_reference_from_candidates(
     *,
     preferred_chapter: int | None = None,
 ) -> dict | None:
+    if context:
+        context_family = book_family(str(context.get("book") or ""))
+        for candidate in candidates:
+            explicit_books = book_candidates(normalize_text(candidate))
+            if explicit_books and not any(
+                book_family(explicit_book.book) == context_family for explicit_book in explicit_books
+            ):
+                return None
+            if has_explicit_other_book_marker(normalize_text(candidate), context):
+                return None
     for candidate in candidates:
         payload = contextual_short_reference(
             candidate,
@@ -1806,6 +1845,7 @@ class LiveReferencePipeline:
             self.text_buffer.clear()
             self.text_buffer.add(text)
         candidate_texts = same_place_candidates(self.text_buffer.candidates(), self.last_parsed)
+        candidate_texts = expand_james_confusable_candidates(candidate_texts)
         candidate_texts = expand_joel_confusable_candidates(candidate_texts)
         candidate_texts = expand_nehemiah_confusable_candidates(
             candidate_texts,

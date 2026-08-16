@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+from array import array
 import getpass
 import json
+import math
 import os
 import queue
 import re
@@ -32,6 +34,7 @@ from bible_parser_core.live_pipeline import (
     LiveReferencePipeline,
     add_risk_score,
     build_grammar,
+    expand_james_confusable_candidates,
     expand_nehemiah_confusable_candidates,
     expand_joel_confusable_candidates,
     grammar_diagnostics,
@@ -95,6 +98,7 @@ def audio_input_candidate_indices(
     devices: list[dict],
     *,
     preferred_name: str = "",
+    preferred_hostapi: int | None = None,
     explicit_index: int | None = None,
     default_index: int | None = None,
 ) -> list[int]:
@@ -121,7 +125,13 @@ def audio_input_candidate_indices(
                 exact.append(index)
             elif selected_name in name:
                 partial.append(index)
-        for index in [*exact, *partial]:
+        name_matches = [*exact, *partial]
+        hostapi_matches = [
+            index
+            for index in name_matches
+            if preferred_hostapi is not None and devices[index].get("hostapi") == preferred_hostapi
+        ]
+        for index in [*hostapi_matches, *name_matches]:
             add(index)
 
     add(explicit_index)
@@ -129,6 +139,146 @@ def audio_input_candidate_indices(
     for index in range(len(devices)):
         add(index)
     return result
+
+
+def pcm16_signal_metrics(data: bytes, *, chunk_peaks: list[int] | None = None) -> dict:
+    """Measure mono 16-bit PCM without requiring NumPy."""
+    samples = array("h")
+    samples.frombytes(data[: len(data) - (len(data) % 2)])
+    if sys.byteorder == "big":
+        samples.byteswap()
+    sample_count = len(samples)
+    if not sample_count:
+        return {
+            "samples": 0,
+            "peak": 0,
+            "peak_percent": 0.0,
+            "peak_dbfs": None,
+            "rms": 0.0,
+            "rms_percent": 0.0,
+            "rms_dbfs": None,
+            "active_percent": 0.0,
+            "clipped_percent": 0.0,
+            "active_chunk_percent": 0.0,
+        }
+
+    peak = max(abs(sample) for sample in samples)
+    rms = math.sqrt(sum(sample * sample for sample in samples) / sample_count)
+    active_samples = sum(1 for sample in samples if abs(sample) >= 328)
+    clipped_samples = sum(1 for sample in samples if abs(sample) >= 32604)
+    peaks = chunk_peaks or []
+    active_chunks = sum(1 for value in peaks if value >= 328)
+
+    def dbfs(value: float) -> float | None:
+        if value <= 0:
+            return None
+        return round(20.0 * math.log10(value / 32768.0), 1)
+
+    return {
+        "samples": sample_count,
+        "peak": peak,
+        "peak_percent": round(peak * 100.0 / 32768.0, 1),
+        "peak_dbfs": dbfs(float(peak)),
+        "rms": round(rms, 1),
+        "rms_percent": round(rms * 100.0 / 32768.0, 1),
+        "rms_dbfs": dbfs(rms),
+        "active_percent": round(active_samples * 100.0 / sample_count, 1),
+        "clipped_percent": round(clipped_samples * 100.0 / sample_count, 3),
+        "active_chunk_percent": round(active_chunks * 100.0 / len(peaks), 1) if peaks else 0.0,
+    }
+
+
+def assess_microphone_signal(metrics: dict) -> dict:
+    """Return a conservative operator-facing diagnosis for a short speech test."""
+    samples = int(metrics.get("samples") or 0)
+    peak = int(metrics.get("peak") or 0)
+    rms = float(metrics.get("rms") or 0.0)
+    active_percent = float(metrics.get("active_percent") or 0.0)
+    clipped_percent = float(metrics.get("clipped_percent") or 0.0)
+    active_chunk_percent = float(metrics.get("active_chunk_percent") or 0.0)
+    if samples <= 0:
+        return {"status": "no_data", "message": "аудиоданные не получены"}
+    if peak < 100 or rms < 15.0:
+        return {
+            "status": "silent",
+            "message": "микрофон открыт, но сигнал почти отсутствует",
+        }
+    if clipped_percent >= 0.1:
+        return {
+            "status": "clipping",
+            "message": "есть цифровой перегруз; уменьшите усиление или громкость микрофона",
+        }
+    if peak < 3000 or rms < 400.0 or active_percent < 5.0:
+        return {
+            "status": "weak",
+            "message": "сигнал слишком слабый; приблизьте микрофон или увеличьте входной уровень",
+        }
+    if active_chunk_percent and active_chunk_percent < 20.0:
+        return {
+            "status": "intermittent",
+            "message": "звук поступал лишь короткими фрагментами; проверьте соединение и повторите тест",
+        }
+    if peak >= 30000:
+        return {
+            "status": "loud",
+            "message": "сигнал хороший, но близок к перегрузу; немного уменьшите усиление",
+        }
+    return {"status": "good", "message": "уровень сигнала подходит для распознавания речи"}
+
+
+def microphone_test_identity(name: str, hostapi_name: str) -> str:
+    return f"{name.strip().casefold()}|{hostapi_name.strip().casefold()}"
+
+
+def microphone_test_leader(results: list[dict]) -> dict | None:
+    """Return the loudest latest result that is still suitable for speech recognition."""
+    suitable = [
+        item
+        for item in results
+        if isinstance(item, dict) and str(item.get("status") or "") in {"good", "loud"}
+    ]
+    if not suitable:
+        return None
+    return max(
+        suitable,
+        key=lambda item: (
+            float(item.get("rms") or 0.0),
+            float(item.get("peak") or 0.0),
+        ),
+    )
+
+
+def microphone_test_status_label(status: str) -> str:
+    return {
+        "good": "пригоден",
+        "loud": "громкий, близко к перегрузу",
+        "weak": "слабый",
+        "silent": "почти нет сигнала",
+        "clipping": "перегруз",
+        "intermittent": "прерывистый",
+        "no_data": "нет данных",
+    }.get(status, status or "неизвестно")
+
+
+def store_microphone_test_result(args: argparse.Namespace, result: dict) -> list[dict]:
+    identity = microphone_test_identity(
+        str(result.get("name") or ""),
+        str(result.get("hostapi_name") or ""),
+    )
+    previous = getattr(args, "_liverse_microphone_test_results", [])
+    kept = [
+        dict(item)
+        for item in previous
+        if isinstance(item, dict)
+        and microphone_test_identity(
+            str(item.get("name") or ""),
+            str(item.get("hostapi_name") or ""),
+        )
+        != identity
+    ]
+    kept.append(dict(result))
+    setattr(args, "_liverse_microphone_test_results", kept[-50:])
+    return kept[-50:]
 
 
 def text_detection_database_startup_message(mode: str, database_path: Path) -> str:
@@ -179,12 +329,27 @@ def save_startup_settings(args: argparse.Namespace) -> None:
     if not getattr(args, "_liverse_startup_settings_enabled", False):
         return
     path = startup_settings_path()
+    existing = load_startup_settings(path)
+    last_sermon_plan = getattr(args, "_holyrics_last_sermon_plan_presentation", None)
+    if not isinstance(last_sermon_plan, dict):
+        last_sermon_plan = existing.get("last_sermon_plan")
+    microphone_test_results = getattr(args, "_liverse_microphone_test_results", None)
+    if not isinstance(microphone_test_results, list):
+        microphone_test_results = existing.get("microphone_test_results")
     payload = {
         "version": 1,
         "run_mode": current_run_mode(args),
         "approval_ui": str(getattr(args, "approval_ui", "web") or "web"),
+        "audio_device_name": str(getattr(args, "device_name", "") or ""),
+        "audio_hostapi_name": str(getattr(args, "device_hostapi", "") or ""),
         "holyrics_theme": str(getattr(args, "holyrics_theme", "") or ""),
         "holyrics_quick_minutes": float(getattr(args, "holyrics_quick_minutes", 0.0) or 0.0),
+        "last_sermon_plan": last_sermon_plan if isinstance(last_sermon_plan, dict) else None,
+        "microphone_test_results": (
+            [dict(item) for item in microphone_test_results if isinstance(item, dict)][-50:]
+            if isinstance(microphone_test_results, list)
+            else []
+        ),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -995,15 +1160,6 @@ def install_updated_dependencies(project_root: Path) -> bool:
 
 
 def apply_startup_update(update: dict, project_root: Path = PROJECT_ROOT) -> bool:
-    if os.name == "nt":
-        updater = project_root / "update-liverse-windows.cmd"
-        if not updater.exists():
-            return False
-        return subprocess.run(
-            ["cmd.exe", "/d", "/c", str(updater), str(project_root)],
-            cwd=project_root,
-        ).returncode == 0
-
     remote_ref = str(update.get("remote_ref") or UPDATE_REMOTE_REF)
     merged = subprocess.run(
         ["git", "-C", str(project_root), "merge", "--ff-only", remote_ref],
@@ -1106,6 +1262,12 @@ def ask_priority_run_mode(settings: dict, *, sermon_plan: bool = False) -> tuple
         print("Остальные настройки будут взяты из прошлого запуска.", flush=True)
         print(f"Последний режим: {run_mode_label(str(settings.get('run_mode') or 'semi_auto'))}", flush=True)
         print(f"Подтверждение: {approval_ui_label(str(settings.get('approval_ui') or 'web'))}", flush=True)
+        microphone = str(settings.get("audio_device_name") or "").strip()
+        hostapi = str(settings.get("audio_hostapi_name") or "").strip()
+        microphone_label = microphone or "системный вход по умолчанию"
+        if microphone and hostapi:
+            microphone_label = f"{microphone} [{hostapi}]"
+        print(f"Микрофон: {microphone_label}", flush=True)
         if sermon_plan:
             print("Тема Holyrics: из текущей презентации плана проповеди", flush=True)
         else:
@@ -1147,6 +1309,25 @@ def apply_saved_startup_settings(args: argparse.Namespace, settings: dict) -> No
         approval_ui = str(settings.get("approval_ui") or "").strip()
         if approval_ui in {"web", "popup"}:
             args.approval_ui = approval_ui
+    if not cli_option_present("--device", "--device-name"):
+        audio_device_name = str(settings.get("audio_device_name") or "").strip()
+        if audio_device_name:
+            args.device_name = audio_device_name
+            args.device = None
+    if not cli_option_present("--device-hostapi"):
+        args.device_hostapi = str(settings.get("audio_hostapi_name") or "").strip()
+    last_sermon_plan = settings.get("last_sermon_plan")
+    if isinstance(last_sermon_plan, dict) and str(
+        last_sermon_plan.get("text_id") or last_sermon_plan.get("id") or ""
+    ).strip():
+        setattr(args, "_holyrics_last_sermon_plan_presentation", dict(last_sermon_plan))
+    microphone_test_results = settings.get("microphone_test_results")
+    if isinstance(microphone_test_results, list):
+        setattr(
+            args,
+            "_liverse_microphone_test_results",
+            [dict(item) for item in microphone_test_results if isinstance(item, dict)][-50:],
+        )
     if not setting_was_explicit("--holyrics-theme", env_name="HOLYRICS_THEME"):
         args.holyrics_theme = str(settings.get("holyrics_theme") or "")
         setattr(args, "_holyrics_theme_id", "")
@@ -1184,6 +1365,8 @@ def configure_interactive_approval_mode(args: argparse.Namespace) -> None:
     if not full_setup:
         setattr(args, "_liverse_skip_holyrics_theme_question", True)
         setattr(args, "_liverse_skip_holyrics_quick_question", True)
+    if full_setup:
+        configure_microphone_full_setup(args)
     if mode == "auto" or not full_setup:
         return
 
@@ -1882,6 +2065,369 @@ def trigger_time_info(asr_result: dict, fallback_seconds: float, preroll: float 
     }
 
 
+def default_audio_input_index(sd) -> int | None:
+    try:
+        default_device = sd.default.device
+        value = default_device[0]
+    except (AttributeError, IndexError, TypeError):
+        try:
+            value = sd.default.device
+        except Exception:
+            return None
+    try:
+        index = int(value)
+    except (TypeError, ValueError):
+        return None
+    return index if index >= 0 else None
+
+
+def audio_hostapi_names(sd) -> list[str]:
+    try:
+        return [str(item.get("name") or "") for item in sd.query_hostapis()]
+    except Exception:
+        return []
+
+
+def audio_hostapi_index(sd, preferred_name: str) -> int | None:
+    selected = preferred_name.strip().casefold()
+    if not selected:
+        return None
+    names = audio_hostapi_names(sd)
+    for index, name in enumerate(names):
+        if name.strip().casefold() == selected:
+            return index
+    for index, name in enumerate(names):
+        if selected in name.strip().casefold():
+            return index
+    return None
+
+
+def supported_audio_samplerate(sd, device_index: int, preferred: int = 16000) -> int | None:
+    rates: list[int] = []
+    for value in (preferred, 16000, 48000, 44100):
+        if value > 0 and value not in rates:
+            rates.append(value)
+    for samplerate in rates:
+        try:
+            sd.check_input_settings(
+                device=device_index,
+                channels=1,
+                samplerate=samplerate,
+                dtype="int16",
+            )
+        except Exception:
+            continue
+        return samplerate
+    return None
+
+
+def measure_microphone_signal(sd, device_index: int, samplerate: int, *, seconds: float = 5.0) -> dict:
+    audio = bytearray()
+    chunk_peaks: list[int] = []
+    statuses: list[str] = []
+
+    def callback(indata, _frames, _time_info, status):
+        if status:
+            statuses.append(str(status))
+        data = bytes(indata)
+        audio.extend(data)
+        try:
+            samples = memoryview(data).cast("h")
+            chunk_peaks.append(max((abs(sample) for sample in samples), default=0))
+        except (TypeError, ValueError):
+            chunk_peaks.append(0)
+
+    blocksize = max(800, min(4000, samplerate // 5))
+    with sd.RawInputStream(
+        device=device_index,
+        samplerate=samplerate,
+        blocksize=blocksize,
+        dtype="int16",
+        channels=1,
+        callback=callback,
+    ):
+        deadline = time.monotonic() + max(0.5, seconds)
+        while time.monotonic() < deadline:
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    metrics = pcm16_signal_metrics(bytes(audio), chunk_peaks=chunk_peaks)
+    metrics["statuses"] = statuses
+    return metrics
+
+
+def format_dbfs(value: object) -> str:
+    if not isinstance(value, (int, float)):
+        return "-inf dBFS"
+    return f"{float(value):.1f} dBFS"
+
+
+def print_microphone_test_result(metrics: dict) -> dict:
+    diagnosis = assess_microphone_signal(metrics)
+    peak_percent = float(metrics.get("peak_percent") or 0.0)
+    blocks = min(20, max(0, round(peak_percent / 5.0)))
+    meter = "#" * blocks + "-" * (20 - blocks)
+    print("", flush=True)
+    print(f"Уровень: [{meter}] пик {peak_percent:.1f}% ({format_dbfs(metrics.get('peak_dbfs'))})", flush=True)
+    print(
+        f"Средний уровень: {float(metrics.get('rms_percent') or 0.0):.1f}% "
+        f"({format_dbfs(metrics.get('rms_dbfs'))}); "
+        f"активный звук: {float(metrics.get('active_percent') or 0.0):.1f}%",
+        flush=True,
+    )
+    print(f"Результат: {diagnosis['message']}.", flush=True)
+    statuses = list(metrics.get("statuses") or [])
+    if statuses:
+        print(f"Драйвер сообщил: {statuses[-1]}", flush=True)
+    return diagnosis
+
+
+def open_windows_recording_settings() -> None:
+    if os.name != "nt":
+        print("Системная панель звукозаписи доступна здесь только в Windows.", flush=True)
+        return
+    try:
+        subprocess.Popen(["control.exe", "mmsys.cpl,,1"])
+        print("Открыта панель Windows «Звук → Запись». После настройки вернитесь в LiVerse.", flush=True)
+    except OSError as exc:
+        print(f"Не удалось открыть панель звукозаписи Windows: {exc}", flush=True)
+
+
+def configure_microphone_full_setup(args: argparse.Namespace) -> None:
+    """Select and test a microphone as a stage of the existing E setup flow."""
+    print("", flush=True)
+    print("Настройка микрофона", flush=True)
+    try:
+        import sounddevice as sd
+    except (ImportError, OSError) as exc:
+        print(f"Диагностика микрофона недоступна: {exc}", flush=True)
+        return
+
+    try:
+        devices = list(sd.query_devices())
+    except Exception as exc:
+        print(f"Не удалось получить список микрофонов: {exc}", flush=True)
+        return
+    default_index = default_audio_input_index(sd)
+    hostapi_names = audio_hostapi_names(sd)
+    preferred_hostapi = audio_hostapi_index(sd, str(getattr(args, "device_hostapi", "") or ""))
+    candidates = audio_input_candidate_indices(
+        devices,
+        preferred_name=str(getattr(args, "device_name", "") or ""),
+        preferred_hostapi=preferred_hostapi,
+        explicit_index=getattr(args, "device", None),
+        default_index=default_index,
+    )
+    if not candidates:
+        print("Windows не сообщает ни об одном доступном аудиовходе.", flush=True)
+        open_windows_recording_settings()
+        return
+
+    def device_hostapi_name(device: dict) -> str:
+        try:
+            return hostapi_names[int(device.get("hostapi"))]
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return "неизвестный интерфейс"
+
+    def available_test_results() -> list[dict]:
+        saved = [
+            item
+            for item in getattr(args, "_liverse_microphone_test_results", [])
+            if isinstance(item, dict)
+        ]
+        by_identity = {
+            microphone_test_identity(
+                str(item.get("name") or ""),
+                str(item.get("hostapi_name") or ""),
+            ): item
+            for item in saved
+        }
+        current: list[dict] = []
+        for index, device in enumerate(devices):
+            if int(device.get("max_input_channels") or 0) < 1:
+                continue
+            identity = microphone_test_identity(
+                str(device.get("name") or ""),
+                device_hostapi_name(device),
+            )
+            result = by_identity.get(identity)
+            if result:
+                current.append({**result, "index": index})
+        return current
+
+    def print_test_leader() -> dict | None:
+        results = available_test_results()
+        leader = microphone_test_leader(results)
+        if leader:
+            print(
+                "Самый громкий пригодный вход: "
+                f"№{leader.get('index')} {leader.get('name')} [{leader.get('hostapi_name')}], "
+                f"средний {float(leader.get('rms_percent') or 0.0):.1f}%, "
+                f"пик {float(leader.get('peak_percent') or 0.0):.1f}%.",
+                flush=True,
+            )
+            return leader
+        if results:
+            loudest = max(results, key=lambda item: float(item.get("rms") or 0.0))
+            print(
+                "Пригодный вход пока не найден. Самый громкий из проверенных: "
+                f"№{loudest.get('index')} {loudest.get('name')} "
+                f"({microphone_test_status_label(str(loudest.get('status') or ''))}).",
+                flush=True,
+            )
+        else:
+            print("Сохранённых результатов теста пока нет.", flush=True)
+        return None
+
+    def run_test(device_index: int) -> dict | None:
+        device = devices[device_index]
+        samplerate = supported_audio_samplerate(
+            sd,
+            device_index,
+            int(getattr(args, "samplerate", 16000)),
+        )
+        if samplerate is None:
+            print("Этот вход не удалось открыть в поддерживаемом формате.", flush=True)
+            return None
+        name = str(device.get("name") or f"устройство {device_index}")
+        hostapi_name = device_hostapi_name(device)
+        print(f"Тест: {device_index}: {name} [{hostapi_name}], {samplerate} Hz", flush=True)
+        print("Говорите в микрофон обычным голосом 5 секунд. Тест можно прервать Ctrl+C.", flush=True)
+        try:
+            metrics = measure_microphone_signal(sd, device_index, samplerate)
+        except KeyboardInterrupt:
+            print("\nТест микрофона прерван.", flush=True)
+            raise
+        except Exception as exc:
+            print(f"Не удалось проверить этот вход: {exc}", flush=True)
+            return None
+        diagnosis = print_microphone_test_result(metrics)
+        result = {
+            "index": device_index,
+            "name": name,
+            "hostapi_name": hostapi_name,
+            "samplerate": samplerate,
+            "tested_at": datetime.now().isoformat(timespec="seconds"),
+            "status": diagnosis["status"],
+            "peak": int(metrics.get("peak") or 0),
+            "peak_percent": float(metrics.get("peak_percent") or 0.0),
+            "peak_dbfs": metrics.get("peak_dbfs"),
+            "rms": float(metrics.get("rms") or 0.0),
+            "rms_percent": float(metrics.get("rms_percent") or 0.0),
+            "rms_dbfs": metrics.get("rms_dbfs"),
+            "active_percent": float(metrics.get("active_percent") or 0.0),
+            "clipped_percent": float(metrics.get("clipped_percent") or 0.0),
+        }
+        store_microphone_test_result(args, result)
+        save_startup_settings(args)
+        print("Результат теста сохранён.", flush=True)
+        print_test_leader()
+        return result
+
+    selected_index = candidates[0]
+    while True:
+        print("Доступные входы:", flush=True)
+        previous_by_identity = {
+            microphone_test_identity(
+                str(item.get("name") or ""),
+                str(item.get("hostapi_name") or ""),
+            ): item
+            for item in available_test_results()
+        }
+        for index, device in enumerate(devices):
+            try:
+                input_channels = int(device.get("max_input_channels") or 0)
+            except (AttributeError, TypeError, ValueError):
+                input_channels = 0
+            if input_channels < 1:
+                continue
+            labels: list[str] = []
+            if index == selected_index:
+                labels.append("выбран")
+            if index == default_index:
+                labels.append("Windows по умолчанию")
+            suffix = f" — {', '.join(labels)}" if labels else ""
+            hostapi_name = device_hostapi_name(device)
+            previous = previous_by_identity.get(
+                microphone_test_identity(str(device.get("name") or ""), hostapi_name)
+            )
+            tested = ""
+            if previous:
+                tested = (
+                    f"; тест: средний {float(previous.get('rms_percent') or 0.0):.1f}%, "
+                    f"пик {float(previous.get('peak_percent') or 0.0):.1f}%, "
+                    f"{microphone_test_status_label(str(previous.get('status') or ''))}"
+                )
+            print(f"  {index}: {device.get('name')} [{hostapi_name}]{suffix}{tested}", flush=True)
+        print_test_leader()
+        print(
+            "Введите номер входа; Enter — проверить выбранный; A — проверить все; "
+            "S — настройки звука Windows; Q — пропустить",
+            flush=True,
+        )
+        choice = input("> ").strip()
+        if choice.casefold() == "q":
+            print("Настройка микрофона пропущена.", flush=True)
+            return
+        if choice.casefold() == "s":
+            open_windows_recording_settings()
+            continue
+        if choice.casefold() == "a":
+            input_indices = [
+                index
+                for index, device in enumerate(devices)
+                if int(device.get("max_input_channels") or 0) > 0
+            ]
+            print(
+                f"Будут проверены {len(input_indices)} входов по 5 секунд. "
+                "Говорите обычным голосом; Ctrl+C прекращает серию.",
+                flush=True,
+            )
+            try:
+                for position, device_index in enumerate(input_indices, start=1):
+                    print(f"\nПроверка {position} из {len(input_indices)}", flush=True)
+                    run_test(device_index)
+            except KeyboardInterrupt:
+                pass
+            leader = print_test_leader()
+            if leader is not None:
+                selected_index = int(leader.get("index") or selected_index)
+            continue
+        if choice:
+            try:
+                requested_index = int(choice)
+            except ValueError:
+                print("Введите номер из списка.", flush=True)
+                continue
+            if requested_index not in candidates:
+                print("У этого номера нет доступного аудиовхода.", flush=True)
+                continue
+            selected_index = requested_index
+
+        try:
+            result = run_test(selected_index)
+        except KeyboardInterrupt:
+            return
+        if result is None:
+            continue
+        print("Enter — сохранить; Space — выбрать другой; R — повторить тест; S — настройки Windows", flush=True)
+        while True:
+            key = read_single_key()
+            if key in ENTER_KEYS:
+                args.device_name = str(result.get("name") or "")
+                args.device_hostapi = str(result.get("hostapi_name") or "")
+                args.device = selected_index
+                hostapi_label = f" [{args.device_hostapi}]" if args.device_hostapi else ""
+                print(f"Сохранён микрофон: {args.device_name}{hostapi_label}", flush=True)
+                return
+            if key in SPACE_KEYS:
+                print("выбрать другой", flush=True)
+                break
+            if key in {"r", "R"}:
+                print("повторить тест", flush=True)
+                break
+            if key in {"s", "S"}:
+                open_windows_recording_settings()
+
+
 def list_audio_devices() -> int:
     import sounddevice as sd
 
@@ -1922,6 +2468,8 @@ def run_microphone(args: argparse.Namespace) -> int:
             "samplerate": args.samplerate,
             "blocksize": args.blocksize,
             "device": args.device,
+            "device_name": args.device_name,
+            "device_hostapi": args.device_hostapi,
             "open_vocabulary": args.open_vocabulary,
             "citation_detection_mode": args.citation_detection_mode,
             "text_detection_db": str(args.text_detection_db) if text_detection_enabled else None,
@@ -1988,6 +2536,15 @@ def run_microphone(args: argparse.Namespace) -> int:
                     )
                 setattr(args, "_holyrics_sermon_plan_theme_id", sermon_plan_theme_id)
                 setattr(args, "_holyrics_sermon_plan_presentation", sermon_plan)
+                last_sermon_plan = {
+                    "type": "text",
+                    "text_id": str(active.get("text_id") or active.get("id") or ""),
+                    "name": str(active.get("name") or ""),
+                    "current_index": current_slide_index,
+                    "slide_number": current_slide_index + 1,
+                }
+                setattr(args, "_holyrics_last_sermon_plan_presentation", last_sermon_plan)
+                save_startup_settings(args)
                 if grammar is not None:
                     grammar = sorted(
                         set(grammar)
@@ -2092,6 +2649,7 @@ def run_microphone(args: argparse.Namespace) -> int:
         result = audio_input_candidate_indices(
             devices,
             preferred_name=args.device_name,
+            preferred_hostapi=audio_hostapi_index(sd, args.device_hostapi),
             explicit_index=args.device,
             default_index=default_input,
         )
@@ -2543,6 +3101,14 @@ def main() -> int:
             "falls back to --device, the system default, then other inputs."
         ),
     )
+    parser.add_argument(
+        "--device-hostapi",
+        default=env_setting("LIVERSE_AUDIO_HOSTAPI", ""),
+        help=(
+            "Prefer a Windows audio interface (for example Windows WDM-KS) when several "
+            "input devices have the same name. The E setup menu saves this automatically."
+        ),
+    )
     parser.add_argument("--list-audio-devices", action="store_true", help="Print microphone/input device list and exit.")
     parser.add_argument("--open-vocabulary", action="store_true", help="Run Vosk without generated grammar.")
     parser.add_argument(
@@ -2757,6 +3323,7 @@ def main() -> int:
             }
         )
         check_holyrics_startup(args, logger)
+        candidate_texts = expand_james_confusable_candidates(candidate_texts)
         candidate_texts = expand_nehemiah_confusable_candidates(
             [" ".join(args.text)],
             bible_path=args.bible,

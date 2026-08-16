@@ -20,6 +20,171 @@ from tools.holyrics import (
 
 
 class LiveReferencePipelineTest(unittest.TestCase):
+    def test_microphone_test_leader_uses_loudest_suitable_average_level(self):
+        from tools.vosk_grammar_probe import microphone_test_leader
+
+        results = [
+            {"index": 1, "status": "weak", "rms": 900.0, "peak": 20000},
+            {"index": 18, "status": "good", "rms": 700.0, "peak": 25000},
+            {"index": 23, "status": "good", "rms": 1100.0, "peak": 22000},
+            {"index": 8, "status": "clipping", "rms": 5000.0, "peak": 32768},
+        ]
+
+        self.assertEqual(23, microphone_test_leader(results)["index"])
+
+    def test_microphone_test_result_replaces_previous_same_input(self):
+        from tools.vosk_grammar_probe import store_microphone_test_result
+
+        args = SimpleNamespace(
+            _liverse_microphone_test_results=[
+                {
+                    "index": 1,
+                    "name": "USB Mic",
+                    "hostapi_name": "MME",
+                    "rms": 100.0,
+                }
+            ]
+        )
+        saved = store_microphone_test_result(
+            args,
+            {
+                "index": 1,
+                "name": "usb mic",
+                "hostapi_name": "mme",
+                "rms": 900.0,
+            },
+        )
+
+        self.assertEqual(1, len(saved))
+        self.assertEqual(900.0, saved[0]["rms"])
+
+    def test_james_vosk_i_okolo_form_does_not_become_philemon(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text(
+            "давайте откроем послание и около третья глава с пятого по пятнадцатый стих"
+        )
+
+        self.assertEqual("Иаков 3:5-15", result.get("parsed", {}).get("ref"))
+
+    def test_james_vosk_yakogo_form_replaces_wrong_philemon_context(self):
+        from bible_parser_core.parser import parse_live_reference
+
+        pipeline = LiveReferencePipeline()
+        self.assertTrue(pipeline.set_context_range(parse_live_reference("Филимону 1:5-15")))
+
+        result = pipeline.process_text("якого третья глава с пятого по пятнадцатый стих")
+
+        self.assertEqual("Иаков 3:5-15", result.get("parsed", {}).get("ref"))
+        self.assertFalse(result.get("context_reference"))
+
+    def test_microphone_signal_metrics_detect_silence(self):
+        from tools.vosk_grammar_probe import assess_microphone_signal, pcm16_signal_metrics
+
+        metrics = pcm16_signal_metrics(b"\x00\x00" * 1600, chunk_peaks=[0, 0])
+
+        self.assertEqual("silent", assess_microphone_signal(metrics)["status"])
+        self.assertEqual(0, metrics["peak"])
+
+    def test_microphone_signal_metrics_accept_speech_level(self):
+        from array import array
+
+        from tools.vosk_grammar_probe import assess_microphone_signal, pcm16_signal_metrics
+
+        audio = array("h", [0, 900, -2400, 7200, -10000, 3500] * 400).tobytes()
+        metrics = pcm16_signal_metrics(audio, chunk_peaks=[7200, 10000, 8000, 6500])
+
+        self.assertEqual("good", assess_microphone_signal(metrics)["status"])
+        self.assertGreater(metrics["rms"], 150)
+        self.assertEqual(0.0, metrics["clipped_percent"])
+
+    def test_microphone_signal_metrics_detect_clipping(self):
+        from array import array
+
+        from tools.vosk_grammar_probe import assess_microphone_signal, pcm16_signal_metrics
+
+        audio = array("h", [32767, -32768, 32000, -31000] * 400).tobytes()
+        metrics = pcm16_signal_metrics(audio, chunk_peaks=[32767, 32768])
+
+        self.assertEqual("clipping", assess_microphone_signal(metrics)["status"])
+
+    def test_saved_startup_settings_restore_microphone_name(self):
+        from tools.vosk_grammar_probe import apply_saved_startup_settings
+
+        args = SimpleNamespace(
+            approval_ui="web",
+            device=7,
+            device_name="old input",
+            device_hostapi="MME",
+            holyrics_theme="",
+            holyrics_quick_minutes=0.0,
+        )
+        with patch("sys.argv", ["liverse"]):
+            apply_saved_startup_settings(
+                args,
+                {
+                    "audio_device_name": "Microphone (USB Dongle)",
+                    "audio_hostapi_name": "Windows WDM-KS",
+                },
+            )
+
+        self.assertEqual("Microphone (USB Dongle)", args.device_name)
+        self.assertEqual("Windows WDM-KS", args.device_hostapi)
+        self.assertIsNone(args.device)
+
+    def test_startup_settings_save_microphone_name(self):
+        import json
+        import tempfile
+
+        from tools.vosk_grammar_probe import save_startup_settings
+
+        args = SimpleNamespace(
+            _liverse_startup_settings_enabled=True,
+            require_approval=False,
+            semi_auto_approval=True,
+            approval_ui="web",
+            device_name="Microphone (USB Dongle)",
+            device_hostapi="Windows WDM-KS",
+            holyrics_theme="Theme 8",
+            holyrics_quick_minutes=0.25,
+            _liverse_microphone_test_results=[
+                {
+                    "index": 23,
+                    "name": "Microphone (USB Dongle)",
+                    "hostapi_name": "Windows WDM-KS",
+                    "status": "good",
+                    "rms": 1000.0,
+                }
+            ],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            with patch("tools.vosk_grammar_probe.startup_settings_path", return_value=path):
+                save_startup_settings(args)
+            saved = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual("Microphone (USB Dongle)", saved["audio_device_name"])
+        self.assertEqual("Windows WDM-KS", saved["audio_hostapi_name"])
+        self.assertEqual(23, saved["microphone_test_results"][0]["index"])
+
+    def test_audio_input_candidates_prefer_saved_hostapi_for_duplicate_names(self):
+        from tools.vosk_grammar_probe import audio_input_candidate_indices
+
+        devices = [
+            {"name": "Microphone (USB2.0 Device)", "hostapi": 0, "max_input_channels": 1},
+            {"name": "Microphone (USB2.0 Device)", "hostapi": 2, "max_input_channels": 1},
+            {"name": "Microphone (USB2.0 Device)", "hostapi": 3, "max_input_channels": 1},
+        ]
+
+        result = audio_input_candidate_indices(
+            devices,
+            preferred_name="USB2.0 Device",
+            preferred_hostapi=3,
+            explicit_index=0,
+        )
+
+        self.assertEqual([2, 0, 1], result)
+
     def test_audio_input_candidates_prefer_stable_name_over_indexes(self):
         from tools.vosk_grammar_probe import audio_input_candidate_indices
 
@@ -56,12 +221,15 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertEqual([0, 2], result)
 
-    def test_windows_updater_reexec_uses_call_without_broken_nested_quotes(self):
-        project_root = Path(__file__).resolve().parents[3]
-        updater = (project_root / "update-liverse-windows.cmd").read_text(encoding="utf-8")
+    def test_startup_update_does_not_run_self_modifying_windows_batch(self):
+        import inspect
 
-        self.assertIn('call "%TEMP_SCRIPT%" "%TARGET_DIR%"', updater)
-        self.assertNotIn('cmd /d /c ""%TEMP_SCRIPT%" "%TARGET_DIR%""', updater)
+        from tools.vosk_grammar_probe import apply_startup_update
+
+        source = inspect.getsource(apply_startup_update)
+
+        self.assertNotIn("update-liverse-windows.cmd", source)
+        self.assertIn('"merge", "--ff-only"', source)
 
     def test_liverse_version_is_consistent_across_packages_and_metadata(self):
         import tomllib
@@ -1622,12 +1790,15 @@ class LiveReferencePipelineTest(unittest.TestCase):
             holyrics_quick_minutes=0.0,
         )
 
-        with patch(
-            "tools.holyrics.post_holyrics_api",
-            side_effect=[
-                (True, "", '{"data": {}}'),
-                (True, "", ""),
-            ],
+        with (
+            patch("tools.holyrics.get_holyrics_current_presentation", return_value=None),
+            patch(
+                "tools.holyrics.post_holyrics_api",
+                side_effect=[
+                    (True, "", '{"data": {}}'),
+                    (True, "", ""),
+                ],
+            ),
         ):
             ok, reason = post_holyrics_url(args, "http://127.0.0.1:8091", parsed)
 
@@ -1773,6 +1944,42 @@ class LiveReferencePipelineTest(unittest.TestCase):
             "http://127.0.0.1:8091",
             presentation,
             2,
+        )
+
+    def test_final_long_range_verse_restores_cached_sermon_plan(self):
+        cached = {
+            "type": "text",
+            "text_id": "cached-sermon-plan",
+            "current_index": 6,
+        }
+        args = SimpleNamespace(
+            holyrics_url="http://127.0.0.1:8091",
+            _holyrics_last_sermon_plan_presentation=cached,
+            _holyrics_scripture_range_reading={
+                "ref": "Иаков 3:5-15",
+                "book": "Иаков",
+                "book_id": 59,
+                "current_index": 0,
+                "targets": [
+                    {"slide_index": 0, "chapter": 3, "verse": 15, "text": "конец"},
+                ],
+            },
+        )
+        verse_fifteen = SimpleNamespace(book_id=59, chapter=3, start_verse=15, end_verse=15)
+
+        with patch(
+            "tools.holyrics.restore_sermon_plan_after_quick_presentation",
+            return_value=(True, "sermon_plan_restore_verified", {"verified": True}),
+        ) as restore:
+            result = handle_scripture_range_reading_match(args, verse_fifteen)
+
+        self.assertTrue(result["completed"])
+        self.assertTrue(result["restored_sermon_plan"])
+        restore.assert_called_once_with(
+            args,
+            "http://127.0.0.1:8091",
+            cached,
+            6,
         )
 
     def test_failed_final_restore_keeps_long_passage_active_for_retry(self):
