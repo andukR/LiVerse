@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import math
+import ssl
 import time
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -34,6 +35,12 @@ def file_sha256(path: Path) -> str:
 
 def ensure_sherpa_model(model_path: Path, *, attempts: int = 3) -> None:
     """Download the pinned 0.54 model once and verify every file."""
+    try:
+        import certifi
+
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        ssl_context = ssl.create_default_context()
     for relative_path, expected_hash in SHERPA_MODEL_FILES.items():
         destination = model_path / relative_path
         if destination.is_file() and file_sha256(destination) == expected_hash:
@@ -48,7 +55,7 @@ def ensure_sherpa_model(model_path: Path, *, attempts: int = 3) -> None:
         for attempt in range(1, max(1, attempts) + 1):
             try:
                 print(f"LiVerse: скачивается модель Vosk 0.54: {relative_path}", flush=True)
-                with urlopen(request, timeout=120) as response, temporary.open("wb") as target:
+                with urlopen(request, timeout=120, context=ssl_context) as response, temporary.open("wb") as target:
                     while chunk := response.read(1024 * 1024):
                         target.write(chunk)
                 if file_sha256(temporary) != expected_hash:
