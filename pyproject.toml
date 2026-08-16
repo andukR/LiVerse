@@ -8,6 +8,7 @@ dependencies = [
   "sounddevice",
   "vosk",
   "sherpa-onnx==1.13.4",
+  "numpy>=1.24,<3",
   "qrcode[pil]",
   "pystray==0.19.5",
   "pymorphy3",
