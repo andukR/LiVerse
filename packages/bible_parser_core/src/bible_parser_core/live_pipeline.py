@@ -1557,18 +1557,10 @@ def contextual_spoken_verse_range(text: str, normalized: str) -> tuple[int, int]
     if connected:
         return int(connected.group("start")), int(connected.group("end"))
 
-    adjacent = re.search(
+    adjacent_numbers = bool(re.search(
         r"\b(?P<start>\d{1,3})\s+(?P<end>\d{1,3})\s+стих\w*\b",
         normalized,
-    )
-    if adjacent:
-        return int(adjacent.group("start")), int(adjacent.group("end"))
-
-    # Compound ordinals such as "двадцать первом" are already normalized to
-    # one number ("21").  Re-reading their two source words here would turn
-    # them into a false reversed range 20-1.
-    if re.search(r"\b\d{1,3}\s+стих\w*\b", normalized):
-        return None
+    ))
 
     raw_words = re.findall(r"[а-я]+", text.lower().replace("ё", "е"))
     for start_word, end_word, marker in zip(raw_words, raw_words[1:], raw_words[2:]):
@@ -1577,6 +1569,10 @@ def contextual_spoken_verse_range(text: str, normalized: str) -> tuple[int, int]
         start_verse = ORDINALS.get(start_word)
         end_verse = ORDINALS.get(end_word)
         if start_verse is not None and end_verse is not None:
+            # Compound ordinals such as "двадцать первом" collapse to one
+            # normalized number ("21") and must not become a false 20-1 range.
+            if not adjacent_numbers:
+                return None
             return int(start_verse), int(end_verse)
     return None
 
