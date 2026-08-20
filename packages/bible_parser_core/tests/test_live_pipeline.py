@@ -168,12 +168,15 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertEqual([0, 2], result)
 
-    def test_windows_updater_reexec_uses_call_without_broken_nested_quotes(self):
-        project_root = Path(__file__).resolve().parents[3]
-        updater = (project_root / "update-liverse-windows.cmd").read_text(encoding="utf-8")
+    def test_startup_update_uses_verified_main_fast_forward(self):
+        import inspect
 
-        self.assertIn('call "%TEMP_SCRIPT%" "%TARGET_DIR%"', updater)
-        self.assertNotIn('cmd /d /c ""%TEMP_SCRIPT%" "%TARGET_DIR%""', updater)
+        from tools.vosk_grammar_probe import apply_startup_update
+
+        source = inspect.getsource(apply_startup_update)
+
+        self.assertIn('"merge", "--ff-only"', source)
+        self.assertNotIn("update-liverse-windows.cmd", source)
 
     def test_liverse_version_is_consistent_across_packages_and_metadata(self):
         import tomllib

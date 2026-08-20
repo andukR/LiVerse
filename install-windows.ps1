@@ -9,27 +9,32 @@ if (-not (Test-Path ".venv")) {
     & $Python -m venv .venv
 }
 
-$pip = Join-Path $PSScriptRoot ".venv\Scripts\pip.exe"
-& $pip install --upgrade pip
-& $pip install -r requirements.txt
-& $pip install -e .
-
 $venvPython = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
+if (-not (Test-Path $venvPython)) {
+    throw "Virtual environment Python was not found: $venvPython"
+}
+& $venvPython -m pip install --upgrade pip
+if ($LASTEXITCODE -ne 0) { throw "Could not upgrade pip." }
+& $venvPython -m pip install -r requirements.txt
+if ($LASTEXITCODE -ne 0) { throw "Could not install LiVerse requirements." }
+& $venvPython -m pip install -e .
+if ($LASTEXITCODE -ne 0) { throw "Could not install LiVerse in editable mode." }
+
 & $venvPython -c "import sherpa_onnx, bible_parser_core; print('LiVerse speech engine OK')"
 if ($LASTEXITCODE -ne 0) {
-    throw "Не удалось установить библиотеку распознавания речи sherpa-onnx."
+    throw "Could not install the sherpa-onnx speech recognition library."
 }
 
 $modelDir = Join-Path $PSScriptRoot ".cache\liverse\models\vosk-model-small-streaming-ru-0.54"
 $modelCode = "import sys; from pathlib import Path; from bible_parser_core.sherpa_streaming import ensure_sherpa_model; ensure_sherpa_model(Path(sys.argv[1]))"
 & $venvPython -c $modelCode $modelDir
 if ($LASTEXITCODE -ne 0) {
-    throw "Не удалось установить модель Vosk 0.54."
+    throw "Could not install the Vosk 0.54 model."
 }
 
 if ((-not (Test-Path ".env")) -and (Test-Path ".env.example")) {
     Copy-Item ".env.example" ".env"
-    Write-Host ".env создан из .env.example. Вставьте HOLYRICS_TOKEN и проверьте HOLYRICS_PORT."
+    Write-Host ".env was created from .env.example. Add HOLYRICS_TOKEN and check HOLYRICS_PORT."
 }
 
 $pythonw = Join-Path $PSScriptRoot ".venv\Scripts\pythonw.exe"
@@ -49,5 +54,5 @@ if (Test-Path $icon) {
 $shortcut.Save()
 
 Write-Host ""
-Write-Host "Готово. Запускайте LiVerse ярлыком на рабочем столе."
-Write-Host "Для диагностики с консолью используйте run-liverse.cmd."
+Write-Host "Done. Start LiVerse from the desktop shortcut."
+Write-Host "For console diagnostics, use run-liverse.cmd."

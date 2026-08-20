@@ -1081,23 +1081,14 @@ def apply_startup_update(
     *,
     hide_console: bool = False,
 ) -> bool:
-    if os.name == "nt":
-        updater = project_root / "update-liverse-windows.cmd"
-        if not updater.exists():
-            return False
-        run_options: dict[str, object] = {}
-        if hide_console:
-            run_options["creationflags"] = subprocess.CREATE_NO_WINDOW
-        return subprocess.run(
-            ["cmd.exe", "/d", "/c", str(updater), str(project_root)],
-            cwd=project_root,
-            **run_options,
-        ).returncode == 0
-
+    run_options: dict[str, object] = {}
+    if hide_console and os.name == "nt":
+        run_options["creationflags"] = subprocess.CREATE_NO_WINDOW
     remote_ref = str(update.get("remote_ref") or UPDATE_REMOTE_REF)
     merged = subprocess.run(
         ["git", "-C", str(project_root), "merge", "--ff-only", remote_ref],
         cwd=project_root,
+        **run_options,
     )
     return merged.returncode == 0 and install_updated_dependencies(project_root)
 
