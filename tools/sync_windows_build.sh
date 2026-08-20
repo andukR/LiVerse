@@ -8,6 +8,7 @@ VM_NAME="win10"
 VM_URI="qemu:///system"
 VM_CDROM="sdc"
 WINDOWS_DEST='C:\Build\LiVerse'
+BIBLE_INDEX_ASSET='bible_index/bible_index.db'
 PREPARE_ONLY=false
 
 usage() {
@@ -140,6 +141,12 @@ copy_tree tools
 copy_tree packages/bible_parser_core/src/bible_parser_core
 copy_tree packages/bible_parser_core/tests
 
+if [[ ! -f "$PROJECT_ROOT/$BIBLE_INDEX_ASSET" ]]; then
+    echo "Required Windows build asset is missing: $BIBLE_INDEX_ASSET" >&2
+    exit 1
+fi
+copy_file "$BIBLE_INDEX_ASSET"
+
 # These source/provenance files are not needed to run or package LiVerse.
 rm -rf -- "$SNAPSHOT_DIR/packages/bible_parser_core/src/bible_parser_core/data/archive"
 rm -f -- "$SNAPSHOT_DIR/packages/bible_parser_core/src/bible_parser_core/data/sword_russinodal.json"
@@ -166,6 +173,7 @@ TIMESTAMP_UTC=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
     printf 'timestamp_utc=%s\n' "$TIMESTAMP_UTC"
     printf 'windows_destination=%s\n' "$WINDOWS_DEST"
     printf 'snapshot_policy=explicit build inputs; no runtime cache, models, env, logs, build or dist\n'
+    printf 'included_build_asset=%s\n' "$BIBLE_INDEX_ASSET"
     printf 'included_ignored_test_data=packages/bible_parser_core/tests/parser_regression_cases.json\n'
     printf '\ngit_diff_stat:\n'
     git -C "$PROJECT_ROOT" diff --stat HEAD
