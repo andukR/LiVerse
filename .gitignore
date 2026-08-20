@@ -48,3 +48,4 @@ build/
 external_sources/
 packages/bible_parser_core/src/bible_parser_core/data/archive/
 .windows-sync/
+bible_index/bible_index.db
