@@ -324,7 +324,7 @@ class LiveReferencePipelineTest(unittest.TestCase):
         project_root = Path(__file__).resolve().parents[3]
         metadata = tomllib.loads((project_root / "pyproject.toml").read_text(encoding="utf-8"))
 
-        self.assertEqual("1.1.0", core_version)
+        self.assertEqual("1.2.0", core_version)
         self.assertEqual(core_version, tools_version)
         self.assertEqual(core_version, slide_server_version)
         self.assertEqual(["version"], metadata["project"]["dynamic"])
