@@ -5,22 +5,29 @@ from __future__ import annotations
 
 import os
 import queue
+import json
+import re
 import signal
 import socket
 import subprocess
 import sys
 import threading
 import traceback
+import zipfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+    PROJECT_ROOT = Path(sys._MEIPASS)
+else:
+    PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 CORE_SRC = PROJECT_ROOT / "packages" / "bible_parser_core" / "src"
@@ -31,10 +38,19 @@ from tools.holyrics import (  # noqa: E402
     DEFAULT_PORT,
     check_holyrics_api_server,
     env_setting,
+    liverse_config_dir,
     required_holyrics_permissions,
     save_holyrics_env,
 )
+from tools import __version__  # noqa: E402
+from tools.release_updater import (  # noqa: E402
+    ReleaseUpdateError,
+    check_windows_release_update,
+    download_windows_release_installer,
+    launch_windows_release_installer,
+)
 from tools.vosk_grammar_probe import (  # noqa: E402
+    DEFAULT_LOG_DIR,
     DEFAULT_TEXT_DETECTION_DB,
     apply_startup_update,
     check_startup_update,
@@ -50,7 +66,7 @@ RUN_MODE_LABELS = {
 }
 APPROVAL_LABELS = {
     "popup": "Всплывающее окно",
-    "web": "Телефон или браузер",
+    "web": "Телефон",
 }
 DETECTION_LABELS = {
     "hybrid_confirm": "Адреса и текст стихов, сомнительное подтверждать",
@@ -71,11 +87,102 @@ STATE_COLORS = {
     "error": ("#FDE8E7", "#A12622"),
     "neutral": ("#E9EEF3", "#465463"),
 }
+LOG_EXPORT_NAMES = ("session.json", "events.jsonl", "trigger_cases.jsonl")
+SENSITIVE_LOG_KEYS = ("token", "password", "secret", "authorization")
+
+
+def redact_log_value(value):
+    if isinstance(value, dict):
+        return {
+            key: ("[скрыто]" if any(part in str(key).casefold() for part in SENSITIVE_LOG_KEYS) else redact_log_value(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_log_value(item) for item in value]
+    if not isinstance(value, str):
+        return value
+    patterns = (
+        r"(?i)(--holyrics-token(?:=|\s+))\S+",
+        r"(?i)(HOLYRICS_TOKEN\s*=\s*)\S+",
+        r"(?i)([?&]token=)[^&\s]+",
+    )
+    cleaned = value
+    for pattern in patterns:
+        cleaned = re.sub(pattern, lambda match: f"{match.group(1)}[скрыто]", cleaned)
+    return cleaned
+
+
+def sanitized_log_bytes(path: Path) -> bytes:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if path.suffix == ".json":
+        try:
+            payload = redact_log_value(json.loads(text))
+            return (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        except json.JSONDecodeError:
+            return str(redact_log_value(text)).encode("utf-8")
+    rows = []
+    for line in text.splitlines():
+        try:
+            rows.append(json.dumps(redact_log_value(json.loads(line)), ensure_ascii=False))
+        except json.JSONDecodeError:
+            rows.append(str(redact_log_value(line)))
+    return (("\n".join(rows) + "\n") if rows else "").encode("utf-8")
+
+
+def list_log_sessions(log_dir: Path = DEFAULT_LOG_DIR) -> list[Path]:
+    """Return newest LiVerse log sessions first."""
+    if not log_dir.is_dir():
+        return []
+    return sorted(
+        (
+            path
+            for path in log_dir.iterdir()
+            if path.is_dir() and any((path / name).is_file() for name in LOG_EXPORT_NAMES)
+        ),
+        key=lambda path: path.name,
+        reverse=True,
+    )
+
+
+def create_log_archive(
+    sessions: list[Path],
+    destination: Path,
+    *,
+    include_audio: bool = False,
+) -> int:
+    """Create a reviewable archive without settings, passwords, or HoLyrics token."""
+    names = (*LOG_EXPORT_NAMES, "audio.wav") if include_audio else LOG_EXPORT_NAMES
+    written = 0
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for session in sessions:
+            for name in names:
+                source = session / name
+                if source.is_file():
+                    archive_name = f"{session.name}/{name}"
+                    if name == "audio.wav":
+                        archive.write(source, arcname=archive_name)
+                    else:
+                        archive.writestr(archive_name, sanitized_log_bytes(source))
+                    written += 1
+    if written == 0:
+        try:
+            destination.unlink()
+        except FileNotFoundError:
+            pass
+        raise ValueError("В выбранных сеансах нет файлов журналов.")
+    return written
 
 
 def gui_log_path() -> Path:
+    if os.name == "nt":
+        return liverse_config_dir() / "logs" / "gui.log"
     cache_root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
     return cache_root / "liverse" / "gui.log"
+
+
+def engine_stop_path() -> Path:
+    return liverse_config_dir() / "engine.stop"
 
 
 def write_gui_log(message: str) -> None:
@@ -87,6 +194,23 @@ def write_gui_log(message: str) -> None:
             log_file.write(message.rstrip() + "\n")
     except OSError:
         pass
+
+
+def packaged_windows_runtime(
+    *, frozen: bool | None = None, platform: str | None = None
+) -> bool:
+    selected_frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
+    selected_platform = sys.platform if platform is None else platform
+    return selected_frozen and selected_platform.startswith("win")
+
+
+def check_gui_update(
+    *, frozen: bool | None = None, platform: str | None = None
+) -> dict:
+    """Select the source or packaged-Windows update channel."""
+    if packaged_windows_runtime(frozen=frozen, platform=platform):
+        return check_windows_release_update(__version__)
+    return check_startup_update()
 
 
 @dataclass
@@ -242,10 +366,19 @@ def engine_command(
     *,
     project_root: Path = PROJECT_ROOT,
     python_executable: str | None = None,
+    application_executable: Path | None = None,
+    frozen: bool | None = None,
 ) -> list[str]:
-    command = [
-        python_executable or sys.executable,
-        str(project_root / "tools" / "vosk_grammar_probe.py"),
+    selected_frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
+    if selected_frozen:
+        gui_executable = application_executable or Path(sys.executable)
+        command = [str(gui_executable.with_name("LiVerseEngine.exe"))]
+    else:
+        command = [
+            python_executable or sys.executable,
+            str(project_root / "tools" / "vosk_grammar_probe.py"),
+        ]
+    command.extend([
         "--slide-output",
         "holyrics",
         "--sermon-plan",
@@ -260,15 +393,17 @@ def engine_command(
         "--text-detection-db",
         str(config.text_detection_db),
         "--print-log-path",
-    ]
+        "--stop-file",
+        str(engine_stop_path()),
+    ])
     if config.run_mode == "semi_auto":
         command.append("--semi-auto-approval")
     elif config.run_mode == "approval":
         command.append("--require-approval")
     if config.audio_device_name:
         command.extend(("--device-name", config.audio_device_name))
-    if not config.open_operator_qr:
-        command.append("--no-open-operator-qr")
+    # The GUI owns the QR window so an external image viewer cannot enlarge it.
+    command.append("--no-open-operator-qr")
     return command
 
 
@@ -332,6 +467,15 @@ def tray_can_hide_window(
     return selected_platform == "win32" or selected_session != "wayland" or appindicator
 
 
+def tray_needs_own_event_loop(*, platform: str | None = None, backend: str = "") -> bool:
+    """Gtk tray backends need their own event loop beside Tkinter."""
+    selected_platform = (platform or sys.platform).casefold()
+    selected_backend = backend.casefold()
+    return selected_platform.startswith("linux") and selected_backend.endswith(
+        ("_appindicator", "_gtk")
+    )
+
+
 class LiVerseGui:
     def __init__(self, root: tk.Tk, instance_guard: SingleInstanceGuard | None = None):
         self.root = root
@@ -345,6 +489,11 @@ class LiVerseGui:
         self.stopping = False
         self.last_log_path = ""
         self._auto_hide_pending = False
+        self._quit_after_engine_stop = False
+        self._quit_restart = False
+        self.qr_window = None
+        self.qr_image = None
+        self.help_images = []
 
         self.state_var = tk.StringVar(value="Подготовка к запуску")
         self.microphone_status_var = tk.StringVar(value="ещё не проверен")
@@ -352,6 +501,7 @@ class LiVerseGui:
         self.database_status_var = tk.StringVar(value="ещё не проверена")
         self.activity_var = tk.StringVar(value="LiVerse запускается")
         self.run_button_var = tk.StringVar(value="Начать распознавание")
+        self.microphone_level_var = tk.DoubleVar(value=0.0)
 
         self.run_mode_var = tk.StringVar(value=RUN_MODE_LABELS[self.config.run_mode])
         self.approval_var = tk.StringVar(value=APPROVAL_LABELS[self.config.approval_ui])
@@ -362,6 +512,8 @@ class LiVerseGui:
         self.port_var = tk.StringVar(value=str(self.config.holyrics_port))
         self.auto_hide_var = tk.BooleanVar(value=self.config.auto_hide)
         self.open_qr_var = tk.BooleanVar(value=self.config.open_operator_qr)
+        self.include_audio_logs_var = tk.BooleanVar(value=False)
+        self.log_sessions: list[Path] = []
 
         self._configure_window()
         self._build_interface()
@@ -445,12 +597,18 @@ class LiVerseGui:
         self.status_tab = ttk.Frame(self.notebook, padding=14)
         self.settings_tab = ttk.Frame(self.notebook, padding=14)
         self.diagnostics_tab = ttk.Frame(self.notebook, padding=14)
+        self.logs_tab = ttk.Frame(self.notebook, padding=14)
+        self.help_tab = ttk.Frame(self.notebook, padding=14)
         self.notebook.add(self.status_tab, text="Состояние")
         self.notebook.add(self.settings_tab, text="Настройки")
         self.notebook.add(self.diagnostics_tab, text="Диагностика")
+        self.notebook.add(self.logs_tab, text="Журналы")
+        self.notebook.add(self.help_tab, text="Помощь")
         self._build_status_tab()
         self._build_settings_tab()
         self._build_diagnostics_tab()
+        self._build_logs_tab()
+        self._build_help_tab()
 
     def _build_status_tab(self) -> None:
         checks = ttk.LabelFrame(self.status_tab, text="Готовность", style="Card.TLabelframe")
@@ -470,6 +628,15 @@ class LiVerseGui:
         ttk.Label(activity, textvariable=self.activity_var, wraplength=640, justify="left").pack(
             anchor="w", fill="x", pady=8
         )
+        level_row = ttk.Frame(activity)
+        level_row.pack(fill="x", pady=(2, 8))
+        ttk.Label(level_row, text="Уровень микрофона", width=18).pack(side="left")
+        ttk.Progressbar(
+            level_row,
+            variable=self.microphone_level_var,
+            maximum=100,
+            mode="determinate",
+        ).pack(side="left", fill="x", expand=True)
 
         buttons = ttk.Frame(self.status_tab)
         buttons.pack(fill="x")
@@ -533,7 +700,7 @@ class LiVerseGui:
         row += 1
         ttk.Checkbutton(
             self.settings_tab,
-            text="Открывать QR-код для управления с телефона",
+            text="Показывать QR-код для подключения телефона",
             variable=self.open_qr_var,
         ).grid(row=row, column=0, columnspan=2, sticky="w", pady=6)
         row += 1
@@ -562,6 +729,192 @@ class LiVerseGui:
         scrollbar.pack(side="right", fill="y")
         bottom = ttk.Frame(self.diagnostics_tab)
         bottom.place(relx=0, rely=1, anchor="sw")
+
+    def _build_logs_tab(self) -> None:
+        ttk.Label(
+            self.logs_tab,
+            text="Журналы для диагностики",
+            font=("Segoe UI", 15, "bold"),
+        ).pack(anchor="w", pady=(0, 8))
+        ttk.Label(
+            self.logs_tab,
+            text=(
+                "Журналы помогают понять, что услышала программа и почему предложила ссылку. "
+                "Они могут содержать распознанные слова проповеди. Token HoLyrics и настройки "
+                "в архив не включаются. Выберите только те сеансы, которыми готовы поделиться."
+            ),
+            wraplength=660,
+            justify="left",
+        ).pack(anchor="w", fill="x", pady=(0, 10))
+
+        list_frame = ttk.Frame(self.logs_tab)
+        list_frame.pack(fill="both", expand=True)
+        self.logs_listbox = tk.Listbox(
+            list_frame,
+            selectmode="extended",
+            exportselection=False,
+            font=("Consolas", 9),
+        )
+        scrollbar = ttk.Scrollbar(list_frame, command=self.logs_listbox.yview)
+        self.logs_listbox.configure(yscrollcommand=scrollbar.set)
+        self.logs_listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        ttk.Checkbutton(
+            self.logs_tab,
+            text="Добавить аудиозапись (может быть большой и содержит речь)",
+            variable=self.include_audio_logs_var,
+        ).pack(anchor="w", pady=(10, 4))
+        ttk.Label(
+            self.logs_tab,
+            text=(
+                "Прямая отправка на сервер пока не настроена. Сначала создайте архив и "
+                "передайте его вручную. Для Google Drive потребуется отдельное безопасное подключение."
+            ),
+            foreground="#7A4D00",
+            wraplength=660,
+            justify="left",
+        ).pack(anchor="w", fill="x", pady=(0, 8))
+
+        actions = ttk.Frame(self.logs_tab)
+        actions.pack(fill="x")
+        ttk.Button(actions, text="Обновить список", command=self._refresh_log_sessions).pack(side="left")
+        ttk.Button(actions, text="Выбрать последний", command=self._select_latest_log).pack(
+            side="left", padx=8
+        )
+        ttk.Button(
+            actions,
+            text="Создать архив…",
+            command=self._export_selected_logs,
+            style="Primary.TButton",
+        ).pack(side="right")
+        self._refresh_log_sessions()
+
+    def _refresh_log_sessions(self) -> None:
+        self.log_sessions = list_log_sessions()
+        self.logs_listbox.delete(0, "end")
+        for session in self.log_sessions:
+            files = [name for name in (*LOG_EXPORT_NAMES, "audio.wav") if (session / name).is_file()]
+            self.logs_listbox.insert("end", f"{session.name}   ({', '.join(files)})")
+
+    def _select_latest_log(self) -> None:
+        self.logs_listbox.selection_clear(0, "end")
+        if self.log_sessions:
+            self.logs_listbox.selection_set(0)
+            self.logs_listbox.see(0)
+
+    def _export_selected_logs(self) -> None:
+        selected = [self.log_sessions[index] for index in self.logs_listbox.curselection()]
+        if not selected:
+            messagebox.showinfo("LiVerse", "Сначала выберите хотя бы один сеанс.")
+            return
+        suggested = f"LiVerse-logs-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
+        filename = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Сохранить журналы LiVerse",
+            defaultextension=".zip",
+            initialfile=suggested,
+            filetypes=[("ZIP-архив", "*.zip")],
+        )
+        if not filename:
+            return
+        try:
+            count = create_log_archive(
+                selected,
+                Path(filename),
+                include_audio=bool(self.include_audio_logs_var.get()),
+            )
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("LiVerse", f"Не удалось создать архив:\n{exc}")
+            return
+        messagebox.showinfo(
+            "LiVerse",
+            f"Архив создан:\n{filename}\n\nДобавлено файлов: {count}",
+        )
+
+    def _build_help_tab(self) -> None:
+        self.help_tab.rowconfigure(0, weight=1)
+        self.help_tab.columnconfigure(0, weight=1)
+        canvas = tk.Canvas(self.help_tab, highlightthickness=0)
+        vertical = ttk.Scrollbar(self.help_tab, orient="vertical", command=canvas.yview)
+        horizontal = ttk.Scrollbar(self.help_tab, orient="horizontal", command=canvas.xview)
+        canvas.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vertical.grid(row=0, column=1, sticky="ns")
+        horizontal.grid(row=1, column=0, sticky="ew")
+
+        content = ttk.Frame(canvas, padding=(2, 2, 12, 12))
+        canvas.create_window((0, 0), window=content, anchor="nw")
+        content.bind(
+            "<Configure>",
+            lambda _event: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+
+        ttk.Label(
+            content,
+            text="Первоначальная настройка LiVerse",
+            font=("Segoe UI", 15, "bold"),
+        ).pack(anchor="w", pady=(0, 10))
+        ttk.Label(
+            content,
+            text=(
+                "LiVerse настраивает и проверяет большую часть параметров автоматически. "
+                "Если что-то не работает, программа сообщает, что нужно проверить. "
+                "Первоначальную интеграцию с HoLyrics нужно выполнить вручную."
+            ),
+            wraplength=660,
+            justify="left",
+        ).pack(anchor="w", fill="x", pady=(0, 14))
+
+        steps = (
+            "1. Откройте HoLyrics.",
+            "2. Откройте Файл → Настройки → API Server.",
+            "3. Включите API Server Local и проверьте порт.",
+            "4. Создайте token, включите необходимые разрешения и скопируйте token.",
+            "5. Вставьте token и порт на вкладке «Настройки» LiVerse.",
+        )
+        for step in steps:
+            ttk.Label(content, text=step, wraplength=900, justify="left").pack(
+                anchor="w", fill="x", pady=3
+            )
+        ttk.Label(
+            content,
+            text="Не публикуйте token и не отправляйте его вместе с журналами.",
+            foreground="#A12622",
+            wraplength=660,
+            justify="left",
+        ).pack(anchor="w", fill="x", pady=(16, 10))
+        ttk.Button(
+            content,
+            text="Показать необходимые разрешения HoLyrics",
+            command=self.show_permissions,
+        ).pack(anchor="w", pady=(0, 18))
+
+        screenshots = (
+            ("holyrics-api-server.png", "1. Включите API Server Local и проверьте порт."),
+            ("holyrics-tokens.png", "2. Откройте управление разрешениями и выберите token."),
+            ("holyrics-permissions.png", "3. Включите нужные флажки в столбце Local."),
+        )
+        try:
+            from PIL import Image, ImageTk
+
+            for filename, caption in screenshots:
+                ttk.Label(content, text=caption, font=("Segoe UI", 11, "bold")).pack(
+                    anchor="w", pady=(8, 6)
+                )
+                image = Image.open(PROJECT_ROOT / "assets" / "help" / filename).convert("RGB")
+                if filename == "holyrics-permissions.png":
+                    image = image.crop((0, 145, image.width, image.height))
+                photo = ImageTk.PhotoImage(image)
+                self.help_images.append(photo)
+                tk.Label(content, image=photo, borderwidth=1, relief="solid").pack(anchor="w")
+        except (OSError, tk.TclError) as exc:
+            ttk.Label(
+                content,
+                text=f"Снимки справки недоступны: {exc}",
+                foreground="#A12622",
+                wraplength=660,
+            ).pack(anchor="w")
 
     def _refresh_state_badge(self, *_args) -> None:
         state = self.state_var.get().casefold()
@@ -672,6 +1025,12 @@ class LiVerseGui:
             return
 
         command = engine_command(self.config)
+        try:
+            engine_stop_path().unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            write_gui_log(f"Не удалось удалить старую команду остановки: {exc}")
         environment = os.environ.copy()
         environment["PYTHONUTF8"] = "1"
         kwargs: dict[str, object] = {}
@@ -719,12 +1078,18 @@ class LiVerseGui:
         self.stopping = True
         self.state_var.set("Останавливается")
         try:
-            if os.name == "nt":
-                process.terminate()
-            else:
-                os.killpg(process.pid, signal.SIGINT)
-        except (OSError, ProcessLookupError):
-            pass
+            path = engine_stop_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("restart" if restart else "stop", encoding="utf-8")
+        except OSError as exc:
+            write_gui_log(f"Не удалось запросить штатную остановку движка: {exc}")
+            try:
+                if os.name == "nt":
+                    process.terminate()
+                else:
+                    os.killpg(process.pid, signal.SIGINT)
+            except (OSError, ProcessLookupError):
+                pass
         if restart:
             self.root.after(900, self._restart_after_stop)
 
@@ -759,7 +1124,10 @@ class LiVerseGui:
                 elif event == "update_result":
                     self._handle_update_result(payload)
                 elif event == "update_installed":
-                    self._handle_update_installed(bool(payload))
+                    self._handle_update_installed(payload)
+                elif event == "update_progress":
+                    downloaded, total = payload
+                    self._handle_update_progress(int(downloaded), int(total))
                 elif event == "holyrics_result":
                     self._handle_holyrics_result(payload)
                 elif event == "show":
@@ -770,6 +1138,12 @@ class LiVerseGui:
 
     def _handle_engine_line(self, line: str) -> None:
         if not line:
+            return
+        if line.startswith("Аудиоуровень:"):
+            try:
+                self.microphone_level_var.set(float(line.partition(":")[2].strip()))
+            except ValueError:
+                pass
             return
         self._append_diagnostic(line)
         if line.startswith("Статус:"):
@@ -787,6 +1161,10 @@ class LiVerseGui:
                 self.root.after(1500, self.hide_window)
         elif line.startswith("Vosk log:"):
             self.last_log_path = line.partition(":")[2].strip()
+        elif line.startswith("Пульт подтверждения:"):
+            operator_url = line.partition(":")[2].strip()
+            if self.config.open_operator_qr and operator_url:
+                self._show_operator_qr(operator_url)
         elif "API Server доступен" in line:
             self.holyrics_status_var.set("подключён")
         elif "API Server сейчас недоступен" in line:
@@ -804,6 +1182,13 @@ class LiVerseGui:
     def _handle_engine_exit(self, code: int) -> None:
         expected = self.stopping
         self.process = None
+        self.microphone_level_var.set(0.0)
+        try:
+            engine_stop_path().unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
         self.run_button_var.set("Начать распознавание")
         if expected:
             self.state_var.set("Остановлен")
@@ -820,6 +1205,11 @@ class LiVerseGui:
                 self.tray_icon.update_menu()
             except Exception:
                 pass
+        if self._quit_after_engine_stop:
+            restart = self._quit_restart
+            self._quit_after_engine_stop = False
+            self._quit_restart = False
+            self.root.after(0, lambda: self._finalize_quit(restart=restart))
 
     def _append_diagnostic(self, line: str) -> None:
         self.diagnostics_text.configure(state="normal")
@@ -864,18 +1254,68 @@ class LiVerseGui:
             "включите в столбце Local:\n\n" + "\n".join(f"• {item}" for item in permissions),
         )
 
+    def _show_operator_qr(self, url: str) -> None:
+        if self.qr_window is not None and self.qr_window.winfo_exists():
+            self.qr_window.lift()
+            self.qr_window.focus_force()
+            return
+        try:
+            import qrcode
+            from PIL import ImageTk
+
+            qr = qrcode.QRCode(
+                version=None,
+                error_correction=qrcode.constants.ERROR_CORRECT_M,
+                box_size=8,
+                border=4,
+            )
+            qr.add_data(url)
+            qr.make(fit=True)
+            image = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+            self.qr_image = ImageTk.PhotoImage(image)
+        except Exception as exc:
+            write_gui_log(f"Не удалось создать QR-код: {exc}")
+            return
+
+        window = tk.Toplevel(self.root)
+        self.qr_window = window
+        window.title("LiVerse — подключение телефона")
+        window.resizable(False, False)
+        window.attributes("-topmost", True)
+        ttk.Label(window, image=self.qr_image).pack(padx=16, pady=(16, 8))
+        ttk.Label(
+            window,
+            text="Наведите камеру телефона на QR-код",
+            justify="center",
+        ).pack(padx=16, pady=(0, 8))
+        ttk.Button(window, text="Закрыть", command=window.destroy).pack(
+            fill="x", padx=16, pady=(0, 16)
+        )
+        window.protocol("WM_DELETE_WINDOW", window.destroy)
+        window.update_idletasks()
+        width = window.winfo_reqwidth()
+        height = window.winfo_reqheight()
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - width) // 2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - height) // 2)
+        window.geometry(f"{width}x{height}{x:+d}{y:+d}")
+        window.lift()
+
     def _begin_update_check(self) -> None:
         self.activity_var.set("Проверяю обновления…")
         threading.Thread(target=self._update_check_worker, daemon=True).start()
 
     def _update_check_worker(self) -> None:
-        self.output_queue.put(("update_result", check_startup_update()))
+        self.output_queue.put(("update_result", check_gui_update()))
 
     def _handle_update_result(self, payload: object) -> None:
         update = payload if isinstance(payload, dict) else {}
         if update.get("status") == "available":
-            local_label = str(update.get("local_label") or "установленная версия")
-            remote_label = str(update.get("remote_label") or "новая версия")
+            if update.get("kind") == "binary":
+                local_label = f"LiVerse {update.get('local_version')}"
+                remote_label = f"LiVerse {update.get('remote_version')}"
+            else:
+                local_label = str(update.get("local_label") or "установленная версия")
+                remote_label = str(update.get("remote_label") or "новая версия")
             install = messagebox.askyesno(
                 "Обновление LiVerse",
                 f"Доступно обновление.\n\nСейчас: {local_label}\nНа GitHub: {remote_label}\n\nУстановить сейчас?",
@@ -885,20 +1325,50 @@ class LiVerseGui:
                 self.activity_var.set("Устанавливаю обновление LiVerse…")
                 threading.Thread(target=self._install_update_worker, args=(update,), daemon=True).start()
                 return
+        elif update.get("status") not in {"current", "current_with_changes", "no_release"}:
+            write_gui_log(f"Проверка обновления пропущена: {update}")
         self._start_after_update_check()
 
     def _install_update_worker(self, update: dict) -> None:
+        if update.get("kind") == "binary":
+            try:
+                installer = download_windows_release_installer(
+                    update,
+                    progress=lambda downloaded, total: self.output_queue.put(
+                        ("update_progress", (downloaded, total))
+                    ),
+                )
+                launch_windows_release_installer(installer)
+                result = {"ok": True, "kind": "binary", "installer": str(installer)}
+            except (OSError, ReleaseUpdateError) as exc:
+                result = {"ok": False, "kind": "binary", "reason": str(exc)}
+            self.output_queue.put(("update_installed", result))
+            return
+        installed = apply_startup_update(update, hide_console=True)
         self.output_queue.put(
-            ("update_installed", apply_startup_update(update, hide_console=True))
+            ("update_installed", {"ok": installed, "kind": "source"})
         )
 
-    def _handle_update_installed(self, installed: bool) -> None:
-        if not installed:
+    def _handle_update_progress(self, downloaded: int, total: int) -> None:
+        if total > 0:
+            percent = min(100, max(0, round(downloaded * 100 / total)))
+            self.activity_var.set(f"Скачиваю обновление: {percent}%")
+
+    def _handle_update_installed(self, payload: object) -> None:
+        result = payload if isinstance(payload, dict) else {"ok": bool(payload)}
+        if not result.get("ok"):
+            reason = str(result.get("reason") or "неизвестная ошибка")
+            write_gui_log(f"Обновление не установлено: {reason}")
             messagebox.showerror(
                 "LiVerse",
-                "Обновление не завершилось. Установленная версия не повреждена. Подробности находятся в журнале обновления.",
+                "Обновление не завершилось. Установленная версия не повреждена.\n\n"
+                f"Причина: {reason}\n\nПодробности находятся в журнале LiVerse.",
             )
             self._start_after_update_check()
+            return
+        if result.get("kind") == "binary":
+            write_gui_log(f"Запущен проверенный установщик: {result.get('installer')}")
+            self.quit_application()
             return
         messagebox.showinfo("LiVerse", "Обновление установлено. LiVerse сейчас перезапустится.")
         self.quit_application(restart=True)
@@ -935,7 +1405,16 @@ class LiVerseGui:
                 pystray.MenuItem("Завершить LiVerse", lambda _icon, _item: self._tray_call(self.quit_application)),
             )
             self.tray_icon = pystray.Icon("liverse", image, "LiVerse", menu)
-            self.tray_icon.run_detached(setup=self._tray_ready)
+            if tray_needs_own_event_loop(backend=self.tray_backend):
+                def run_tray() -> None:
+                    try:
+                        self.tray_icon.run(setup=self._tray_ready)
+                    except Exception as exc:
+                        self.output_queue.put(("tray_error", str(exc)))
+
+                threading.Thread(target=run_tray, daemon=True).start()
+            else:
+                self.tray_icon.run_detached(setup=self._tray_ready)
         except Exception as exc:
             self.output_queue.put(("tray_error", str(exc)))
 
@@ -962,11 +1441,13 @@ class LiVerseGui:
     def quit_application(self, *, restart: bool = False) -> None:
         process = self.process
         if process is not None and process.poll() is None:
+            self._quit_after_engine_stop = True
+            self._quit_restart = restart
             self.stop_engine()
-            try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                process.kill()
+            return
+        self._finalize_quit(restart=restart)
+
+    def _finalize_quit(self, *, restart: bool = False) -> None:
         if self.tray_icon is not None:
             try:
                 self.tray_icon.stop()
@@ -976,11 +1457,73 @@ class LiVerseGui:
             self.instance_guard.close()
         self.root.destroy()
         if restart:
-            os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve())])
+            if getattr(sys, "frozen", False):
+                os.execv(sys.executable, [sys.executable])
+            else:
+                os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve())])
+
+
+def run_packaged_gui_smoke_test() -> int:
+    """Open the real Tk/tray backend briefly and verify the packaged engine link."""
+    instance_guard = SingleInstanceGuard(port=0)
+    if not instance_guard.acquire():
+        write_gui_log("Windows package smoke test failed: single-instance guard")
+        return 2
+
+    result = {"code": 3}
+    root = tk.Tk(className="LiVerse")
+    app = LiVerseGui(root, instance_guard)
+    root.withdraw()
+
+    def finish() -> None:
+        failures: list[str] = []
+        command = engine_command(app.config)
+        engine_path = Path(command[0])
+        if not engine_path.is_file():
+            failures.append(f"packaged engine is missing: {engine_path}")
+        else:
+            run_options: dict[str, object] = {}
+            if os.name == "nt":
+                run_options["creationflags"] = subprocess.CREATE_NO_WINDOW
+            try:
+                engine_check = subprocess.run(
+                    [str(engine_path), "--version"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=20,
+                    **run_options,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                failures.append(f"packaged engine did not start: {exc}")
+            else:
+                if engine_check.returncode != 0 or "LiVerse " not in engine_check.stdout:
+                    failures.append(
+                        f"packaged engine check failed with code {engine_check.returncode}"
+                    )
+        if not app.tray_available:
+            failures.append(f"tray backend did not start: {app.tray_backend or 'unknown'}")
+        if failures:
+            write_gui_log("Windows package smoke test failed: " + "; ".join(failures))
+        else:
+            result["code"] = 0
+            write_gui_log(
+                f"Windows package smoke test passed: engine={engine_path}; tray={app.tray_backend}"
+            )
+        app.quit_application()
+
+    root.after(5000, finish)
+    root.mainloop()
+    instance_guard.close()
+    return int(result["code"])
 
 
 def main() -> int:
     try:
+        if "--check-packaged-gui" in sys.argv[1:]:
+            return run_packaged_gui_smoke_test()
         instance_guard = SingleInstanceGuard()
         if not instance_guard.acquire():
             return 0

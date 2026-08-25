@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from urllib import request
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -35,6 +35,8 @@ REQUIRED_HOLYRICS_PERMISSIONS = (
     "GetBibleSettings",
     "GetCurrentPresentation",
     "GetCurrentQuickPresentation",
+    "ActionNext",
+    "ActionPrevious",
     "CloseCurrentQuickPresentation",
     "CloseCurrentPresentation",
     "SetBibleSettings",
@@ -118,6 +120,25 @@ HOLYRICS_BOOKS = (
 )
 HOLYRICS_BOOK_INDEX = {book: index for index, book in enumerate(HOLYRICS_BOOKS, start=1)}
 _TEMPORARY_VERSE_RESTORE_TIMER: threading.Timer | None = None
+
+
+def liverse_config_dir(
+    *,
+    platform: str | None = None,
+    environ: Mapping[str, str] | None = None,
+    home: Path | None = None,
+) -> Path:
+    """Return the per-user writable configuration directory."""
+    selected_platform = platform or os.name
+    variables = os.environ if environ is None else environ
+    selected_home = home or Path.home()
+    if selected_platform == "nt":
+        local_app_data = str(variables.get("LOCALAPPDATA") or "").strip()
+        base_dir = Path(local_app_data) if local_app_data else selected_home / "AppData" / "Local"
+        return base_dir / "LiVerse"
+    config_home = str(variables.get("XDG_CONFIG_HOME") or "").strip()
+    base_dir = Path(config_home).expanduser() if config_home else selected_home / ".config"
+    return base_dir / "liverse"
 _TEMPORARY_VERSE_RESTORE_LOCK = threading.Lock()
 _VERSE_LINE_RE = re.compile(r"(?m)^(\d+):(\d+)\.\s*(.+)$")
 
@@ -129,13 +150,36 @@ def parse_env_value(value: str) -> str:
     return value
 
 
-def env_file_paths() -> list[Path]:
-    explicit_path = os.environ.get("LIVE_VERSE_VOSK_ENV")
-    paths = [
-        Path(explicit_path).expanduser() if explicit_path else None,
-        Path.cwd() / ".env",
-        DEFAULT_ENV_PATH,
-    ]
+def env_file_paths(
+    *,
+    platform: str | None = None,
+    environ: Mapping[str, str] | None = None,
+    home: Path | None = None,
+    cwd: Path | None = None,
+) -> list[Path]:
+    selected_platform = platform or os.name
+    variables = os.environ if environ is None else environ
+    selected_home = home or Path.home()
+    explicit_path = str(variables.get("LIVE_VERSE_VOSK_ENV") or "").strip()
+    if selected_platform != "nt":
+        paths: list[Path | None] = [
+            Path(explicit_path).expanduser() if explicit_path else None,
+            (cwd or Path.cwd()) / ".env",
+            DEFAULT_ENV_PATH,
+        ]
+    else:
+        paths = [
+            DEFAULT_ENV_PATH,
+            selected_home / "LiVerse" / ".env",
+            (cwd or Path.cwd()) / ".env",
+            liverse_config_dir(
+                platform=selected_platform,
+                environ=variables,
+                home=selected_home,
+            )
+            / ".env",
+            Path(explicit_path).expanduser() if explicit_path else None,
+        ]
     result: list[Path] = []
     for path in paths:
         if path is not None and path not in result:
@@ -143,10 +187,23 @@ def env_file_paths() -> list[Path]:
     return result
 
 
-def env_write_path() -> Path:
-    explicit_path = os.environ.get("LIVE_VERSE_VOSK_ENV")
+def env_write_path(
+    *,
+    platform: str | None = None,
+    environ: Mapping[str, str] | None = None,
+    home: Path | None = None,
+) -> Path:
+    selected_platform = platform or os.name
+    variables = os.environ if environ is None else environ
+    explicit_path = str(variables.get("LIVE_VERSE_VOSK_ENV") or "").strip()
     if explicit_path:
         return Path(explicit_path).expanduser()
+    if selected_platform == "nt":
+        return liverse_config_dir(
+            platform=selected_platform,
+            environ=variables,
+            home=home,
+        ) / ".env"
     return DEFAULT_ENV_PATH
 
 
@@ -172,6 +229,21 @@ def save_holyrics_env(token: str, port: int, path: Path | None = None) -> Path:
     selected_path = path or env_write_path()
     if selected_path.exists():
         lines = selected_path.read_text(encoding="utf-8").splitlines()
+    elif path is None and os.name == "nt" and not os.environ.get("LIVE_VERSE_VOSK_ENV"):
+        legacy_path = next(
+            (
+                candidate
+                for candidate in reversed(env_file_paths())
+                if candidate != selected_path and candidate.exists()
+            ),
+            None,
+        )
+        if legacy_path:
+            lines = legacy_path.read_text(encoding="utf-8").splitlines()
+        elif DEFAULT_ENV_EXAMPLE_PATH.exists():
+            lines = DEFAULT_ENV_EXAMPLE_PATH.read_text(encoding="utf-8").splitlines()
+        else:
+            lines = []
     elif DEFAULT_ENV_EXAMPLE_PATH.exists():
         lines = DEFAULT_ENV_EXAMPLE_PATH.read_text(encoding="utf-8").splitlines()
     else:
@@ -1423,6 +1495,29 @@ def post_holyrics_update(args: Any, payload: dict) -> tuple[bool, str]:
             if auto_target:
                 setattr(args, "holyrics_url", url)
             return True, reason
+        if not auto_target and (reason.startswith("holyrics_token_") or reason.startswith("holyrics_error:")):
+            return False, reason
+        reasons.append(f"{url}={reason}")
+    return False, ";".join(reasons) or "holyrics_unavailable"
+
+
+def control_holyrics_presentation(args: Any, action: str) -> tuple[bool, str]:
+    """Move the currently displayed regular presentation by one slide."""
+    endpoints = {"next": "ActionNext", "previous": "ActionPrevious"}
+    endpoint = endpoints.get(action)
+    if endpoint is None:
+        return False, "unknown_presentation_action"
+    if not getattr(args, "holyrics_token", ""):
+        return False, "holyrics_token_missing"
+
+    auto_target = str(getattr(args, "holyrics_url", "auto")).strip().lower() == "auto"
+    reasons: list[str] = []
+    for url in holyrics_candidate_urls(getattr(args, "holyrics_url", "auto")):
+        ok, reason, _body = post_holyrics_api(args, url, endpoint, {})
+        if ok:
+            if auto_target:
+                setattr(args, "holyrics_url", url)
+            return True, ""
         if not auto_target and (reason.startswith("holyrics_token_") or reason.startswith("holyrics_error:")):
             return False, reason
         reasons.append(f"{url}={reason}")

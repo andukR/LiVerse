@@ -4,6 +4,25 @@ body { margin: 0; min-height: 100vh; background: #0c1117; color: #f3f6f9; }
 main { width: min(100%, 720px); margin: 0 auto; padding: 18px; }
 header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
 header img { width: 72px; height: 72px; padding: 5px; background: white; border-radius: 8px; }
+.header-actions { display: flex; align-items: center; gap: 10px; }
+.screen-mode-button { min-height: 44px; padding: 8px 12px; background: #315e9b; font-size: 15px; }
+.screen-mode-status { max-width: 420px; margin-top: 3px; color: #91a0af; font-size: 12px; }
+.mode-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
+.mode-tabs button { min-height: 46px; background: #203040; color: #c8d2dc; font-size: 17px; }
+.mode-tabs button.active { background: #d9a83d; color: #101720; }
+.song-control { display: none; text-align: center; }
+body.song-mode .song-control { display: block; }
+body.song-mode #pipeline,
+body.song-mode #waiting,
+body.song-mode #candidate,
+body.song-mode #manualCard { display: none !important; }
+.song-control h1 { margin-bottom: 8px; }
+.song-control p { color: #c8d2dc; }
+.song-actions { display: grid; grid-template-columns: 1fr 2fr; gap: 12px; margin-top: 28px; }
+.song-actions button { min-height: 112px; padding: 16px; font-size: 24px; }
+.song-previous { background: #315e9b; }
+.song-next { background: #148447; }
+.song-control-status { min-height: 24px; margin-top: 16px; color: #c8d2dc; }
 .brand { font-size: 28px; font-weight: 800; color: #f1c66d; }
 #connection { color: #91a0af; margin-top: 4px; }
 .card { background: #171f29; border: 1px solid #2b3847; border-radius: 18px; padding: 22px; box-shadow: 0 14px 40px #0005; margin-bottom: 18px; }
@@ -87,6 +106,15 @@ button:disabled { opacity: .5; }
   }
   header { flex: 0 0 auto; margin-bottom: 8px; }
   header img { display: none; }
+  .header-actions { margin-left: 8px; }
+  .screen-mode-button { min-height: 34px; padding: 5px 9px; font-size: 12px; }
+  .screen-mode-status { max-width: 230px; font-size: 10px; }
+  .mode-tabs { flex: 0 0 auto; gap: 5px; margin-bottom: 6px; }
+  .mode-tabs button { min-height: 34px; font-size: 14px; }
+  .song-control { flex: 1 1 auto; }
+  .song-actions { grid-template-columns: 1fr; gap: 10px; margin-top: 18px; }
+  .song-actions button { min-height: 72px; font-size: 20px; }
+  .song-actions .song-next { min-height: 150px; font-size: 25px; }
   .brand { font-size: 21px; }
   #connection { margin-top: 1px; font-size: 13px; }
   .card { margin-bottom: 8px; padding: 10px; border-radius: 10px; box-shadow: none; }
@@ -175,15 +203,20 @@ button:disabled { opacity: .5; }
     height: 100vh;
     display: grid;
     grid-template-columns: 320px minmax(0, 1fr);
-    grid-template-rows: auto auto minmax(0, 1fr);
+    grid-template-rows: auto auto auto minmax(0, 1fr);
     gap: 12px;
     padding: 12px;
   }
   header,
+  #modeTabs,
   #pipeline,
   #waiting,
   #candidate { grid-column: 1; margin-bottom: 0; }
-  header { margin-bottom: 0; padding: 4px 0; }
+  header { grid-row: 1; margin-bottom: 0; padding: 4px 0; }
+  #modeTabs { grid-row: 2; }
+  #pipeline { grid-row: 3; }
+  #waiting,
+  #candidate { grid-row: 4; }
   header img { width: 86px; height: 86px; }
   .brand { font-size: 24px; }
   .card { border-radius: 10px; padding: 14px; margin-bottom: 0; box-shadow: none; }
@@ -223,6 +256,11 @@ button:disabled { opacity: .5; }
     flex-direction: column;
     overflow: hidden;
   }
+  body.song-mode main { grid-template-columns: minmax(0, 1fr); }
+  body.song-mode header,
+  body.song-mode #modeTabs,
+  body.song-mode #songControl { grid-column: 1; }
+  body.song-mode #songControl { grid-row: 3 / -1; }
   .manual label { margin: 8px 0 5px; }
   .manual input { min-height: 44px; font-size: 18px; }
   .suggestions { margin-top: 6px; }

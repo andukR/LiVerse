@@ -6,12 +6,14 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import math
 import os
 import queue
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import webbrowser
 import wave
@@ -21,7 +23,20 @@ from pathlib import Path
 from urllib.parse import quote
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_POPUP_APPROVAL_LOCK = threading.Lock()
+_POPUP_APPROVAL_REVISION = 0
+
+
+class GracefulStopRequested(Exception):
+    def __init__(self, action: str):
+        super().__init__(action)
+        self.action = action
+
+
+if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+    PROJECT_ROOT = Path(sys._MEIPASS)
+else:
+    PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 CORE_SRC = PROJECT_ROOT / "packages" / "bible_parser_core" / "src"
@@ -60,12 +75,14 @@ from tools.holyrics import (
     REQUIRED_HOLYRICS_PERMISSIONS,
     THEME_HOLYRICS_PERMISSIONS,
     check_holyrics_api_server,
+    control_holyrics_presentation,
     default_holyrics_url,
     describe_holyrics_target,
     env_setting,
     get_holyrics_current_presentation,
     get_holyrics_theme_options,
     handle_scripture_range_reading_match,
+    liverse_config_dir,
     show_holyrics_text_slide,
     scripture_range,
     scripture_range_reading_active,
@@ -84,7 +101,11 @@ DEFAULT_SHERPA_MODEL_PATH = (
     / "models"
     / "vosk-model-small-streaming-ru-0.54"
 )
-DEFAULT_LOG_DIR = Path.cwd() / ".cache" / "liverse" / "vosk_probe"
+DEFAULT_LOG_DIR = (
+    liverse_config_dir() / "logs" / "vosk_probe"
+    if os.name == "nt"
+    else Path.cwd() / ".cache" / "liverse" / "vosk_probe"
+)
 DEFAULT_TEXT_DETECTION_DB = PROJECT_ROOT / "bible_index" / "bible_index.db"
 STARTUP_SETTINGS_ENV = "LIVERSE_STARTUP_SETTINGS"
 UPDATE_REPO_URL = "https://github.com/andukR/LiVerse.git"
@@ -166,25 +187,53 @@ def parse_window_sizes(value: str) -> tuple[int, ...]:
     return sizes
 
 
-def startup_settings_path() -> Path:
-    explicit_path = os.environ.get(STARTUP_SETTINGS_ENV)
+def startup_settings_path(
+    *,
+    platform: str | None = None,
+    environ: dict[str, str] | None = None,
+    home: Path | None = None,
+) -> Path:
+    variables = os.environ if environ is None else environ
+    explicit_path = variables.get(STARTUP_SETTINGS_ENV)
     if explicit_path:
         return Path(explicit_path).expanduser()
-    config_home = os.environ.get("XDG_CONFIG_HOME")
-    base_dir = Path(config_home).expanduser() if config_home else Path.home() / ".config"
-    return base_dir / "liverse" / "settings.json"
+    return liverse_config_dir(
+        platform=platform,
+        environ=variables,
+        home=home,
+    ) / "settings.json"
 
 
-def load_startup_settings(path: Path | None = None) -> dict:
-    selected_path = path or startup_settings_path()
-    try:
-        data = json.loads(selected_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {}
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"LiVerse: не удалось прочитать настройки запуска {selected_path}: {exc}", flush=True)
-        return {}
-    return data if isinstance(data, dict) else {}
+def load_startup_settings(
+    path: Path | None = None,
+    *,
+    platform: str | None = None,
+    environ: dict[str, str] | None = None,
+    home: Path | None = None,
+) -> dict:
+    selected_platform = platform or os.name
+    selected_home = home or Path.home()
+    paths = [
+        path
+        or startup_settings_path(
+            platform=selected_platform,
+            environ=environ,
+            home=selected_home,
+        )
+    ]
+    legacy_path = selected_home / ".config" / "liverse" / "settings.json"
+    if path is None and selected_platform == "nt" and legacy_path not in paths:
+        paths.append(legacy_path)
+    for selected_path in paths:
+        try:
+            data = json.loads(selected_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"LiVerse: не удалось прочитать настройки запуска {selected_path}: {exc}", flush=True)
+            return {}
+        return data if isinstance(data, dict) else {}
+    return {}
 
 
 def save_startup_settings(args: argparse.Namespace) -> None:
@@ -812,6 +861,13 @@ def center_tk_window(root, width: int, height: int) -> None:
     root.geometry(f"{width}x{height}{x:+d}{y:+d}")
 
 
+def session_summary_dimensions(screen_width: int, screen_height: int) -> tuple[int, int]:
+    return (
+        min(760, max(500, screen_width - 80)),
+        min(560, max(400, screen_height - 80)),
+    )
+
+
 def show_session_summary_popup(records: list[dict]) -> None:
     try:
         import tkinter as tk
@@ -832,12 +888,16 @@ def show_session_summary_popup(records: list[dict]) -> None:
     root.configure(bg="#101820")
     root.resizable(True, True)
 
-    width, height = 760, 560
+    _screen_x, _screen_y, screen_width, screen_height = tk_monitor_bounds(root)
+    width, height = session_summary_dimensions(screen_width, screen_height)
     center_tk_window(root, width, height)
+    root.minsize(min(500, width), min(400, height))
+    root.grid_columnconfigure(0, weight=1)
+    root.grid_rowconfigure(1, weight=1)
 
-    title_font = tkfont.Font(family="Segoe UI", size=28, weight="bold")
-    body_font = tkfont.Font(family="Segoe UI", size=18)
-    button_font = tkfont.Font(family="Segoe UI", size=18, weight="bold")
+    title_font = tkfont.Font(family="Segoe UI", size=24, weight="bold")
+    body_font = tkfont.Font(family="Segoe UI", size=16)
+    button_font = tkfont.Font(family="Segoe UI", size=14, weight="bold")
 
     tk.Label(
         root,
@@ -845,10 +905,14 @@ def show_session_summary_popup(records: list[dict]) -> None:
         bg="#101820",
         fg="#ffd166",
         font=title_font,
-    ).pack(fill="x", padx=28, pady=(24, 10))
+    ).grid(row=0, column=0, sticky="ew", padx=24, pady=(18, 8))
 
+    body_frame = tk.Frame(root, bg="#101820")
+    body_frame.grid(row=1, column=0, sticky="nsew", padx=24, pady=(0, 12))
+    body_frame.grid_columnconfigure(0, weight=1)
+    body_frame.grid_rowconfigure(0, weight=1)
     body = tk.Text(
-        root,
+        body_frame,
         bg="#0f1720",
         fg="#f5f7fa",
         insertbackground="#f5f7fa",
@@ -857,14 +921,19 @@ def show_session_summary_popup(records: list[dict]) -> None:
         wrap="word",
         padx=16,
         pady=16,
-        height=12,
+        height=8,
     )
-    body.pack(fill="both", expand=True, padx=28, pady=(0, 18))
+    scrollbar = tk.Scrollbar(body_frame, command=body.yview)
+    body.configure(yscrollcommand=scrollbar.set)
+    body.grid(row=0, column=0, sticky="nsew")
+    scrollbar.grid(row=0, column=1, sticky="ns")
     body.insert("1.0", text or "За этот сеанс ссылки не были распознаны.")
     body.configure(state="disabled")
 
     buttons = tk.Frame(root, bg="#101820")
-    buttons.pack(fill="x", padx=28, pady=(0, 24))
+    buttons.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 18))
+    buttons.grid_columnconfigure(0, weight=1, uniform="summary-buttons")
+    buttons.grid_columnconfigure(1, weight=1, uniform="summary-buttons")
 
     def share_whatsapp() -> None:
         if whatsapp_url:
@@ -881,8 +950,9 @@ def show_session_summary_popup(records: list[dict]) -> None:
         disabledforeground="#9aa4ad",
         font=button_font,
         relief="flat",
-        padx=20,
-        pady=14,
+        padx=10,
+        pady=10,
+        wraplength=max(180, (width - 80) // 2),
         state="normal" if whatsapp_url else "disabled",
     )
     close = tk.Button(
@@ -895,11 +965,11 @@ def show_session_summary_popup(records: list[dict]) -> None:
         activeforeground="white",
         font=button_font,
         relief="flat",
-        padx=20,
-        pady=14,
+        padx=10,
+        pady=10,
     )
-    share.pack(side="left", fill="x", expand=True, padx=(0, 10))
-    close.pack(side="left", fill="x", expand=True, padx=(10, 0))
+    share.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+    close.grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
     root.bind("<Escape>", lambda _event: root.destroy())
     root.after(100, root.focus_force)
@@ -1238,8 +1308,6 @@ def apply_saved_startup_settings(args: argparse.Namespace, settings: dict) -> No
         detection_mode = str(settings.get("citation_detection_mode") or "").strip()
         if detection_mode in {"address_only", "text_only", "hybrid_auto", "hybrid_confirm"}:
             args.citation_detection_mode = detection_mode
-    if not setting_was_explicit("--open-operator-qr", "--no-open-operator-qr"):
-        args.open_operator_qr = bool(settings.get("open_operator_qr", True))
     if not setting_was_explicit("--holyrics-theme", env_name="HOLYRICS_THEME"):
         args.holyrics_theme = str(settings.get("holyrics_theme") or "")
         setattr(args, "_holyrics_theme_id", "")
@@ -1425,6 +1493,31 @@ def text_citation_output_args(args: argparse.Namespace) -> argparse.Namespace:
     return output_args
 
 
+def popup_approval_revision() -> int:
+    with _POPUP_APPROVAL_LOCK:
+        return _POPUP_APPROVAL_REVISION
+
+
+def cancel_pending_popup_approval() -> None:
+    """Tell an already visible local popup that a phone action superseded it."""
+    global _POPUP_APPROVAL_REVISION
+    with _POPUP_APPROVAL_LOCK:
+        _POPUP_APPROVAL_REVISION += 1
+
+
+def clear_stale_approvals_after_range_action(action: dict | None) -> bool:
+    """Drop proposals for a verse consumed as a long-passage boundary."""
+    if not isinstance(action, dict) or not (
+        action.get("advanced") or action.get("completed")
+    ):
+        return False
+    cancel_pending_popup_approval()
+    from tools.slide_server import discard_pending_candidate
+
+    discard_pending_candidate("long_passage_boundary_consumed")
+    return True
+
+
 def text_decision_ready_for_scripture_range(
     decision: TextCitationDecision | None,
 ) -> bool:
@@ -1439,6 +1532,25 @@ def text_decision_ready_for_scripture_range(
 def address_recognition_allowed(address_detection_enabled: bool, long_passage_reading: bool) -> bool:
     """Keep address parsing off while the already selected passage is being read."""
     return bool(address_detection_enabled and not long_passage_reading)
+
+
+def audio_level_percent(peak: int) -> int:
+    """Map a 16-bit audio peak to a useful zero-to-100 microphone indicator."""
+    if peak <= 0:
+        return 0
+    decibels = 20.0 * math.log10(min(32767, peak) / 32767.0)
+    return max(0, min(100, round((decibels + 60.0) * 100.0 / 60.0)))
+
+
+def consume_stop_request(path: Path | None) -> str:
+    if path is None or not path.is_file():
+        return ""
+    try:
+        action = path.read_text(encoding="utf-8").strip().casefold() or "stop"
+        path.unlink()
+    except OSError:
+        return ""
+    return action if action in {"stop", "restart"} else "stop"
 
 
 def parsed_payload_from_candidates(
@@ -1514,6 +1626,7 @@ def popup_approval_decision(slide: dict) -> str:
         raise RuntimeError(f"popup_unavailable:{exc}") from exc
 
     decision = {"action": "skip"}
+    approval_revision = popup_approval_revision()
     root = tk.Tk()
     root.title("LiVerse")
     root.attributes("-topmost", True)
@@ -1568,6 +1681,13 @@ def popup_approval_decision(slide: dict) -> str:
     def close(action: str) -> None:
         decision["action"] = action
         root.destroy()
+
+    def close_if_superseded() -> None:
+        if popup_approval_revision() != approval_revision:
+            close("skip")
+            return
+        if root.winfo_exists():
+            root.after(100, close_if_superseded)
 
     approve = tk.Button(
         buttons,
@@ -1673,6 +1793,7 @@ def popup_approval_decision(slide: dict) -> str:
         )
     root.bind("<Escape>", lambda _event: close("skip"))
     root.protocol("WM_DELETE_WINDOW", lambda: close("skip"))
+    root.after(100, close_if_superseded)
     root.after(100, root.focus_force)
     root.after(150, root.lift)
     root.mainloop()
@@ -1927,14 +2048,19 @@ def start_slide_server_if_needed(args: argparse.Namespace, pipeline: LiveReferen
             set_current_slide(candidate)
         if pipeline is not None and action_selects_context(action, candidate):
             pipeline.set_context_range(candidate)
+        cancel_pending_popup_approval()
         return True, ""
+
+    def presentation_action_callback(action: str) -> tuple[bool, str]:
+        return control_holyrics_presentation(args, action)
 
     return start_server_thread(
         args.slide_host,
         args.slide_port,
         decision_callback=decision_callback if web_approval else None,
-        open_qr=args.open_operator_qr and web_approval,
-        open_browser=args.open_operator_browser,
+        presentation_action_callback=presentation_action_callback,
+        open_qr=bool(args.open_operator_qr),
+        open_browser=False,
         print_qr=args.print_operator_qr,
     )
 
@@ -2216,6 +2342,7 @@ def run_microphone(args: argparse.Namespace) -> int:
         try:
             samples = memoryview(data).cast("h")
             peak = max((abs(sample) for sample in samples), default=0)
+            audio_stats["current_peak"] = peak
             if peak > audio_stats["peak"]:
                 audio_stats["peak"] = peak
             audio_stats["chunks"] += 1
@@ -2256,7 +2383,7 @@ def run_microphone(args: argparse.Namespace) -> int:
             print(f"LiVerse: не удалось включить поиск цитат по тексту: {exc}", file=sys.stderr)
             return 2
     start_slide_server_if_needed(args, pipeline=pipeline)
-    audio_stats = {"chunks": 0, "peak": 0}
+    audio_stats = {"chunks": 0, "peak": 0, "current_peak": 0}
     empty_final_count = 0
     trigger_case_count = 0
 
@@ -2436,11 +2563,22 @@ def run_microphone(args: argparse.Namespace) -> int:
 
         try:
             with stream:
+                last_audio_level_at = 0.0
                 while True:
                     data = audio_queue.get()
+                    stop_action = consume_stop_request(args.stop_file)
+                    if stop_action:
+                        raise GracefulStopRequested(stop_action)
                     if audio_log:
                         audio_log.writeframes(data)
                     audio_bytes_seen += len(data)
+                    now = time.monotonic()
+                    if now - last_audio_level_at >= 0.25:
+                        print(
+                            f"Аудиоуровень: {audio_level_percent(int(audio_stats.get('current_peak') or 0))}",
+                            flush=True,
+                        )
+                        last_audio_level_at = now
                     if recognizer.AcceptWaveform(data):
                         result = json.loads(recognizer.Result())
                         text = result.get("text", "").strip()
@@ -2452,6 +2590,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                             {"result": result, "text": text, "audio": final_audio_stats},
                         )
                         if text:
+                            print(f"Распознано: {text}", flush=True)
                             empty_final_count = 0
                             console.status("распознаю")
                             recognition_time = time.monotonic()
@@ -2597,6 +2736,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                                         "window": text_decision.window_text,
                                     },
                                 )
+                                clear_stale_approvals_after_range_action(range_reading_action)
                                 if range_reading_action.get("advanced"):
                                     text_detector.clear()
                                     console.status(
@@ -2743,6 +2883,11 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 logger.write("partial", {"result": partial_result, "partial": partial})
                             if args.debug_console:
                                 print("...", partial, flush=True)
+        except GracefulStopRequested as request:
+            print("\nОстановлено.", flush=True)
+            if args.session_summary_popup and request.action != "restart":
+                show_session_summary_popup(session_refs)
+            return 0
         except KeyboardInterrupt:
             print("\nОстановлено.", flush=True)
             if args.session_summary_popup:
@@ -2780,6 +2925,11 @@ def main() -> int:
         ),
     )
     parser.add_argument("--list-audio-devices", action="store_true", help="Print microphone/input device list and exit.")
+    parser.add_argument(
+        "--check-runtime-assets",
+        action="store_true",
+        help="Open the Bible text index and load the Sherpa model, then exit.",
+    )
     parser.add_argument("--open-vocabulary", action="store_true", help="Run Vosk without generated grammar.")
     parser.add_argument(
         "--sermon-plan",
@@ -2839,6 +2989,11 @@ def main() -> int:
     )
     parser.add_argument("--text", nargs="+", help="Resolve text without opening the microphone.")
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR)
+    parser.add_argument(
+        "--stop-file",
+        type=Path,
+        help="Exit cleanly when this local control file appears.",
+    )
     parser.add_argument("--no-log", action="store_true", help="Disable JSONL logging.")
     parser.add_argument("--log-partials", action="store_true", help="Log Vosk partial results too.")
     parser.add_argument(
@@ -2910,8 +3065,8 @@ def main() -> int:
         "--open-operator-qr",
         dest="open_operator_qr",
         action="store_true",
-        default=True,
-        help="Open generated operator QR PNG. Enabled by default.",
+        default=False,
+        help="Open generated operator QR PNG in an external viewer (legacy console mode only).",
     )
     parser.add_argument(
         "--no-open-operator-qr",
@@ -2920,7 +3075,6 @@ def main() -> int:
         help="Do not open the generated operator QR PNG.",
     )
     parser.add_argument("--print-operator-qr", action="store_true", help="Print QR as ASCII in the console.")
-    parser.add_argument("--open-operator-browser", action="store_true", help="Open operator UI on this computer.")
     parser.add_argument(
         "--no-session-summary-popup",
         dest="session_summary_popup",
@@ -2953,6 +3107,22 @@ def main() -> int:
     args = parser.parse_args()
     if args.list_audio_devices:
         return list_audio_devices()
+    if args.check_runtime_assets:
+        try:
+            with BibleTextSearcher(args.text_detection_db) as searcher:
+                _lemmas, results = searcher.search("ибо так возлюбил бог мир", limit=1)
+                if not results or results[0].reference != "Ин. 3:16":
+                    raise RuntimeError("контрольный поиск не нашёл Ин. 3:16")
+            load_sherpa_recognizer(
+                args.sherpa_model,
+                sample_rate=args.samplerate,
+                num_threads=args.sherpa_threads,
+            )
+        except Exception as exc:
+            print(f"LiVerse runtime assets check failed: {exc}", file=sys.stderr, flush=True)
+            return 2
+        print("LiVerse runtime assets check passed: Ин. 3:16, bible_index.db, Sherpa 0.54.", flush=True)
+        return 0
     if args.print_grammar_json:
         grammar_json = json.dumps(build_grammar(), ensure_ascii=False)
         if args.grammar_output:

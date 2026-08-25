@@ -25,11 +25,16 @@ if str(CORE_SRC) not in sys.path:
     sys.path.insert(0, str(CORE_SRC))
 
 from bible_parser_core.version import __version__
+from tools.holyrics import liverse_config_dir
 
 SLIDE_DIR = PROJECT_ROOT / "slide_display"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
-DEFAULT_QR_PATH = Path(".cache") / "liverse" / "operator_qr.png"
+DEFAULT_QR_PATH = (
+    liverse_config_dir() / "cache" / "operator_qr.png"
+    if os.name == "nt"
+    else Path(".cache") / "liverse" / "operator_qr.png"
+)
 
 CURRENT_SLIDE = {
     "ref": "Иоанна 20:24-29",
@@ -42,6 +47,7 @@ STATE_LOCK = threading.Lock()
 PENDING_CANDIDATE: dict = {}
 SESSION_QUOTES: list[dict] = []
 DECISION_CALLBACK = None
+PRESENTATION_ACTION_CALLBACK = None
 PROCESSING_STATE = {
     "stage": "listening",
     "message": "LiVerse слушает речь",
@@ -83,8 +89,8 @@ def operator_state() -> dict:
     }
 
 
-def reset_operator_state(decision_callback=None) -> None:
-    global DECISION_CALLBACK
+def reset_operator_state(decision_callback=None, presentation_action_callback=None) -> None:
+    global DECISION_CALLBACK, PRESENTATION_ACTION_CALLBACK
     with STATE_LOCK:
         PENDING_CANDIDATE.clear()
         SESSION_QUOTES.clear()
@@ -98,6 +104,22 @@ def reset_operator_state(decision_callback=None) -> None:
             }
         )
     DECISION_CALLBACK = decision_callback
+    PRESENTATION_ACTION_CALLBACK = presentation_action_callback
+
+
+def run_presentation_action(action: str) -> tuple[bool, str]:
+    if action not in {"next", "previous"}:
+        return False, "unknown_presentation_action"
+    callback = PRESENTATION_ACTION_CALLBACK
+    if callback is None:
+        return False, "presentation_control_unavailable"
+    try:
+        result = callback(action)
+    except Exception as exc:
+        return False, f"presentation_control_error:{exc}"
+    if isinstance(result, tuple):
+        return bool(result[0]), str(result[1] or "")
+    return (True, "") if result is not False else (False, "presentation_control_failed")
 
 
 def session_share_text(quotes: list[dict]) -> str:
@@ -199,6 +221,26 @@ def submit_candidate(payload: dict) -> dict:
     state = operator_state()
     broadcast_operator(state)
     return candidate
+
+
+def discard_pending_candidate(reason: str = "superseded") -> bool:
+    """Remove a proposal that became obsolete after another successful action."""
+    with STATE_LOCK:
+        if not PENDING_CANDIDATE:
+            return False
+        PENDING_CANDIDATE.clear()
+        PROCESSING_STATE.update(
+            {
+                "stage": "listening",
+                "message": "Предыдущее предложение больше не актуально",
+                "progress": 0,
+                "chunk": None,
+                "manual_required": False,
+                "reason": reason,
+            }
+        )
+    broadcast_operator(operator_state())
+    return True
 
 
 def set_current_slide(payload: dict) -> dict:
@@ -447,6 +489,11 @@ class SlideHandler(BaseHTTPRequestHandler):
         self.serve_static()
 
     def do_POST(self) -> None:
+        if self.path in {"/api/presentation-next", "/api/presentation-previous"}:
+            action = self.path.rsplit("-", 1)[-1]
+            ok, reason = run_presentation_action(action)
+            self.send_json({"ok": ok, "reason": reason}, status=200 if ok else 409)
+            return
         if self.path in {"/api/approve", "/api/approve-context", "/api/reject"}:
             action = "approve_context" if self.path == "/api/approve-context" else self.path.rsplit("/", 1)[-1]
             ok, reason, candidate = decide_candidate(action)
@@ -572,6 +619,7 @@ class SlideHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
 
@@ -601,16 +649,17 @@ def start_server_thread(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     decision_callback=None,
+    presentation_action_callback=None,
     open_qr: bool = False,
     open_browser: bool = False,
     print_qr: bool = False,
 ) -> ThreadingHTTPServer:
-    reset_operator_state(decision_callback)
+    reset_operator_state(decision_callback, presentation_action_callback)
     server = ThreadingHTTPServer((host, port), SlideHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     print(f"Slide display: http://{host}:{port}", flush=True)
-    if decision_callback is not None:
+    if decision_callback is not None or presentation_action_callback is not None:
         url = operator_url(port)
         desktop_url = f"http://127.0.0.1:{port}/operator"
         qr_path = save_operator_qr_png(url)

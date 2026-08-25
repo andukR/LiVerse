@@ -1,4 +1,6 @@
 import unittest
+import tempfile
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -26,7 +28,7 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertGreaterEqual(
             suite.countTestCases(),
-            218,
+            253,
             "Набор регрессионных тестов уменьшился; проверьте, какие проверки были удалены.",
         )
 
@@ -57,8 +59,134 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertIn("--no-open-operator-qr", command)
         self.assertNotIn("secret-token", command)
 
+    def test_packaged_gui_engine_command_uses_sibling_executable(self):
+        from tools.liverse_gui import GuiConfig, engine_command
+
+        gui_executable = Path("C:/LiVerse/LiVerse.exe")
+        database_path = Path("C:/LiVerse/_internal/bible_index/bible_index.db")
+        command = engine_command(
+            GuiConfig(text_detection_db=database_path),
+            project_root=Path("C:/LiVerse/_internal"),
+            python_executable="pythonw.exe",
+            application_executable=gui_executable,
+            frozen=True,
+        )
+
+        self.assertEqual(str(gui_executable.with_name("LiVerseEngine.exe")), command[0])
+        self.assertNotIn("pythonw.exe", command)
+        self.assertNotIn("vosk_grammar_probe.py", " ".join(command))
+        self.assertIn(str(database_path), command)
+        self.assertIn("--stop-file", command)
+        self.assertIn("--no-open-operator-qr", command)
+
+    def test_microphone_indicator_uses_decibel_scale(self):
+        from tools.vosk_grammar_probe import audio_level_percent
+
+        self.assertEqual(0, audio_level_percent(0))
+        self.assertLess(audio_level_percent(300), audio_level_percent(3000))
+        self.assertLess(audio_level_percent(3000), audio_level_percent(30000))
+        self.assertEqual(100, audio_level_percent(32767))
+
+    def test_stop_file_is_consumed_once(self):
+        import tempfile
+
+        from tools.vosk_grammar_probe import consume_stop_request
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "engine.stop"
+            path.write_text("restart", encoding="utf-8")
+            self.assertEqual("restart", consume_stop_request(path))
+            self.assertFalse(path.exists())
+            self.assertEqual("", consume_stop_request(path))
+
+    def test_session_summary_fits_small_windows_desktop(self):
+        from tools.vosk_grammar_probe import session_summary_dimensions
+
+        self.assertEqual((760, 560), session_summary_dimensions(1920, 1080))
+        self.assertEqual((720, 520), session_summary_dimensions(800, 600))
+        self.assertEqual((500, 400), session_summary_dimensions(500, 400))
+
+    def test_log_archive_contains_only_selected_diagnostic_files(self):
+        from tools.liverse_gui import create_log_archive, list_log_sessions
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            older = root / "20260824_100000_000000"
+            newer = root / "20260825_100000_000000"
+            older.mkdir()
+            newer.mkdir()
+            (older / "events.jsonl").write_text("{}\n", encoding="utf-8")
+            (newer / "session.json").write_text(
+                '{"command":"liverse --holyrics-token private", "token":"private"}\n',
+                encoding="utf-8",
+            )
+            (newer / "audio.wav").write_bytes(b"audio")
+            (newer / ".env").write_text("HOLYRICS_TOKEN=secret\n", encoding="utf-8")
+            destination = root / "logs.zip"
+
+            self.assertEqual([newer, older], list_log_sessions(root))
+            self.assertEqual(1, create_log_archive([newer], destination))
+            with zipfile.ZipFile(destination) as archive:
+                self.assertEqual([f"{newer.name}/session.json"], archive.namelist())
+                exported = archive.read(archive.namelist()[0]).decode("utf-8")
+                self.assertNotIn("private", exported)
+                self.assertIn("[скрыто]", exported)
+
+    def test_phone_operator_has_fullscreen_and_wake_lock_controls(self):
+        root = Path(__file__).resolve().parents[3]
+        html = (root / "slide_display" / "operator.html").read_text(encoding="utf-8")
+        script = (root / "slide_display" / "operator.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="screenModeButton"', html)
+        self.assertIn("requestFullscreen", script)
+        self.assertIn('navigator.wakeLock.request("screen")', script)
+        self.assertIn('document.addEventListener("visibilitychange"', script)
+        self.assertIn('id="songModeButton"', html)
+        self.assertIn('id="previousSongSlide"', html)
+        self.assertIn('id="nextSongSlide"', html)
+        self.assertIn('/api/presentation-${action}', script)
+
+    def test_phone_song_controls_use_regular_holyrics_presentation_actions(self):
+        from tools.holyrics import control_holyrics_presentation
+
+        args = SimpleNamespace(
+            holyrics_token="secret",
+            holyrics_url="http://127.0.0.1:8091",
+        )
+        with patch("tools.holyrics.post_holyrics_api", return_value=(True, "", '{"status":"ok"}')) as api:
+            self.assertEqual((True, ""), control_holyrics_presentation(args, "next"))
+            self.assertEqual((True, ""), control_holyrics_presentation(args, "previous"))
+
+        self.assertEqual("ActionNext", api.call_args_list[0].args[2])
+        self.assertEqual("ActionPrevious", api.call_args_list[1].args[2])
+        self.assertEqual({}, api.call_args_list[0].args[3])
+
+    def test_slide_server_routes_phone_song_controls_to_callback(self):
+        from tools.slide_server import reset_operator_state, run_presentation_action
+
+        calls = []
+        reset_operator_state(
+            presentation_action_callback=lambda action: calls.append(action) or (True, "")
+        )
+
+        self.assertEqual((True, ""), run_presentation_action("next"))
+        self.assertEqual((True, ""), run_presentation_action("previous"))
+        self.assertEqual(["next", "previous"], calls)
+
+    def test_long_passage_advance_discards_stale_phone_candidate(self):
+        from tools.slide_server import operator_state, reset_operator_state, submit_candidate
+        from tools.vosk_grammar_probe import clear_stale_approvals_after_range_action
+
+        reset_operator_state()
+        submit_candidate({"ref": "Иаков 2:20", "verse": "текст"})
+        self.assertIsNotNone(operator_state()["candidate"])
+
+        self.assertTrue(clear_stale_approvals_after_range_action({"advanced": True}))
+        self.assertIsNone(operator_state()["candidate"])
+        self.assertFalse(clear_stale_approvals_after_range_action({"matched_boundary": False}))
+
     def test_gui_keeps_taskbar_fallback_for_linux_wayland(self):
-        from tools.liverse_gui import tray_can_hide_window
+        from tools.liverse_gui import tray_can_hide_window, tray_needs_own_event_loop
 
         self.assertTrue(tray_can_hide_window(platform="win32", session_type=""))
         self.assertFalse(tray_can_hide_window(platform="linux", session_type="wayland"))
@@ -70,6 +198,14 @@ class LiveReferencePipelineTest(unittest.TestCase):
             )
         )
         self.assertTrue(tray_can_hide_window(platform="linux", session_type="x11"))
+        self.assertTrue(
+            tray_needs_own_event_loop(
+                platform="linux", backend="pystray._appindicator"
+            )
+        )
+        self.assertFalse(
+            tray_needs_own_event_loop(platform="win32", backend="pystray._win32")
+        )
 
     def test_full_setup_can_select_microphone_by_stable_name(self):
         from tools.vosk_grammar_probe import ask_audio_input_device
@@ -249,6 +385,8 @@ class LiveReferencePipelineTest(unittest.TestCase):
                 "GetBibleSettings",
                 "GetCurrentPresentation",
                 "GetCurrentQuickPresentation",
+                "ActionNext",
+                "ActionPrevious",
                 "CloseCurrentQuickPresentation",
                 "CloseCurrentPresentation",
                 "SetBibleSettings",
@@ -371,6 +509,73 @@ class LiveReferencePipelineTest(unittest.TestCase):
                     "HOLYRICS_HOST": "http://localhost",
                 },
                 load_env_file(env_path),
+            )
+
+    def test_windows_user_files_use_local_app_data_and_keep_legacy_fallbacks(self):
+        from tools.holyrics import env_file_paths, env_write_path, liverse_config_dir
+
+        local_app_data = Path("C:/Users/operator/AppData/Local")
+        home = Path("C:/Users/operator")
+        cwd = home / "LiVerse"
+        environment = {"LOCALAPPDATA": str(local_app_data)}
+
+        config_dir = liverse_config_dir(
+            platform="nt", environ=environment, home=home
+        )
+        paths = env_file_paths(
+            platform="nt", environ=environment, home=home, cwd=cwd
+        )
+
+        self.assertEqual(local_app_data / "LiVerse", config_dir)
+        self.assertEqual(config_dir / ".env", env_write_path(
+            platform="nt", environ=environment, home=home
+        ))
+        self.assertIn(home / "LiVerse" / ".env", paths)
+        self.assertEqual(config_dir / ".env", paths[-1])
+
+    def test_linux_env_file_precedence_stays_unchanged(self):
+        from tools.holyrics import DEFAULT_ENV_PATH, env_file_paths
+
+        explicit_path = Path("/tmp/liverse-explicit.env")
+        cwd = Path("/tmp/liverse-cwd")
+
+        self.assertEqual(
+            [explicit_path, cwd / ".env", DEFAULT_ENV_PATH],
+            env_file_paths(
+                platform="posix",
+                environ={"LIVE_VERSE_VOSK_ENV": str(explicit_path)},
+                cwd=cwd,
+            ),
+        )
+
+    def test_windows_startup_settings_read_legacy_file_before_migration(self):
+        import json
+        import tempfile
+
+        from tools.vosk_grammar_probe import load_startup_settings, startup_settings_path
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            local_app_data = root / "local"
+            legacy_path = home / ".config" / "liverse" / "settings.json"
+            legacy_path.parent.mkdir(parents=True)
+            legacy_path.write_text(
+                json.dumps({"run_mode": "semi_auto"}), encoding="utf-8"
+            )
+            environment = {"LOCALAPPDATA": str(local_app_data)}
+
+            self.assertEqual(
+                local_app_data / "LiVerse" / "settings.json",
+                startup_settings_path(
+                    platform="nt", environ=environment, home=home
+                ),
+            )
+            self.assertEqual(
+                {"run_mode": "semi_auto"},
+                load_startup_settings(
+                    platform="nt", environ=environment, home=home
+                ),
             )
 
     def test_startup_update_detects_and_applies_newer_main_commit(self):

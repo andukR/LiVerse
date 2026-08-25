@@ -12,9 +12,35 @@
       <div>
         <div class="brand">LiVerse</div>
         <div id="connection">Подключение…</div>
+        <div id="screenModeStatus" class="screen-mode-status">Обычный режим экрана</div>
       </div>
-      <img src="/operator-qr.svg" alt="QR-код пульта">
+      <div class="header-actions">
+        <button id="screenModeButton" type="button" class="screen-mode-button">
+          На весь экран
+        </button>
+        <img src="/operator-qr.svg" alt="QR-код пульта">
+      </div>
     </header>
+
+    <nav id="modeTabs" class="mode-tabs" aria-label="Режим пульта">
+      <button id="bibleModeButton" type="button" class="active">Библия</button>
+      <button id="songModeButton" type="button">Песни</button>
+    </nav>
+
+    <section id="songControl" class="card song-control">
+      <div class="caption">Дистанционное управление HoLyrics</div>
+      <h1>Слайды песни</h1>
+      <p>Откройте песню в HoLyrics, затем перелистывайте куплеты с телефона.</p>
+      <div class="song-actions">
+        <button id="previousSongSlide" type="button" class="song-previous">
+          ← Предыдущий слайд
+        </button>
+        <button id="nextSongSlide" type="button" class="song-next">
+          Следующий слайд →
+        </button>
+      </div>
+      <div id="songControlStatus" class="song-control-status">Готово к управлению</div>
+    </section>
 
     <section id="pipeline" class="card pipeline">
       <div class="caption">Состояние распознавания</div>

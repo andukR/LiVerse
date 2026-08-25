@@ -28,12 +28,21 @@ const manualCard = document.querySelector("#manualCard");
 const sessionQuoteCount = document.querySelector("#sessionQuoteCount");
 const whatsappShare = document.querySelector("#whatsappShare");
 const copySessionQuotes = document.querySelector("#copySessionQuotes");
+const screenModeButton = document.querySelector("#screenModeButton");
+const screenModeStatus = document.querySelector("#screenModeStatus");
+const bibleModeButton = document.querySelector("#bibleModeButton");
+const songModeButton = document.querySelector("#songModeButton");
+const previousSongSlide = document.querySelector("#previousSongSlide");
+const nextSongSlide = document.querySelector("#nextSongSlide");
+const songControlStatus = document.querySelector("#songControlStatus");
 let books = [];
 let bibleStructure = {};
 let applyPickTimer = null;
 let activeBookTopic = "old";
 let multiTapState = { key: "", count: 0, timer: null };
 let sessionShareText = "";
+let keepScreenAwake = false;
+let wakeLock = null;
 const rangePick = {
   book: "",
   chapter: null,
@@ -129,6 +138,91 @@ const stageNames = {
   approved: "Отправлено",
   rejected: "Отклонено",
 };
+
+function fullscreenElement() {
+  return document.fullscreenElement || document.webkitFullscreenElement;
+}
+
+async function requestScreenWakeLock() {
+  if (!keepScreenAwake) return false;
+  if (!("wakeLock" in navigator)) {
+    screenModeStatus.textContent = "Полный экран; удержание экрана недоступно в этом браузере";
+    return false;
+  }
+  try {
+    wakeLock = await navigator.wakeLock.request("screen");
+    wakeLock.addEventListener("release", () => {
+      wakeLock = null;
+      if (keepScreenAwake && document.visibilityState === "visible") {
+        screenModeStatus.textContent = "Удержание экрана прервано системой";
+      }
+    });
+    screenModeStatus.textContent = "Полный экран; экран телефона не выключится";
+    return true;
+  } catch (error) {
+    screenModeStatus.textContent = "Полный экран; Android может выключить экран";
+    return false;
+  }
+}
+
+async function enableScreenMode() {
+  keepScreenAwake = true;
+  try {
+    const root = document.documentElement;
+    if (!fullscreenElement()) {
+      if (root.requestFullscreen) {
+        await root.requestFullscreen();
+      } else if (root.webkitRequestFullscreen) {
+        root.webkitRequestFullscreen();
+      }
+    }
+  } catch (error) {
+    screenModeStatus.textContent = "Браузер не разрешил полноэкранный режим";
+  }
+  await requestScreenWakeLock();
+}
+
+screenModeButton.addEventListener("click", enableScreenMode);
+document.addEventListener("fullscreenchange", () => {
+  screenModeButton.textContent = fullscreenElement() ? "Полный экран включён" : "На весь экран";
+});
+document.addEventListener("webkitfullscreenchange", () => {
+  screenModeButton.textContent = fullscreenElement() ? "Полный экран включён" : "На весь экран";
+});
+document.addEventListener("visibilitychange", () => {
+  if (keepScreenAwake && document.visibilityState === "visible" && !wakeLock) {
+    requestScreenWakeLock();
+  }
+});
+
+function selectOperatorMode(mode) {
+  const songMode = mode === "songs";
+  document.body.classList.toggle("song-mode", songMode);
+  bibleModeButton.classList.toggle("active", !songMode);
+  songModeButton.classList.toggle("active", songMode);
+}
+
+async function moveSongSlide(action) {
+  previousSongSlide.disabled = true;
+  nextSongSlide.disabled = true;
+  songControlStatus.textContent = action === "next" ? "Переключаю вперёд…" : "Переключаю назад…";
+  try {
+    const response = await fetch(`/api/presentation-${action}`, { method: "POST" });
+    const result = await response.json();
+    if (!result.ok) throw new Error(result.reason || "HoLyrics не выполнил команду");
+    songControlStatus.textContent = action === "next" ? "Показан следующий слайд" : "Показан предыдущий слайд";
+  } catch (error) {
+    songControlStatus.textContent = `Ошибка: ${error.message}`;
+  } finally {
+    previousSongSlide.disabled = false;
+    nextSongSlide.disabled = false;
+  }
+}
+
+bibleModeButton.addEventListener("click", () => selectOperatorMode("bible"));
+songModeButton.addEventListener("click", () => selectOperatorMode("songs"));
+previousSongSlide.addEventListener("click", () => moveSongSlide("previous"));
+nextSongSlide.addEventListener("click", () => moveSongSlide("next"));
 
 function renderProcessing(processing = {}) {
   const stage = processing.stage || "listening";
