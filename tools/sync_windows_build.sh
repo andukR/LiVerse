@@ -21,6 +21,9 @@ RUN_TESTS=false
 BUILD_ENGINE=false
 BUILD_INSTALLER=false
 RELEASE_VERSION=''
+UPGRADE_FROM_INSTALLER=''
+UPGRADE_FROM_NAME=''
+UPGRADE_FROM_SHA256=''
 GUEST_TIMEOUT_SECONDS=1200
 
 usage() {
@@ -40,6 +43,9 @@ Options:
                         clean-install test the Inno Setup installer.
   --release-version N   Require clean main and exact application version N;
                         implies --build-installer.
+  --upgrade-from-installer PATH
+                        Test installing the new version over this previous
+                        LiVerse installer; implies --build-installer.
   --iso PATH            Write the source ISO to PATH.
   --vm NAME             Libvirt VM name (default: win10).
   --destination PATH    Windows copy destination (default: C:\Build\LiVerse).
@@ -75,6 +81,13 @@ while (($#)); do
             RUN_TESTS=true
             shift 2
             ;;
+        --upgrade-from-installer)
+            UPGRADE_FROM_INSTALLER=${2:?missing value for --upgrade-from-installer}
+            BUILD_INSTALLER=true
+            BUILD_ENGINE=true
+            RUN_TESTS=true
+            shift 2
+            ;;
         --iso)
             ISO_PATH=${2:?missing value for --iso}
             shift 2
@@ -98,6 +111,19 @@ while (($#)); do
             ;;
     esac
 done
+
+if [[ -n "$UPGRADE_FROM_INSTALLER" ]]; then
+    if [[ ! -f "$UPGRADE_FROM_INSTALLER" ]]; then
+        printf 'Previous LiVerse installer was not found: %s\n' "$UPGRADE_FROM_INSTALLER" >&2
+        exit 1
+    fi
+    UPGRADE_FROM_NAME=$(basename "$UPGRADE_FROM_INSTALLER")
+    if [[ ! "$UPGRADE_FROM_NAME" =~ ^LiVerse-Setup-[0-9]+\.[0-9]+\.[0-9]+\.exe$ ]]; then
+        printf 'Previous installer has an unexpected name: %s\n' "$UPGRADE_FROM_NAME" >&2
+        exit 1
+    fi
+    UPGRADE_FROM_SHA256=$(sha256sum "$UPGRADE_FROM_INSTALLER" | awk '{print $1}')
+fi
 
 REQUIRED_COMMANDS=(git rsync xorriso sha256sum find du awk sed python3)
 
@@ -324,6 +350,14 @@ if [[ "$BUILD_INSTALLER" == true ]]; then
     cp -a -- "$INNO_SETUP_ASSET" "$STAGE_ROOT/build-tools/$INNO_SETUP_NAME"
 fi
 
+if [[ -n "$UPGRADE_FROM_INSTALLER" ]]; then
+    mkdir -p "$STAGE_ROOT/previous-installer"
+    cp -a -- "$UPGRADE_FROM_INSTALLER" \
+        "$STAGE_ROOT/previous-installer/LiVerse-Setup-previous.exe"
+    printf '%s\n' "$UPGRADE_FROM_SHA256" \
+        > "$STAGE_ROOT/previous-installer/LiVerse-Setup-previous.exe.sha256"
+fi
+
 # These source/provenance files are not needed to run or package LiVerse.
 rm -rf -- "$SNAPSHOT_DIR/packages/bible_parser_core/src/bible_parser_core/data/archive"
 rm -f -- "$SNAPSHOT_DIR/packages/bible_parser_core/src/bible_parser_core/data/sword_russinodal.json"
@@ -353,6 +387,10 @@ TIMESTAMP_UTC=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
     printf 'included_build_asset=%s\n' "$BIBLE_INDEX_ASSET"
     printf 'included_build_asset=%s -> %s\n' "$SHERPA_MODEL_ASSET" "$SHERPA_MODEL_SNAPSHOT"
     printf 'included_ignored_test_data=packages/bible_parser_core/tests/parser_regression_cases.json\n'
+    if [[ -n "$UPGRADE_FROM_INSTALLER" ]]; then
+        printf 'external_upgrade_installer=%s\n' "$UPGRADE_FROM_NAME"
+        printf 'external_upgrade_installer_sha256=%s\n' "$UPGRADE_FROM_SHA256"
+    fi
     printf '\ngit_diff_stat:\n'
     git -C "$PROJECT_ROOT" diff --stat HEAD
     printf '\ngit_status_porcelain:\n'
@@ -587,10 +625,10 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & $exe --check-runtime-assets
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-& $gui --check-packaged-gui
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-& $gui --check-packaged-update
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$guiCheck = Start-Process -FilePath $gui -ArgumentList "--check-packaged-gui" -Wait -PassThru
+if ($guiCheck.ExitCode -ne 0) { exit $guiCheck.ExitCode }
+$updaterCheck = Start-Process -FilePath $gui -ArgumentList "--check-packaged-update" -Wait -PassThru
+if ($updaterCheck.ExitCode -ne 0) { exit $updaterCheck.ExitCode }
 
 $guiItem = Get-Item -LiteralPath $gui
 $guiHash = (Get-FileHash -LiteralPath $gui -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -701,8 +739,8 @@ if (-not ($shortcutPaths | Where-Object { Test-Path -LiteralPath $_ -PathType Le
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & $engine --check-runtime-assets
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-& $gui --check-packaged-gui
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$guiCheck = Start-Process -FilePath $gui -ArgumentList "--check-packaged-gui" -Wait -PassThru
+if ($guiCheck.ExitCode -ne 0) { exit $guiCheck.ExitCode }
 
 $uninstall = Start-Process -FilePath $uninstaller -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait -PassThru
 if ($uninstall.ExitCode -ne 0) { throw "Uninstaller failed: $($uninstall.ExitCode)" }
@@ -718,6 +756,99 @@ Write-Output "Installer clean install, launch and uninstall tests passed."
 Write-Output "User data directory was preserved: $configDir"
 exit 0
 '
+
+            if [[ -n "$UPGRADE_FROM_INSTALLER" ]]; then
+                run_guest_powershell 'LiVerse installer upgrade test' '
+$ErrorActionPreference = "Stop"
+$root = "C:\Build\LiVerse"
+$versionFile = Join-Path $root "packages\bible_parser_core\src\bible_parser_core\version.py"
+$match = Select-String -LiteralPath $versionFile -Pattern "__version__ = .([0-9.]+)."
+if (-not $match) { throw "LiVerse version was not found" }
+$newVersionExpected = $match.Matches[0].Groups[1].Value
+
+$volume = Get-Volume -FileSystemLabel "LIVERSE_SOURCE" -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $volume -or -not $volume.DriveLetter) { throw "LIVERSE_SOURCE CD-ROM was not found" }
+$oldSetup = $volume.DriveLetter + ":\previous-installer\LiVerse-Setup-previous.exe"
+$oldHashFile = $oldSetup + ".sha256"
+foreach ($path in @($oldSetup, $oldHashFile)) {
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Previous installer asset is missing: $path" }
+}
+$oldHashExpected = (Get-Content -LiteralPath $oldHashFile -Raw).Trim().ToLowerInvariant()
+$oldHashActual = (Get-FileHash -LiteralPath $oldSetup -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($oldHashActual -ne $oldHashExpected) { throw "Previous installer SHA-256 mismatch: $oldHashActual" }
+
+$newSetup = Join-Path $root ("dist\installer\LiVerse-Setup-" + $newVersionExpected + ".exe")
+if (-not (Test-Path -LiteralPath $newSetup -PathType Leaf)) { throw "New installer was not found: $newSetup" }
+$installDir = Join-Path $root "installer-upgrade-test\LiVerse"
+$configDir = Join-Path $env:LOCALAPPDATA "LiVerse"
+$sentinel = Join-Path $configDir "installer-upgrade-preserve-test.txt"
+$sentinelText = "preserve-across-upgrade"
+$shortcutPaths = @(
+    (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\LiVerse.lnk"),
+    (Join-Path ($env:APPDATA -replace "\\system32\\", "\SysWOW64\") "Microsoft\Windows\Start Menu\Programs\LiVerse.lnk")
+) | Select-Object -Unique
+if (Test-Path -LiteralPath $installDir) { throw "Upgrade test target already exists: $installDir" }
+
+New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+$testPassed = $false
+try {
+    $oldInstall = Start-Process -FilePath $oldSetup -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/SP-",("/DIR=" + $installDir) -Wait -PassThru
+    if ($oldInstall.ExitCode -ne 0) { throw "Previous LiVerse installer failed: $($oldInstall.ExitCode)" }
+
+    $engine = Join-Path $installDir "LiVerseEngine.exe"
+    $gui = Join-Path $installDir "LiVerse.exe"
+    $uninstaller = Join-Path $installDir "unins000.exe"
+    foreach ($path in @($engine, $gui, $uninstaller)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Previous installed file is missing: $path" }
+    }
+    $oldVersion = (& $engine --version | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) { throw "Previous installed version check failed: $LASTEXITCODE" }
+    if ($oldVersion -match [regex]::Escape($newVersionExpected)) { throw "Previous installer already contains LiVerse $newVersionExpected" }
+
+    Set-Content -LiteralPath $sentinel -Value $sentinelText -Encoding UTF8
+
+    $newInstall = Start-Process -FilePath $newSetup -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/SP-",("/DIR=" + $installDir) -Wait -PassThru
+    if ($newInstall.ExitCode -ne 0) { throw "New LiVerse installer failed: $($newInstall.ExitCode)" }
+
+    $newVersion = (& $engine --version | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $newVersion -notmatch [regex]::Escape($newVersionExpected)) {
+        throw "Expected installed version $newVersionExpected, got: $newVersion"
+    }
+    & $engine --check-runtime-assets
+    if ($LASTEXITCODE -ne 0) { throw "Runtime assets check failed: $LASTEXITCODE" }
+    $guiCheck = Start-Process -FilePath $gui -ArgumentList "--check-packaged-gui" -Wait -PassThru
+    if ($guiCheck.ExitCode -ne 0) { throw "Packaged GUI check failed: $($guiCheck.ExitCode)" }
+    $updaterCheck = Start-Process -FilePath $gui -ArgumentList "--check-packaged-update" -Wait -PassThru
+    if ($updaterCheck.ExitCode -ne 0) { throw "Packaged updater check failed: $($updaterCheck.ExitCode)" }
+
+    if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf)) { throw "User setting marker disappeared during upgrade" }
+    $actualSentinel = (Get-Content -LiteralPath $sentinel -Raw).Trim()
+    if ($actualSentinel -ne $sentinelText) { throw "User setting marker changed during upgrade: $actualSentinel" }
+
+    Write-Output "Installer upgrade test passed: $oldVersion -> $newVersion."
+    Write-Output "Previous installer SHA-256: $oldHashActual"
+    Write-Output "User data was preserved during upgrade: $sentinel"
+    $testPassed = $true
+}
+finally {
+    $uninstaller = Join-Path $installDir "unins000.exe"
+    if (Test-Path -LiteralPath $uninstaller -PathType Leaf) {
+        $uninstall = Start-Process -FilePath $uninstaller -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait -PassThru
+        if ($uninstall.ExitCode -ne 0) { Write-Error "Upgrade test cleanup uninstaller failed: $($uninstall.ExitCode)" }
+        $deadline = (Get-Date).AddSeconds(60)
+        while ((Test-Path -LiteralPath $gui) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 250 }
+    }
+    if (Test-Path -LiteralPath $sentinel -PathType Leaf) { Remove-Item -LiteralPath $sentinel -Force }
+}
+if (-not $testPassed) { exit 1 }
+if (Test-Path -LiteralPath $gui) { throw "Upgrade test application was not removed: $gui" }
+foreach ($shortcut in $shortcutPaths) {
+    if (Test-Path -LiteralPath $shortcut) { throw "Upgrade test shortcut was not removed: $shortcut" }
+}
+Write-Output "Upgrade test cleanup passed."
+exit 0
+'
+            fi
         fi
     fi
 fi
