@@ -12,7 +12,7 @@ PY := $(BIN_DIR)/python
 PIP := $(BIN_DIR)/pip
 endif
 
-.PHONY: install test liverse gui analyze slides sword-russinodal check-sword-russinodal clean
+.PHONY: install test windows-vm-test windows-vm-engine windows-vm-installer windows-release liverse gui analyze slides sword-russinodal check-sword-russinodal clean
 
 install:
 	$(PYTHON) -m venv $(VENV)
@@ -26,6 +26,20 @@ test:
 	else \
 		$(PYTHON) -m unittest discover -s packages/bible_parser_core/tests -p 'test_*.py' -q; \
 	fi
+
+windows-vm-test: test
+	./tools/sync_windows_build.sh --run-tests
+
+windows-vm-engine: test
+	./tools/sync_windows_build.sh --build-engine
+
+windows-vm-installer: test
+	./tools/sync_windows_build.sh --build-installer
+
+windows-release:
+	@if [ -z "$(VERSION)" ]; then echo 'Укажите VERSION, например: make windows-release VERSION=1.2.0' >&2; exit 2; fi
+	$(MAKE) test
+	./tools/sync_windows_build.sh --build-installer --release-version "$(VERSION)"
 
 liverse:
 	@if [ -x "$(PY)" ]; then \
