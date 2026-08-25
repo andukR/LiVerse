@@ -589,6 +589,8 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & $gui --check-packaged-gui
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+& $gui --check-packaged-update
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $guiItem = Get-Item -LiteralPath $gui
 $guiHash = (Get-FileHash -LiteralPath $gui -Algorithm SHA256).Hash.ToLowerInvariant()

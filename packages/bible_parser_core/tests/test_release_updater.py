@@ -6,7 +6,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tools.liverse_gui import check_gui_update, packaged_windows_runtime
+from tools.liverse_gui import (
+    check_gui_update,
+    packaged_windows_runtime,
+    run_packaged_update_smoke_test,
+)
 from tools.release_updater import (
     ReleaseUpdateError,
     check_windows_release_update,
@@ -55,6 +59,30 @@ def release_payload(version: str, installer: bytes, *, digest: str | None = None
 
 
 class ReleaseUpdaterTest(unittest.TestCase):
+    def test_packaged_update_smoke_accepts_offline_binary_check(self):
+        with (
+            patch("tools.liverse_gui.packaged_windows_runtime", return_value=True),
+            patch(
+                "tools.liverse_gui.check_gui_update",
+                return_value={"status": "network_unavailable", "kind": "binary"},
+            ) as update_check,
+            patch("tools.liverse_gui.write_gui_log") as log,
+        ):
+            self.assertEqual(0, run_packaged_update_smoke_test())
+
+        update_check.assert_called_once_with()
+        self.assertIn("channel=binary", log.call_args.args[0])
+
+    def test_packaged_update_smoke_rejects_source_runtime(self):
+        with (
+            patch("tools.liverse_gui.packaged_windows_runtime", return_value=False),
+            patch("tools.liverse_gui.check_gui_update") as update_check,
+            patch("tools.liverse_gui.write_gui_log"),
+        ):
+            self.assertEqual(2, run_packaged_update_smoke_test())
+
+        update_check.assert_not_called()
+
     def test_version_comparison_accepts_release_tags(self):
         self.assertEqual((1, 2, 3), parse_release_version("v1.2.3"))
         self.assertEqual((1, 2, 3), parse_release_version("1.2.3"))

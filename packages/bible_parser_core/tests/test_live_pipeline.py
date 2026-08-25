@@ -28,7 +28,7 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertGreaterEqual(
             suite.countTestCases(),
-            253,
+            255,
             "Набор регрессионных тестов уменьшился; проверьте, какие проверки были удалены.",
         )
 

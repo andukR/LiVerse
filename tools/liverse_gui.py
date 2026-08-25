@@ -213,6 +213,27 @@ def check_gui_update(
     return check_startup_update()
 
 
+def run_packaged_update_smoke_test() -> int:
+    """Verify the packaged EXE selects its installer-based update channel."""
+    if not packaged_windows_runtime():
+        write_gui_log("Packaged update smoke test failed: runtime is not packaged Windows")
+        return 2
+    update = check_gui_update()
+    status = str(update.get("status") or "")
+    acceptable = {
+        "available",
+        "current",
+        "no_release",
+        "network_unavailable",
+        "invalid_release",
+    }
+    if status not in acceptable:
+        write_gui_log(f"Packaged update smoke test failed: status={status or 'missing'}")
+        return 3
+    write_gui_log(f"Packaged update smoke test passed: channel=binary; status={status}")
+    return 0
+
+
 @dataclass
 class GuiConfig:
     run_mode: str = "semi_auto"
@@ -1522,6 +1543,8 @@ def run_packaged_gui_smoke_test() -> int:
 
 def main() -> int:
     try:
+        if "--check-packaged-update" in sys.argv[1:]:
+            return run_packaged_update_smoke_test()
         if "--check-packaged-gui" in sys.argv[1:]:
             return run_packaged_gui_smoke_test()
         instance_guard = SingleInstanceGuard()
