@@ -202,7 +202,16 @@ class ScriptureTextDetector:
             self._shown_at[_reference_key(reference)] = now
 
     def process_fragment(self, text: str, now: float) -> TextCitationDecision:
+        fragment_tokens = normalize_bible_text(text)
         windows = self.buffer.add(text)
+        if 2 <= len(fragment_tokens) < self.config.min_words:
+            windows.append(
+                SpeechWindow(
+                    size=len(fragment_tokens),
+                    text=" ".join(fragment_tokens),
+                    tokens=tuple(fragment_tokens),
+                ),
+            )
         if not windows:
             return self._decision(reason="not_enough_words")
         if now < self._suppressed_until:
@@ -330,6 +339,27 @@ class ScriptureTextDetector:
             and strong_phrase_evidence
             and top.trigram_overlap > 0
         )
+        exact_phrase = (
+            len(lemmas) >= self.config.min_words
+            and top.start_verse == top.end_verse
+            and top.score >= self.config.acceptance_score
+            and margin >= self.config.minimum_margin
+            and matched_words >= self.config.minimum_matched_content_words
+            and top.coverage >= 99.0
+            and top.bigram_overlap >= 99.0
+            and top.trigram_overlap >= 99.0
+        )
+        exact_short_verse = (
+            2 <= len(lemmas) < self.config.min_words
+            and top.start_verse == top.end_verse
+            and top.score >= 99.0
+            and margin >= self.config.minimum_margin + 20.0
+            and matched_words >= 2
+            and top.coverage >= 99.0
+            and top.ordered_similarity >= 99.0
+            and top.token_similarity >= 99.0
+            and top.bigram_overlap >= 99.0
+        )
         strong_range = (
             top.end_verse > top.start_verse
             and top.score >= max(0.0, self.config.acceptance_score - 8.0)
@@ -338,14 +368,22 @@ class ScriptureTextDetector:
             and top.bigram_overlap >= 60.0
             and top.trigram_overlap >= 45.0
         )
-        if immediate or strong_range:
+        if immediate or exact_phrase or exact_short_verse or strong_range:
             return self._decision(
                 accepted=True, reference=top.reference, score=top.score, margin=margin,
                 matched_words=matched_words, window_text=window_text,
                 reason=(
                     "immediate_strong_range_match"
                     if strong_range and not immediate
-                    else "immediate_strong_match"
+                    else (
+                        "immediate_exact_short_verse_match"
+                        if exact_short_verse
+                        else (
+                            "immediate_exact_phrase_match"
+                            if exact_phrase and not immediate
+                            else "immediate_strong_match"
+                        )
+                    )
                 ),
                 confirmations=1, top=top, second=second,
             )

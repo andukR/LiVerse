@@ -112,7 +112,7 @@ class ScriptureTextDetectorTest(unittest.TestCase):
         )
         second = hit("1Ин. 4:9", 60.0, matched=("бог", "мир"), bigram=0.0, trigram=0.0)
         detector = ScriptureTextDetector(
-            FakeSearcher([[first, second], [first, second]]),
+            FakeSearcher([[first, second], [first, second], []]),
             self.config(),
         )
 
@@ -141,6 +141,106 @@ class ScriptureTextDetectorTest(unittest.TestCase):
 
         self.assertTrue(decision.accepted)
         self.assertEqual("immediate_strong_match", decision.reason)
+
+    def test_exact_five_word_verse_prefix_is_accepted_immediately(self) -> None:
+        john_316 = BibleTextSearchResult(
+            reference="Ин. 3:16",
+            text=(
+                "Ибо так возлюбил Бог мир, что отдал Сына Своего Единородного, "
+                "дабы всякий верующий в Него не погиб, но имел жизнь вечную."
+            ),
+            score=88.94,
+            coverage=100.0,
+            ordered_similarity=34.97,
+            token_similarity=100.0,
+            bigram_overlap=100.0,
+            trigram_overlap=100.0,
+            matched_lemmas=("ибо", "так", "возлюбить", "бог", "мир"),
+            book_id=43,
+            chapter=3,
+            start_verse=16,
+            end_verse=16,
+        )
+        other = hit(
+            "1Ин. 4:11",
+            54.92,
+            matched=("так", "возлюбить", "бог"),
+            bigram=25.0,
+            trigram=0.0,
+            book_id=62,
+            chapter=4,
+            verse=11,
+        )
+        detector = ScriptureTextDetector(
+            FakeSearcher([[john_316, other]]),
+            self.config(),
+        )
+
+        decision = detector.process_fragment("ибо так возлюбить бог мир", now=0.0)
+
+        self.assertTrue(decision.accepted)
+        self.assertEqual("Ин. 3:16", decision.reference)
+        self.assertEqual("immediate_exact_phrase_match", decision.reason)
+
+    def test_exact_complete_two_word_verse_is_accepted_immediately(self) -> None:
+        john_1135 = BibleTextSearchResult(
+            reference="Ин. 11:35",
+            text="Иисус прослезился.",
+            score=100.0,
+            coverage=100.0,
+            ordered_similarity=100.0,
+            token_similarity=100.0,
+            bigram_overlap=100.0,
+            trigram_overlap=0.0,
+            matched_lemmas=("иисус", "прослезиться"),
+            book_id=43,
+            chapter=11,
+            start_verse=35,
+            end_verse=35,
+        )
+        other = hit(
+            "Нав. 4:15",
+            29.14,
+            matched=("иисус",),
+            ordered=25.0,
+            bigram=0.0,
+            trigram=0.0,
+            book_id=6,
+            chapter=4,
+            verse=15,
+        )
+        detector = ScriptureTextDetector(
+            FakeSearcher([[], [], [john_1135, other]]),
+            self.config(),
+        )
+        detector.process_fragment("обычная речь перед коротким стихом", now=0.0)
+
+        decision = detector.process_fragment("иисус прослезиться", now=1.0)
+
+        self.assertTrue(decision.accepted)
+        self.assertEqual("Ин. 11:35", decision.reference)
+        self.assertEqual("immediate_exact_short_verse_match", decision.reason)
+
+    def test_unrelated_two_word_fragment_is_not_accepted(self) -> None:
+        weak = hit(
+            "Нав. 4:15",
+            55.0,
+            matched=("иисус",),
+            ordered=40.0,
+            bigram=0.0,
+            trigram=0.0,
+            book_id=6,
+            chapter=4,
+            verse=15,
+        )
+        detector = ScriptureTextDetector(
+            FakeSearcher([[weak]]),
+            self.config(),
+        )
+
+        decision = detector.process_fragment("иисус сказал", now=0.0)
+
+        self.assertFalse(decision.accepted)
 
     def test_repeated_content_word_counts_as_repeated_evidence(self) -> None:
         strong = hit(
@@ -302,7 +402,7 @@ class ScriptureTextDetectorTest(unittest.TestCase):
             trigram=75.0,
         )
         detector = ScriptureTextDetector(
-            FakeSearcher([[strong], [strong]]),
+            FakeSearcher([[strong], [strong], []]),
             self.config(immediate_score=90.0),
         )
 
