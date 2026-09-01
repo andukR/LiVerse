@@ -334,6 +334,21 @@ class LiveReferencePipelineTest(unittest.TestCase):
             metadata["tool"]["setuptools"]["dynamic"]["version"]["attr"],
         )
 
+    def test_windows_upgrade_removes_running_previous_engine(self):
+        project_root = Path(__file__).resolve().parents[3]
+        installer = (project_root / "installer" / "LiVerse.iss").read_text(encoding="utf-8")
+        build_script = (project_root / "tools" / "sync_windows_build.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('Type: files; Name: "{app}\\LiVerseEngine.exe"', installer)
+        self.assertIn("function PrepareToInstall", installer)
+        self.assertIn("/F /T /IM LiVerseEngine.exe", installer)
+        self.assertIn("not DeleteFile(EnginePath)", installer)
+        self.assertIn("$oldEngineProcess = Start-Process", build_script)
+        self.assertIn('"--installer-test-hold"', build_script)
+        self.assertIn("Previous LiVerseEngine.exe remained running after upgrade", build_script)
+
     def test_holyrics_first_setup_saves_env_and_updates_runtime_args(self):
         import os
         import tempfile

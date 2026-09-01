@@ -817,10 +817,27 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Previous installed version check failed: $LASTEXITCODE" }
     if ($oldVersion -match [regex]::Escape($newVersionExpected)) { throw "Previous installer already contains LiVerse $newVersionExpected" }
 
+    # The previous public engine does not know the private hold option. After
+    # confirming its real version, replace only the test executable with the
+    # newly built engine so a process from the installed target path can be
+    # held open while the installer upgrades that same path.
+    $testEngine = Join-Path $root "dist\LiVerse\LiVerseEngine.exe"
+    Copy-Item -LiteralPath $testEngine -Destination $engine -Force
+    $oldEngineProcess = Start-Process -FilePath $engine -ArgumentList "--installer-test-hold" -WindowStyle Hidden -PassThru
+    Start-Sleep -Seconds 3
+    if ($oldEngineProcess.HasExited) {
+        throw "Previous LiVerseEngine.exe did not remain running for the upgrade test"
+    }
+
     Set-Content -LiteralPath $sentinel -Value $sentinelText -Encoding UTF8
 
     $newInstall = Start-Process -FilePath $newSetup -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/SP-",("/DIR=" + $installDir) -Wait -PassThru
     if ($newInstall.ExitCode -ne 0) { throw "New LiVerse installer failed: $($newInstall.ExitCode)" }
+
+    $oldEngineProcess.Refresh()
+    if (-not $oldEngineProcess.HasExited) {
+        throw "Previous LiVerseEngine.exe remained running after upgrade"
+    }
 
     $newVersion = (& $engine --version | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or $newVersion -notmatch [regex]::Escape($newVersionExpected)) {
@@ -843,6 +860,9 @@ try {
     $testPassed = $true
 }
 finally {
+    if ($null -ne $oldEngineProcess -and -not $oldEngineProcess.HasExited) {
+        Stop-Process -Id $oldEngineProcess.Id -Force -ErrorAction SilentlyContinue
+    }
     $uninstaller = Join-Path $installDir "unins000.exe"
     if (Test-Path -LiteralPath $uninstaller -PathType Leaf) {
         $uninstall = Start-Process -FilePath $uninstaller -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait -PassThru

@@ -2912,6 +2912,7 @@ def main() -> int:
         action="store_true",
         help="Open the Bible text index and load the Sherpa model, then exit.",
     )
+    parser.add_argument("--installer-test-hold", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--open-vocabulary", action="store_true", help="Run Vosk without generated grammar.")
     parser.add_argument(
         "--sermon-plan",
@@ -3087,6 +3088,10 @@ def main() -> int:
     )
     parser.set_defaults(session_summary_popup=True, log_audio=True)
     args = parser.parse_args()
+    if args.installer_test_hold:
+        print("LiVerse installer test process is running.", flush=True)
+        while True:
+            time.sleep(60)
     if args.list_audio_devices:
         return list_audio_devices()
     if args.check_runtime_assets:
