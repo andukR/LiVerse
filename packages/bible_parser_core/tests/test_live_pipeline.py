@@ -2300,12 +2300,18 @@ class LiveReferencePipelineTest(unittest.TestCase):
             holyrics_quick_minutes=0.0,
         )
 
-        with patch(
-            "tools.holyrics.post_holyrics_api",
-            side_effect=[
-                (True, "", '{"data": {}}'),
-                (True, "", ""),
-            ],
+        with (
+            patch(
+                "tools.holyrics.get_holyrics_current_presentation",
+                return_value=None,
+            ),
+            patch(
+                "tools.holyrics.post_holyrics_api",
+                side_effect=[
+                    (True, "", '{"data": {}}'),
+                    (True, "", ""),
+                ],
+            ),
         ):
             ok, reason = post_holyrics_url(args, "http://127.0.0.1:8091", parsed)
 
@@ -2315,6 +2321,44 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertEqual(
             [6, 11, 15, 20],
             [item["verse"] for item in args._holyrics_scripture_range_reading["targets"]],
+        )
+
+    def test_showing_long_range_caches_current_text_presentation_for_restore(self):
+        pipeline = LiveReferencePipeline()
+        parsed = pipeline.process_text(
+            "первая иоанна вторая глава с первого по двадцатый стих"
+        )["parsed"]
+        args = SimpleNamespace(holyrics_theme="", holyrics_quick_minutes=0.0)
+        current = {
+            "type": "text",
+            "text_id": "sermon-plan",
+            "slide_number": 4,
+        }
+
+        with (
+            patch(
+                "tools.holyrics.get_holyrics_current_presentation",
+                return_value=current,
+            ),
+            patch(
+                "tools.holyrics.post_holyrics_api",
+                side_effect=[
+                    (True, "", '{"data": {}}'),
+                    (True, "", ""),
+                ],
+            ),
+        ):
+            ok, _reason = post_holyrics_url(args, "http://127.0.0.1:8091", parsed)
+
+        self.assertTrue(ok)
+        self.assertEqual(
+            {
+                "type": "text",
+                "text_id": "sermon-plan",
+                "slide_number": 4,
+                "current_index": 3,
+            },
+            args._holyrics_scripture_range_reading["restore_presentation"],
         )
 
     def test_last_verse_advances_long_range_and_final_verse_completes_it(self):
@@ -2451,6 +2495,42 @@ class LiveReferencePipelineTest(unittest.TestCase):
             "http://127.0.0.1:8091",
             presentation,
             2,
+        )
+
+    def test_final_long_range_verse_restores_presentation_cached_in_range_state(self):
+        cached = {
+            "type": "text",
+            "text_id": "sermon-plan",
+            "current_index": 6,
+        }
+        args = SimpleNamespace(
+            holyrics_url="http://127.0.0.1:8091",
+            _holyrics_scripture_range_reading={
+                "ref": "Иаков 3:5-15",
+                "book": "Иаков",
+                "book_id": 59,
+                "current_index": 0,
+                "restore_presentation": cached,
+                "targets": [
+                    {"slide_index": 0, "chapter": 3, "verse": 15, "text": "конец"},
+                ],
+            },
+        )
+        verse_fifteen = SimpleNamespace(book_id=59, chapter=3, start_verse=15, end_verse=15)
+
+        with patch(
+            "tools.holyrics.restore_sermon_plan_after_quick_presentation",
+            return_value=(True, "sermon_plan_restore_verified", {"verified": True}),
+        ) as restore:
+            result = handle_scripture_range_reading_match(args, verse_fifteen)
+
+        self.assertTrue(result["completed"])
+        self.assertTrue(result["restored_sermon_plan"])
+        restore.assert_called_once_with(
+            args,
+            "http://127.0.0.1:8091",
+            cached,
+            6,
         )
 
     def test_failed_final_restore_keeps_long_passage_active_for_retry(self):

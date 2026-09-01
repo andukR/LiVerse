@@ -1355,6 +1355,10 @@ def handle_scripture_range_reading_match(args: Any, candidate: Any) -> dict:
     if next_index >= len(targets):
         base_url = str(getattr(args, "holyrics_url", "")).rstrip("/")
         presentation = getattr(args, "_holyrics_sermon_plan_presentation", None)
+        if not isinstance(presentation, dict):
+            presentation = state.get("restore_presentation")
+        if not isinstance(presentation, dict):
+            presentation = getattr(args, "_holyrics_last_sermon_plan_presentation", None)
         if isinstance(presentation, dict):
             try:
                 return_index = max(0, int(presentation.get("current_index") or 0))
@@ -1438,6 +1442,19 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
 
     selected_scripture_range = scripture_range(payload)
     if selected_scripture_range:
+        restore_presentation = getattr(args, "_holyrics_sermon_plan_presentation", None)
+        if not isinstance(restore_presentation, dict):
+            current_presentation = get_holyrics_current_presentation(args, base_url)
+            if str((current_presentation or {}).get("type") or "").strip() == "text":
+                restore_presentation = dict(current_presentation)
+                try:
+                    restore_presentation["current_index"] = max(
+                        0, int(restore_presentation.get("slide_number") or 1) - 1
+                    )
+                except (TypeError, ValueError):
+                    restore_presentation["current_index"] = 0
+        if not isinstance(restore_presentation, dict):
+            restore_presentation = getattr(args, "_holyrics_last_sermon_plan_presentation", None)
         quick_body = scripture_range_quick_presentation_body(args, base_url, payload)
         if not quick_body:
             return False, "holyrics_scripture_range_empty"
@@ -1452,6 +1469,8 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
         if not show_ok:
             return False, show_reason
         state = scripture_range_reading_state(payload, list(quick_body["slides"]))
+        if isinstance(restore_presentation, dict):
+            state["restore_presentation"] = dict(restore_presentation)
         setattr(args, "_holyrics_scripture_range_reading", state)
         return True, f"show_quick_presentation:{range_kind};slides:{len(quick_body['slides'])};manual_advance"
 
