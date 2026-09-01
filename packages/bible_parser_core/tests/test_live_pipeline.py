@@ -3,13 +3,14 @@ import tempfile
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from bible_parser_core.live_pipeline import LiveReferencePipeline, build_grammar
 from bible_parser_core.parser import normalize_text
 from bible_parser_core.risk_model import load_risk_model, score_payload_with_model
 from tools.holyrics import (
     cross_chapter_quick_presentation_slides,
+    format_missing_holyrics_permissions,
     handle_scripture_range_reading_match,
     post_holyrics_url,
     restore_holyrics_presentation,
@@ -324,7 +325,7 @@ class LiveReferencePipelineTest(unittest.TestCase):
         project_root = Path(__file__).resolve().parents[3]
         metadata = tomllib.loads((project_root / "pyproject.toml").read_text(encoding="utf-8"))
 
-        self.assertEqual("1.2.0", core_version)
+        self.assertEqual("1.2.1", core_version)
         self.assertEqual(core_version, tools_version)
         self.assertEqual(core_version, slide_server_version)
         self.assertEqual(["version"], metadata["project"]["dynamic"])
@@ -948,6 +949,73 @@ class LiveReferencePipelineTest(unittest.TestCase):
                     }
                 ]
             },
+        )
+
+    def test_sermon_plan_verse_recovers_plan_when_cached_state_is_missing(self):
+        args = SimpleNamespace(
+            sermon_plan=True,
+            holyrics_quick_minutes=0.0,
+            holyrics_theme="",
+        )
+        payload = {
+            "ref": "Иоанн 3:16",
+            "verse": "Ибо так возлюбил Бог мир...",
+            "book": "Иоанн",
+            "chapter": 3,
+            "start_verse": 16,
+            "end_verse": 16,
+        }
+
+        with patch(
+            "tools.holyrics.get_holyrics_current_presentation",
+            return_value={
+                "type": "text",
+                "text_id": "sermon-plan",
+                "slide_number": 1,
+                "slides": [
+                    {
+                        "text": "Ибо так возлюбил Бог мир...",
+                        "theme_id": "plan-theme",
+                    }
+                ],
+                "name": "Проповедь",
+            },
+        ), patch(
+            "tools.holyrics.post_holyrics_api",
+            return_value=(True, "", ""),
+        ) as api:
+            ok, reason = post_holyrics_url(args, "http://127.0.0.1:8091", payload)
+
+        self.assertTrue(ok)
+        self.assertEqual(
+            "show_quick_presentation:sermon_verse;temporary_verse:0min",
+            reason,
+        )
+        self.assertEqual(
+            [call(
+                args,
+                "http://127.0.0.1:8091",
+                "ShowQuickPresentation",
+                {
+                    "slides": [
+                        {
+                            "text": "Иоанн 3:16\n\nИбо так возлюбил Бог мир...",
+                            "theme": {"id": "plan-theme"},
+                        }
+                    ]
+                },
+            )],
+            api.call_args_list,
+        )
+
+    def test_missing_holyrics_permissions_message_lists_exact_permissions(self):
+        self.assertEqual(
+            "Holyrics: в API token не хватает разрешений: ShowVerse, ActionGoToIndex",
+            format_missing_holyrics_permissions(["ShowVerse", "ActionGoToIndex"]),
+        )
+        self.assertEqual(
+            "Holyrics: в API token не хватает разрешения: ShowVerse",
+            format_missing_holyrics_permissions(["ShowVerse"]),
         )
 
     def test_text_plan_restore_does_not_close_presentation_first(self):

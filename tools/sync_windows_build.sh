@@ -512,9 +512,16 @@ if [[ "$PREPARE_ONLY" == false ]]; then
     VM_STATE=$(virsh -c "$VM_URI" domstate "$VM_NAME" | tr -d '\r')
     if virsh -c "$VM_URI" domblklist "$VM_NAME" --details | awk -v target="$VM_CDROM" '$3 == target {found=1} END {exit !found}'; then
         if [[ "$VM_STATE" == 'running' ]]; then
+            VM_CDROM_SOURCE=$(
+                virsh -c "$VM_URI" domblklist "$VM_NAME" --details |
+                    awk -v target="$VM_CDROM" '$3 == target {print $4; exit}'
+            )
             # The ISO is atomically replaced at the same path. Explicitly eject
-            # it first so QEMU cannot keep serving the previous open file.
-            virsh -c "$VM_URI" change-media "$VM_NAME" "$VM_CDROM" --eject --live --config --force >/dev/null
+            # it first so QEMU cannot keep serving the previous open file. An
+            # empty virtual drive has source "-" and must not be ejected.
+            if [[ -n "$VM_CDROM_SOURCE" && "$VM_CDROM_SOURCE" != '-' ]]; then
+                virsh -c "$VM_URI" change-media "$VM_NAME" "$VM_CDROM" --eject --live --config --force >/dev/null
+            fi
             virsh -c "$VM_URI" change-media "$VM_NAME" "$VM_CDROM" "$ISO_PATH" --insert --live --config >/dev/null
         else
             virsh -c "$VM_URI" change-media "$VM_NAME" "$VM_CDROM" "$ISO_PATH" --update --config >/dev/null
@@ -675,15 +682,21 @@ if (-not \$match) { throw 'LiVerse version was not found' }
 \$source = Join-Path \$root 'dist\\LiVerse'
 \$output = Join-Path \$root 'dist\\installer'
 \$script = Join-Path \$root 'installer\\LiVerse.iss'
+\$setup = Join-Path \$output ('LiVerse-Setup-' + \$version + '.exe')
+\$checksum = \$setup + '.sha256'
+\$reportPath = Join-Path \$output ('LiVerse-Windows-Release-' + \$version + '.json')
 if (Test-Path -LiteralPath (Join-Path \$source '_internal\\.env')) { throw '.env must not be included in the installer source' }
 New-Item -ItemType Directory -Path \$output -Force | Out-Null
+foreach (\$staleArtifact in @(\$setup, \$checksum, \$reportPath)) {
+    if (Test-Path -LiteralPath \$staleArtifact -PathType Leaf) {
+        Remove-Item -LiteralPath \$staleArtifact -Force
+    }
+}
 & \$compiler ('/DAppVersion=' + \$version) ('/DSourceDir=' + \$source) ('/DOutputDir=' + \$output) \$script
 if (\$LASTEXITCODE -ne 0) { exit \$LASTEXITCODE }
-\$setup = Join-Path \$output ('LiVerse-Setup-' + \$version + '.exe')
 if (-not (Test-Path -LiteralPath \$setup -PathType Leaf)) { throw ('Installer was not created: ' + \$setup) }
 \$item = Get-Item -LiteralPath \$setup
 \$hash = (Get-FileHash -LiteralPath \$setup -Algorithm SHA256).Hash.ToLowerInvariant()
-\$checksum = Join-Path \$output (\$item.Name + '.sha256')
 Set-Content -LiteralPath \$checksum -Value (\$hash + '  ' + \$item.Name) -Encoding ascii
 \$report = [ordered]@{
     version = \$version
@@ -692,7 +705,6 @@ Set-Content -LiteralPath \$checksum -Value (\$hash + '  ' + \$item.Name) -Encodi
     sha256 = \$hash
     built_at_utc = (Get-Date).ToUniversalTime().ToString('o')
 }
-\$reportPath = Join-Path \$output ('LiVerse-Windows-Release-' + \$version + '.json')
 \$report | ConvertTo-Json | Set-Content -LiteralPath \$reportPath -Encoding utf8
 Write-Output ('Installer: ' + \$setup)
 Write-Output ('Installer bytes: ' + \$item.Length)

@@ -903,6 +903,54 @@ def show_holyrics_text_slide(
     return ok, reason or "sermon_plan_show_text"
 
 
+def build_holyrics_sermon_plan_presentation(args: Any, active: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(active, dict):
+        return None
+    if str(active.get("type") or "").strip() != "text":
+        return None
+    slides = list(active.get("slides") or [])
+    nonempty_slide_count = sum(1 for slide in slides if str(slide.get("text") or "").strip())
+    if not nonempty_slide_count:
+        return None
+
+    sermon_plan = {
+        **active,
+        "slides": slides,
+        "current_index": max(0, int(active.get("slide_number") or 1) - 1),
+        "next_index": max(0, int(active.get("slide_number") or 1) - 1),
+        "speech_parts": [],
+    }
+    current_slide_index = max(0, int(active.get("slide_number") or 1) - 1)
+    current_slide = slides[current_slide_index] if current_slide_index < len(slides) else {}
+    sermon_plan_theme_id = str(current_slide.get("theme_id") or "").strip()
+    if not sermon_plan_theme_id:
+        sermon_plan_theme_id = next(
+            (
+                str(slide.get("theme_id") or "").strip()
+                for slide in slides
+                if str(slide.get("theme_id") or "").strip()
+            ),
+            "",
+        )
+    setattr(args, "_holyrics_sermon_plan_theme_id", sermon_plan_theme_id)
+    setattr(args, "_holyrics_sermon_plan_presentation", sermon_plan)
+    return sermon_plan
+
+
+def ensure_holyrics_sermon_plan_presentation(args: Any, base_url: str) -> dict[str, Any] | None:
+    sermon_plan = getattr(args, "_holyrics_sermon_plan_presentation", None)
+    if isinstance(sermon_plan, dict):
+        return sermon_plan
+    if not getattr(args, "sermon_plan", False):
+        return None
+    active = get_holyrics_current_presentation(
+        args,
+        base_url,
+        include_slides=True,
+    )
+    return build_holyrics_sermon_plan_presentation(args, active or {})
+
+
 def get_holyrics_api_server_info(args: Any, base_url: str) -> tuple[bool, str, dict[str, Any] | None]:
     ok, reason, body = post_holyrics_api(args, base_url, "GetAPIServerInfo", {})
     if not ok:
@@ -972,6 +1020,17 @@ def required_holyrics_permissions(args: Any) -> tuple[str, ...]:
     if str(getattr(args, "holyrics_theme", "") or "").strip():
         permissions.extend(THEME_HOLYRICS_PERMISSIONS)
     return tuple(dict.fromkeys(permissions))
+
+
+def format_missing_holyrics_permissions(
+    missing_permissions: list[str] | tuple[str, ...] | set[str],
+) -> str:
+    items = [str(permission).strip() for permission in missing_permissions if str(permission).strip()]
+    if not items:
+        return "Holyrics: в API token не хватает разрешений."
+    if len(items) == 1:
+        return f"Holyrics: в API token не хватает разрешения: {items[0]}"
+    return "Holyrics: в API token не хватает разрешений: " + ", ".join(items)
 
 
 def check_holyrics_api_server(args: Any) -> dict[str, Any]:
@@ -1396,7 +1455,7 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
         setattr(args, "_holyrics_scripture_range_reading", state)
         return True, f"show_quick_presentation:{range_kind};slides:{len(quick_body['slides'])};manual_advance"
 
-    sermon_plan_presentation = getattr(args, "_holyrics_sermon_plan_presentation", None)
+    sermon_plan_presentation = ensure_holyrics_sermon_plan_presentation(args, base_url)
     if isinstance(sermon_plan_presentation, dict):
         quick_body = slide_payload_to_holyrics_body(args, payload)
         if not str((quick_body.get("slides") or [{}])[0].get("text") or "").strip():
@@ -1473,6 +1532,29 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
         show_payload,
     )
     holyrics_log(f"ShowVerse response={show_body or show_reason or 'ok'}")
+    if not show_ok and (isinstance(sermon_plan_presentation, dict) or bool(getattr(args, "sermon_plan", False))):
+        fallback_body = slide_payload_to_holyrics_body(args, payload)
+        fallback_ok, fallback_reason, fallback_body_text = post_holyrics_api(
+            args,
+            base_url,
+            "ShowQuickPresentation",
+            fallback_body,
+        )
+        holyrics_log(
+            "ShowQuickPresentation sermon verse fallback response="
+            f"{fallback_body_text or fallback_reason or 'ok'}"
+        )
+        if fallback_ok:
+            clear_scripture_range_reading(args)
+            close_suffix = ""
+            if quick_minutes > 0:
+                restore_holyrics_presentation_later(args, base_url, previous_presentation, quick_minutes)
+                close_suffix = f";temporary_verse:{quick_minutes:g}min"
+            return True, (
+                f"verse_id:{verse_id};show_x_verses:{show_x_verses}"
+                f";fallback:show_quick_presentation{close_suffix}"
+            )
+        return False, f"{show_reason};fallback:{fallback_reason}"
     if not show_ok:
         return False, show_reason
     clear_scripture_range_reading(args)

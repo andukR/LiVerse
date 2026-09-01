@@ -38,6 +38,7 @@ from tools.holyrics import (  # noqa: E402
     DEFAULT_PORT,
     check_holyrics_api_server,
     env_setting,
+    format_missing_holyrics_permissions,
     liverse_config_dir,
     required_holyrics_permissions,
     save_holyrics_env,
@@ -546,8 +547,25 @@ class LiVerseGui:
         self.root.after(100, self._poll_events)
         self.root.after(350, self._begin_update_check)
 
+    def _create_primary_button(self, parent: tk.Misc, **kwargs):
+        if os.name == "nt":
+            return tk.Button(
+                parent,
+                bg=BRAND_BLUE,
+                fg="#FFFFFF",
+                activebackground=BRAND_BLUE_ACTIVE,
+                activeforeground="#FFFFFF",
+                relief="flat",
+                borderwidth=1,
+                highlightthickness=0,
+                padx=12,
+                pady=4,
+                **kwargs,
+            )
+        return ttk.Button(parent, style="Primary.TButton", **kwargs)
+
     def _configure_window(self) -> None:
-        self.root.title("LiVerse")
+        self.root.title(f"LiVerse {__version__}")
         self.root.geometry("760x640")
         self.root.minsize(700, 560)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
@@ -661,11 +679,10 @@ class LiVerseGui:
 
         buttons = ttk.Frame(self.status_tab)
         buttons.pack(fill="x")
-        ttk.Button(
+        self._create_primary_button(
             buttons,
             textvariable=self.run_button_var,
             command=self.toggle_engine,
-            style="Primary.TButton",
         ).pack(side="left")
         ttk.Button(buttons, text="Проверить HoLyrics", command=self.check_holyrics).pack(side="left", padx=8)
         ttk.Button(buttons, text="Завершить LiVerse", command=self.quit_application).pack(side="right")
@@ -728,7 +745,7 @@ class LiVerseGui:
 
         actions = ttk.Frame(self.settings_tab)
         actions.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(16, 0))
-        ttk.Button(actions, text="Сохранить и запустить", command=self.save_and_start, style="Primary.TButton").pack(
+        self._create_primary_button(actions, text="Сохранить и запустить", command=self.save_and_start).pack(
             side="left"
         )
         ttk.Button(actions, text="Обновить список микрофонов", command=self._refresh_microphones).pack(
@@ -803,11 +820,10 @@ class LiVerseGui:
         ttk.Button(actions, text="Выбрать последний", command=self._select_latest_log).pack(
             side="left", padx=8
         )
-        ttk.Button(
+        self._create_primary_button(
             actions,
             text="Создать архив…",
             command=self._export_selected_logs,
-            style="Primary.TButton",
         ).pack(side="right")
         self._refresh_log_sessions()
 
@@ -1111,8 +1127,21 @@ class LiVerseGui:
                     os.killpg(process.pid, signal.SIGINT)
             except (OSError, ProcessLookupError):
                 pass
+        self.root.after(3000, self._force_engine_stop_if_needed, process)
         if restart:
             self.root.after(900, self._restart_after_stop)
+
+    def _force_engine_stop_if_needed(self, process: subprocess.Popen[str]) -> None:
+        if self.process is not process or process.poll() is not None or not self.stopping:
+            return
+        write_gui_log("Движок не завершился штатно за 3 секунды; выполняется принудительная остановка.")
+        try:
+            if os.name == "nt":
+                process.terminate()
+            else:
+                os.killpg(process.pid, signal.SIGINT)
+        except (OSError, ProcessLookupError):
+            pass
 
     def _restart_after_stop(self) -> None:
         if self.process is not None and self.process.poll() is None:
@@ -1261,7 +1290,7 @@ class LiVerseGui:
         missing = list(result.get("missing_permissions") or [])
         if missing:
             self.holyrics_status_var.set("не хватает разрешений")
-            self.activity_var.set("В токене HoLyrics включены не все разрешения: " + ", ".join(missing))
+            self.activity_var.set(format_missing_holyrics_permissions(missing))
             return
         version = str(result.get("version") or "").strip()
         self.holyrics_status_var.set(f"подключён{', версия ' + version if version else ''}")
@@ -1300,7 +1329,7 @@ class LiVerseGui:
 
         window = tk.Toplevel(self.root)
         self.qr_window = window
-        window.title("LiVerse — подключение телефона")
+        window.title(f"LiVerse {__version__} — подключение телефона")
         window.resizable(False, False)
         window.attributes("-topmost", True)
         ttk.Label(window, image=self.qr_image).pack(padx=16, pady=(16, 8))

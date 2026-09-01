@@ -74,6 +74,7 @@ from tools.holyrics import (
     MIN_RECOMMENDED_HOLYRICS_VERSION,
     REQUIRED_HOLYRICS_PERMISSIONS,
     THEME_HOLYRICS_PERMISSIONS,
+    build_holyrics_sermon_plan_presentation,
     check_holyrics_api_server,
     control_holyrics_presentation,
     default_holyrics_url,
@@ -88,6 +89,7 @@ from tools.holyrics import (
     scripture_range_reading_active,
     sync_scripture_range_reading,
     post_holyrics_update,
+    format_missing_holyrics_permissions,
     required_holyrics_permissions,
     save_holyrics_env,
 )
@@ -684,9 +686,7 @@ def check_holyrics_startup(args: argparse.Namespace, logger: JsonlLogger | None 
             )
         missing_permissions = result.get("missing_permissions") or []
         if missing_permissions:
-            print("Holyrics: в API token не хватает разрешений:", flush=True)
-            for permission in missing_permissions:
-                print(f"  - {permission}", flush=True)
+            print(format_missing_holyrics_permissions(missing_permissions), flush=True)
             print("Откройте Holyrics -> Settings -> API Server -> Manage permissions.", flush=True)
         return True
 
@@ -2280,54 +2280,33 @@ def run_microphone(args: argparse.Namespace) -> int:
             str(args.holyrics_url).rstrip("/"),
             include_slides=True,
         )
-        if active and str(active.get("type") or "") == "text":
-            slides = list(active.get("slides") or [])
+        sermon_plan = build_holyrics_sermon_plan_presentation(args, active or {})
+        if sermon_plan is not None:
+            slides = list(sermon_plan.get("slides") or [])
             nonempty_slide_count = sum(1 for slide in slides if str(slide.get("text") or "").strip())
-            if nonempty_slide_count:
-                sermon_plan = {
-                    **active,
-                    "slides": slides,
-                    "current_index": max(0, int(active.get("slide_number") or 1) - 1),
-                    "next_index": max(0, int(active.get("slide_number") or 1) - 1),
-                    "speech_parts": [],
-                }
-                current_slide_index = max(0, int(active.get("slide_number") or 1) - 1)
-                current_slide = slides[current_slide_index] if current_slide_index < len(slides) else {}
-                sermon_plan_theme_id = str(current_slide.get("theme_id") or "").strip()
-                if not sermon_plan_theme_id:
-                    sermon_plan_theme_id = next(
-                        (
-                            str(slide.get("theme_id") or "").strip()
-                            for slide in slides
-                            if str(slide.get("theme_id") or "").strip()
-                        ),
-                        "",
-                    )
-                setattr(args, "_holyrics_sermon_plan_theme_id", sermon_plan_theme_id)
-                setattr(args, "_holyrics_sermon_plan_presentation", sermon_plan)
-                if grammar is not None and model is not None:
-                    grammar = sorted(
-                        set(grammar)
-                        | set(
-                            sermon_plan_grammar_phrases(
-                                slides,
-                                word_is_known=lambda word: model.vosk_model_find_word(word) != -1,
-                            )
+            if grammar is not None and model is not None:
+                grammar = sorted(
+                    set(grammar)
+                    | set(
+                        sermon_plan_grammar_phrases(
+                            slides,
+                            word_is_known=lambda word: model.vosk_model_find_word(word) != -1,
                         )
                     )
-                logger.write(
-                    "sermon_plan_loaded",
-                    {
-                        "name": active.get("name"),
-                        "text_id": active.get("text_id") or active.get("id"),
-                        "slides": nonempty_slide_count,
-                        "current_slide": active.get("slide_number"),
-                    },
                 )
-                print(
-                    f"План проповеди: {active.get('name')} ({nonempty_slide_count} непустых слайда)",
-                    flush=True,
-                )
+            logger.write(
+                "sermon_plan_loaded",
+                {
+                    "name": active.get("name"),
+                    "text_id": active.get("text_id") or active.get("id"),
+                    "slides": nonempty_slide_count,
+                    "current_slide": active.get("slide_number"),
+                },
+            )
+            print(
+                f"План проповеди: {active.get('name')} ({nonempty_slide_count} непустых слайда)",
+                flush=True,
+            )
         if sermon_plan is None:
             print("План проповеди не найден: откройте текстовую презентацию Holyrics до запуска LiVerse.", flush=True)
     print(WELCOME_TEXT, flush=True)
@@ -2565,10 +2544,13 @@ def run_microphone(args: argparse.Namespace) -> int:
             with stream:
                 last_audio_level_at = 0.0
                 while True:
-                    data = audio_queue.get()
                     stop_action = consume_stop_request(args.stop_file)
                     if stop_action:
                         raise GracefulStopRequested(stop_action)
+                    try:
+                        data = audio_queue.get(timeout=0.25)
+                    except queue.Empty:
+                        continue
                     if audio_log:
                         audio_log.writeframes(data)
                     audio_bytes_seen += len(data)
