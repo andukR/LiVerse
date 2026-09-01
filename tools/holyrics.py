@@ -955,6 +955,58 @@ def extract_holyrics_data_list(body: str) -> list[dict[str, Any]]:
     return [item for item in data if isinstance(item, dict)]
 
 
+def resolve_holyrics_quick_theme_id(
+    args: Any,
+    base_url: str,
+    theme_id: str,
+) -> tuple[str | None, str]:
+    """Map a presentation-private theme ID to a public API theme with the same name."""
+    requested_id = str(theme_id or "").strip()
+    if not requested_id:
+        return None, "holyrics_theme_id_empty"
+
+    themes_ok, themes_reason, themes_body = post_holyrics_api(
+        args,
+        base_url,
+        "GetThemes",
+        {},
+    )
+    if not themes_ok:
+        return None, themes_reason
+    themes = extract_holyrics_data_list(themes_body)
+    for theme in themes:
+        public_id = str(theme.get("id") or "").strip()
+        if public_id == requested_id:
+            return public_id, "holyrics_theme_id_public"
+
+    current_ok, current_reason, current_body = post_holyrics_api(
+        args,
+        base_url,
+        "GetCurrentTheme",
+        {},
+    )
+    if not current_ok:
+        return None, current_reason
+    try:
+        parsed = json.loads(current_body)
+    except json.JSONDecodeError:
+        return None, "holyrics_current_theme_invalid_json"
+    current = parsed.get("data") if isinstance(parsed, dict) else None
+    current_id = str((current or {}).get("id") or "").strip() if isinstance(current, dict) else ""
+    current_name = str((current or {}).get("name") or "").strip() if isinstance(current, dict) else ""
+    if current_id != requested_id or not current_name:
+        return None, "holyrics_private_theme_name_unavailable"
+
+    current_name_key = current_name.casefold()
+    for theme in themes:
+        if str(theme.get("name") or "").strip().casefold() != current_name_key:
+            continue
+        public_id = str(theme.get("id") or "").strip()
+        if public_id:
+            return public_id, "holyrics_private_theme_mapped_by_name"
+    return None, f"holyrics_public_theme_not_found:{current_name}"
+
+
 def get_holyrics_theme_options(args: Any) -> dict[str, Any]:
     reasons: list[str] = []
     auto_target = str(getattr(args, "holyrics_url", "auto")).strip().lower() == "auto"

@@ -72,6 +72,7 @@ from tools.holyrics import (
     sync_scripture_range_reading,
     post_holyrics_update,
     required_holyrics_permissions,
+    resolve_holyrics_quick_theme_id,
     save_holyrics_env,
 )
 
@@ -2177,6 +2178,28 @@ def run_microphone(args: argparse.Namespace) -> int:
                         ),
                         "",
                     )
+                if sermon_plan_theme_id:
+                    resolved_theme_id, theme_resolution = resolve_holyrics_quick_theme_id(
+                        args,
+                        str(args.holyrics_url).rstrip("/"),
+                        sermon_plan_theme_id,
+                    )
+                    if resolved_theme_id:
+                        if resolved_theme_id != sermon_plan_theme_id:
+                            logger.write(
+                                "sermon_plan_theme_mapped",
+                                {
+                                    "presentation_theme_id": sermon_plan_theme_id,
+                                    "quick_theme_id": resolved_theme_id,
+                                    "reason": theme_resolution,
+                                },
+                            )
+                        sermon_plan_theme_id = resolved_theme_id
+                    else:
+                        logger.write(
+                            "sermon_plan_theme_unavailable",
+                            {"theme_id": sermon_plan_theme_id, "reason": theme_resolution},
+                        )
                 setattr(args, "_holyrics_sermon_plan_theme_id", sermon_plan_theme_id)
                 setattr(args, "_holyrics_sermon_plan_presentation", sermon_plan)
                 if grammar is not None and model is not None:

@@ -745,6 +745,36 @@ class LiveReferencePipelineTest(unittest.TestCase):
             },
         )
 
+    def test_private_sermon_theme_maps_to_public_theme_with_same_name(self):
+        from tools.holyrics import resolve_holyrics_quick_theme_id
+
+        args = SimpleNamespace(holyrics_token="token", holyrics_timeout=1.0)
+        responses = [
+            (
+                True,
+                "",
+                '{"status":"ok","data":[{"id":"public-theme","name":"Plan theme"}]}',
+            ),
+            (
+                True,
+                "",
+                '{"status":"ok","data":{"id":"private-theme","name":"Plan theme"}}',
+            ),
+        ]
+        with patch("tools.holyrics.post_holyrics_api", side_effect=responses) as api:
+            theme_id, reason = resolve_holyrics_quick_theme_id(
+                args,
+                "http://127.0.0.1:8091",
+                "private-theme",
+            )
+
+        self.assertEqual("public-theme", theme_id)
+        self.assertEqual("holyrics_private_theme_mapped_by_name", reason)
+        self.assertEqual(
+            ["GetThemes", "GetCurrentTheme"],
+            [item.args[2] for item in api.call_args_list],
+        )
+
     def test_text_plan_restore_does_not_close_presentation_first(self):
         args = SimpleNamespace()
         previous = {
