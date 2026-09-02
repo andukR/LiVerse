@@ -965,7 +965,7 @@ liverse
 CSV-таблицу:
 
 ```bash
-.venv/bin/python tools/analyze_vosk_probe_logs.py --log-dir .cache/liverse/vosk_probe --export-training-data .cache/liverse/ml/training_cases.csv
+.venv/bin/python tools/analyze_vosk_probe_logs.py --log-dir .cache/liverse/vosk_probe --asr-engine sherpa-0.54 --export-training-data .cache/liverse/ml/training_cases.csv
 ```
 
 В этой таблице `target_confirm=1` означает "случай нужно отдать оператору",

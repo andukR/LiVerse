@@ -715,6 +715,13 @@ def resolve_reference_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, sh
                     source = "resolver"
         if parsed is None and invalid_reference is None:
             invalid_reference = diagnose_invalid_reference(text, bible_path=bible_path)
+        if blocked_weak_context is None:
+            normalized = normalize_text(text)
+            if any(
+                candidate.book == "Колоссянам" and candidate.score >= 0.999
+                for candidate in book_candidates(normalized)
+            ):
+                blocked_weak_context = "colossians_book_conflict"
 
     payload = {
         "text": text,
@@ -1409,9 +1416,8 @@ def same_place_candidates(candidates: list[str], last_parsed: dict | ParsedRefer
         any(book.score >= 0.95 for book in book_candidates(normalize_text(candidate)))
         for candidate in candidates
     )
-    expanded: list[str] = []
+    expanded: list[str] = list(candidates)
     for candidate in candidates:
-        expanded.append(candidate)
         normalized = normalize_text(candidate)
         unconnected_range = unconnected_spoken_verse_range(normalized)
         if (
@@ -1866,7 +1872,8 @@ class LiveReferencePipeline:
         if likely_book_only_fragment(text) and len(self.text_buffer.parts) > 1:
             self.text_buffer.clear()
             self.text_buffer.add(text)
-        candidate_texts = same_place_candidates(self.text_buffer.candidates(), self.last_parsed)
+        spoken_candidate_texts = self.text_buffer.candidates()
+        candidate_texts = same_place_candidates(spoken_candidate_texts, self.last_parsed)
         candidate_texts = expand_joel_confusable_candidates(candidate_texts)
         candidate_texts = expand_nehemiah_confusable_candidates(
             candidate_texts,
@@ -1888,9 +1895,12 @@ class LiveReferencePipeline:
         explicit_buffered_reference = bool(
             payload.get("matched")
             and context_payload
-            and acceptable_buffer_context(
-                str(payload.get("text") or ""),
-                str(context_payload.get("text") or ""),
+            and any(
+                acceptable_buffer_context(
+                    candidate,
+                    str(context_payload.get("text") or ""),
+                )
+                for candidate in spoken_candidate_texts
             )
         )
         if context_payload and not explicit_buffered_reference:

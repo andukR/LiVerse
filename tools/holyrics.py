@@ -340,6 +340,72 @@ def holyrics_log(message: str) -> None:
     print(f"Holyrics: {message}", flush=True)
 
 
+_HOLYRICS_SENSITIVE_KEYS = {
+    "api_key",
+    "authorization",
+    "dtoken",
+    "holyrics_token",
+    "nonce",
+    "sid",
+    "token",
+}
+
+
+def safe_holyrics_diagnostic_value(value: Any) -> Any:
+    """Copy API diagnostics while removing credentials recursively."""
+    if isinstance(value, dict):
+        return {
+            str(key): (
+                "[скрыто]"
+                if str(key).strip().casefold() in _HOLYRICS_SENSITIVE_KEYS
+                else safe_holyrics_diagnostic_value(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [safe_holyrics_diagnostic_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [safe_holyrics_diagnostic_value(item) for item in value]
+    return value
+
+
+def redact_holyrics_secret(value: Any, secret: str) -> Any:
+    if not secret:
+        return value
+    if isinstance(value, dict):
+        return {key: redact_holyrics_secret(item, secret) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_holyrics_secret(item, secret) for item in value]
+    if isinstance(value, str):
+        return value.replace(secret, "[скрыто]")
+    return value
+
+
+def holyrics_diagnostic_event(args: Any, event: str, payload: dict[str, Any]) -> None:
+    callback = getattr(args, "_holyrics_event_logger", None)
+    if not callable(callback):
+        return
+    try:
+        safe_payload = safe_holyrics_diagnostic_value(payload)
+        safe_payload = redact_holyrics_secret(
+            safe_payload,
+            str(getattr(args, "holyrics_token", "") or ""),
+        )
+        callback(event, safe_payload)
+    except Exception:
+        # Diagnostics must never interrupt slide display.
+        return
+
+
+def safe_holyrics_response_body(body: str) -> Any:
+    if not body:
+        return ""
+    try:
+        return safe_holyrics_diagnostic_value(json.loads(body))
+    except json.JSONDecodeError:
+        return body
+
+
 def holyrics_verse_id(payload: dict) -> tuple[str | None, str]:
     book = str(payload.get("book") or "").strip()
     try:
@@ -632,6 +698,43 @@ def post_holyrics_api(args: Any, base_url: str, endpoint: str, body: dict) -> tu
     base_url = str(base_url).rstrip("/")
     query = urlencode({"token": getattr(args, "holyrics_token", "")})
     url = f"{base_url}/api/{endpoint}?{query}"
+    request_id = f"{time.time_ns():x}"
+    timeout_seconds = float(getattr(args, "holyrics_timeout", DEFAULT_TIMEOUT))
+    started_at = time.monotonic()
+
+    holyrics_diagnostic_event(
+        args,
+        "holyrics_api_request",
+        {
+            "request_id": request_id,
+            "method": "POST",
+            "base_url": base_url,
+            "endpoint": endpoint,
+            "request_body": body,
+            "timeout_seconds": timeout_seconds,
+        },
+    )
+
+    def finish(
+        ok: bool,
+        reason: str,
+        response_body: str,
+        http_status: int | None,
+    ) -> tuple[bool, str, str]:
+        holyrics_diagnostic_event(
+            args,
+            "holyrics_api_response",
+            {
+                "request_id": request_id,
+                "endpoint": endpoint,
+                "ok": ok,
+                "reason": reason,
+                "http_status": http_status,
+                "elapsed_ms": round((time.monotonic() - started_at) * 1000, 1),
+                "response_body": safe_holyrics_response_body(response_body),
+            },
+        )
+        return ok, reason, response_body
 
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")
     req = request.Request(
@@ -641,17 +744,30 @@ def post_holyrics_api(args: Any, base_url: str, endpoint: str, body: dict) -> tu
         method="POST",
     )
     try:
-        with request.urlopen(req, timeout=float(getattr(args, "holyrics_timeout", DEFAULT_TIMEOUT))) as response:
-            body = response.read().decode("utf-8", errors="replace").strip()
+        with request.urlopen(req, timeout=timeout_seconds) as response:
+            response_body = response.read().decode("utf-8", errors="replace").strip()
             if not (200 <= response.status < 300):
-                return False, f"holyrics_http_{response.status}", body
-            ok, reason = parse_holyrics_response(body)
-            return ok, reason, body
+                return finish(False, f"holyrics_http_{response.status}", response_body, response.status)
+            ok, reason = parse_holyrics_response(response_body)
+            return finish(ok, reason, response_body, response.status)
     except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace").strip()
-        return False, f"holyrics_http_{exc.code}", body
+        response_body = exc.read().decode("utf-8", errors="replace").strip()
+        return finish(False, f"holyrics_http_{exc.code}", response_body, exc.code)
     except URLError as exc:
-        return False, f"holyrics_unavailable:{exc.reason}", ""
+        return finish(False, f"holyrics_unavailable:{exc.reason}", "", None)
+    except Exception as exc:
+        holyrics_diagnostic_event(
+            args,
+            "holyrics_api_exception",
+            {
+                "request_id": request_id,
+                "endpoint": endpoint,
+                "exception_type": type(exc).__name__,
+                "error": str(exc),
+                "elapsed_ms": round((time.monotonic() - started_at) * 1000, 1),
+            },
+        )
+        raise
 
 
 def holyrics_quick_minutes(args: Any) -> float:
@@ -764,7 +880,7 @@ def restore_sermon_plan_after_quick_presentation(
 
     diagnostics["show_text_responses"] = []
     diagnostics["presentation_states"] = []
-    cancel_holyrics_restore_timer()
+    cancel_holyrics_restore_timer(args)
     for attempt in range(2):
         ok, reason, body = post_holyrics_api(
             args,
@@ -841,9 +957,15 @@ def restore_holyrics_presentation_later(args: Any, base_url: str, previous: dict
         return
 
     delay_seconds = max(1.0, minutes * 60.0)
+    display_token = object()
+    setattr(args, "_holyrics_temporary_verse_display", display_token)
 
     def restore() -> None:
-        restore_holyrics_presentation(args, base_url, previous)
+        try:
+            restore_holyrics_presentation(args, base_url, previous)
+        finally:
+            if getattr(args, "_holyrics_temporary_verse_display", None) is display_token:
+                setattr(args, "_holyrics_temporary_verse_display", None)
 
     global _TEMPORARY_VERSE_RESTORE_TIMER
     with _TEMPORARY_VERSE_RESTORE_LOCK:
@@ -855,12 +977,19 @@ def restore_holyrics_presentation_later(args: Any, base_url: str, previous: dict
         timer.start()
 
 
-def cancel_holyrics_restore_timer() -> None:
+def cancel_holyrics_restore_timer(args: Any | None = None) -> None:
     global _TEMPORARY_VERSE_RESTORE_TIMER
     with _TEMPORARY_VERSE_RESTORE_LOCK:
         if _TEMPORARY_VERSE_RESTORE_TIMER is not None:
             _TEMPORARY_VERSE_RESTORE_TIMER.cancel()
             _TEMPORARY_VERSE_RESTORE_TIMER = None
+    if args is not None:
+        setattr(args, "_holyrics_temporary_verse_display", None)
+
+
+def temporary_verse_display_active(args: Any) -> bool:
+    """Return whether a normal Bible slide is waiting for its timed restore."""
+    return getattr(args, "_holyrics_temporary_verse_display", None) is not None
 
 
 def show_holyrics_text_slide(
@@ -891,7 +1020,7 @@ def show_holyrics_text_slide(
             presentation["slide_number"] = slide_index + 1
         return ok, reason or "sermon_plan_action_go_to_index"
 
-    cancel_holyrics_restore_timer()
+    cancel_holyrics_restore_timer(args)
     ok, reason, _body = post_holyrics_api(
         args,
         base_url,
@@ -901,6 +1030,71 @@ def show_holyrics_text_slide(
     if ok:
         presentation["slide_number"] = slide_index + 1
     return ok, reason or "sermon_plan_show_text"
+
+
+def sermon_plan_slide_theme_id(slides: list[dict[str, Any]], slide_index: int) -> str:
+    current_slide = slides[slide_index] if 0 <= slide_index < len(slides) else {}
+    current_theme_id = str(current_slide.get("theme_id") or "").strip()
+    if current_theme_id:
+        return current_theme_id
+    return next(
+        (
+            str(slide.get("theme_id") or "").strip()
+            for slide in slides
+            if str(slide.get("theme_id") or "").strip()
+        ),
+        "",
+    )
+
+
+def refresh_sermon_plan_restore_snapshot(
+    args: Any,
+    base_url: str,
+    presentation: dict[str, Any],
+) -> dict[str, Any]:
+    """Capture the actual active plan slide immediately before Bible display."""
+    snapshot = dict(presentation)
+    current = get_holyrics_current_presentation(args, base_url, include_slides=True)
+    current_type = str((current or {}).get("type") or "").strip()
+    current_text_id = str(
+        (current or {}).get("text_id") or (current or {}).get("id") or ""
+    ).strip()
+    presentation_text_id = str(
+        presentation.get("text_id") or presentation.get("id") or ""
+    ).strip()
+    if current_type != "text" or current_text_id != presentation_text_id:
+        return snapshot
+
+    snapshot.update(current)
+    try:
+        slide_number = max(1, int(current.get("slide_number") or 1))
+    except (TypeError, ValueError):
+        slide_number = 1
+    slide_index = slide_number - 1
+    slides = list(current.get("slides") or presentation.get("slides") or [])
+    snapshot["slide_number"] = slide_number
+    snapshot["current_index"] = slide_index
+    snapshot["slides"] = slides
+
+    presentation["slide_number"] = slide_number
+    presentation["current_index"] = slide_index
+    presentation["next_index"] = slide_index + 1
+    if slides:
+        presentation["slides"] = slides
+
+    theme_id = sermon_plan_slide_theme_id(slides, slide_index)
+    setattr(args, "_holyrics_sermon_plan_theme_id", theme_id)
+    holyrics_diagnostic_event(
+        args,
+        "sermon_plan_restore_snapshot",
+        {
+            "text_id": current_text_id,
+            "slide_number": slide_number,
+            "initial_index": slide_index,
+            "theme_id": theme_id,
+        },
+    )
+    return snapshot
 
 
 def build_holyrics_sermon_plan_presentation(args: Any, active: dict[str, Any]) -> dict[str, Any] | None:
@@ -921,17 +1115,7 @@ def build_holyrics_sermon_plan_presentation(args: Any, active: dict[str, Any]) -
         "speech_parts": [],
     }
     current_slide_index = max(0, int(active.get("slide_number") or 1) - 1)
-    current_slide = slides[current_slide_index] if current_slide_index < len(slides) else {}
-    sermon_plan_theme_id = str(current_slide.get("theme_id") or "").strip()
-    if not sermon_plan_theme_id:
-        sermon_plan_theme_id = next(
-            (
-                str(slide.get("theme_id") or "").strip()
-                for slide in slides
-                if str(slide.get("theme_id") or "").strip()
-            ),
-            "",
-        )
+    sermon_plan_theme_id = sermon_plan_slide_theme_id(slides, current_slide_index)
     setattr(args, "_holyrics_sermon_plan_theme_id", sermon_plan_theme_id)
     setattr(args, "_holyrics_sermon_plan_presentation", sermon_plan)
     return sermon_plan
@@ -1443,7 +1627,13 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
     selected_scripture_range = scripture_range(payload)
     if selected_scripture_range:
         restore_presentation = getattr(args, "_holyrics_sermon_plan_presentation", None)
-        if not isinstance(restore_presentation, dict):
+        if isinstance(restore_presentation, dict):
+            restore_presentation = refresh_sermon_plan_restore_snapshot(
+                args,
+                base_url,
+                restore_presentation,
+            )
+        else:
             current_presentation = get_holyrics_current_presentation(args, base_url)
             if str((current_presentation or {}).get("type") or "").strip() == "text":
                 restore_presentation = dict(current_presentation)
@@ -1476,10 +1666,15 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
 
     sermon_plan_presentation = ensure_holyrics_sermon_plan_presentation(args, base_url)
     if isinstance(sermon_plan_presentation, dict):
+        restore_presentation = refresh_sermon_plan_restore_snapshot(
+            args,
+            base_url,
+            sermon_plan_presentation,
+        )
         quick_body = slide_payload_to_holyrics_body(args, payload)
         if not str((quick_body.get("slides") or [{}])[0].get("text") or "").strip():
             return False, "holyrics_quick_presentation_empty"
-        cancel_holyrics_restore_timer()
+        cancel_holyrics_restore_timer(args)
         show_ok, show_reason, show_body = post_holyrics_api(
             args,
             base_url,
@@ -1492,7 +1687,12 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
         clear_scripture_range_reading(args)
         quick_minutes = holyrics_quick_minutes(args)
         if quick_minutes > 0:
-            restore_holyrics_presentation_later(args, base_url, sermon_plan_presentation, quick_minutes)
+            restore_holyrics_presentation_later(
+                args,
+                base_url,
+                restore_presentation,
+                quick_minutes,
+            )
         return True, f"show_quick_presentation:sermon_verse;temporary_verse:{quick_minutes:g}min"
 
     verse_id, reason = holyrics_verse_id(payload)

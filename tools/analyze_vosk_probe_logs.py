@@ -37,6 +37,10 @@ TRAINING_EXCLUDED_CASES = {
     ("20260710_172600_060527", "trigger_0005"): "old_colossians_grammar_confused_as_ephesians",
     ("20260710_172600_060527", "trigger_0006"): "old_colossians_grammar_confused_as_ephesians",
     ("20260710_193656_496511", "trigger_0012"): "old_colossians_grammar_confused_as_ephesians",
+    ("20260825_133014_033320", "trigger_0002"): "fixed_active_range_stale_book_context",
+    ("20260831_124818_969652", "trigger_0002"): "fixed_split_reference_stale_book_context",
+    ("20260831_124818_969652", "trigger_0006"): "fixed_james_i_okolo_asr_alias",
+    ("20260902_154834_285558", "trigger_0008"): "fixed_nehemiah_stale_ezra_context",
 }
 TRAINING_REASON_COLUMNS = (
     "contains_unk",
@@ -134,9 +138,11 @@ def trigger_case_paths(log_dir: Path) -> list[Path]:
     return sorted(log_dir.glob("*/trigger_cases.jsonl"), key=lambda path: path.parent.name)
 
 
-def reviewed_trigger_cases(log_dir: Path) -> list[tuple[Path, dict]]:
+def reviewed_trigger_cases(log_dir: Path, *, asr_engine: str = "") -> list[tuple[Path, dict]]:
     cases_by_signature: dict[tuple[str, str, str, str, str], tuple[Path, dict]] = {}
     for cases_path in trigger_case_paths(log_dir):
+        if asr_engine and str(session_metadata(cases_path).get("asr_engine") or "") != asr_engine:
+            continue
         for case in load_jsonl(cases_path):
             if is_unreviewed(case):
                 continue
@@ -317,10 +323,10 @@ def training_exclusion_reason(cases_path: Path, case: dict) -> str | None:
     return TRAINING_EXCLUDED_CASES.get((cases_path.parent.name, str(case.get("case_id") or "")))
 
 
-def export_training_data(log_dir: Path, output_path: Path) -> dict:
+def export_training_data(log_dir: Path, output_path: Path, *, asr_engine: str = "") -> dict:
     rows = []
     excluded: list[dict[str, str]] = []
-    for cases_path, case in reviewed_trigger_cases(log_dir):
+    for cases_path, case in reviewed_trigger_cases(log_dir, asr_engine=asr_engine):
         if not str(case.get("review_category") or ""):
             continue
         exclusion_reason = training_exclusion_reason(cases_path, case)
@@ -704,6 +710,11 @@ def main() -> int:
         help="Write reviewed trigger cases as CSV for ML experiments.",
     )
     parser.add_argument(
+        "--asr-engine",
+        default="",
+        help="For training export, include only sessions from this ASR engine, for example sherpa-0.54.",
+    )
+    parser.add_argument(
         "--train-risk-model",
         type=Path,
         help="Train a simple stdlib Naive Bayes risk model from training CSV.",
@@ -723,7 +734,11 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.export_training_data:
-        export = export_training_data(args.log_dir, args.export_training_data)
+        export = export_training_data(
+            args.log_dir,
+            args.export_training_data,
+            asr_engine=args.asr_engine,
+        )
         print(f"Обучающий CSV: {export['output']}")
         print(f"Строк: {export['rows']}  столбцов: {export['columns']}")
         if export["excluded"]:

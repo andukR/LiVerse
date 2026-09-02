@@ -88,6 +88,7 @@ from tools.holyrics import (
     scripture_range,
     scripture_range_reading_active,
     sync_scripture_range_reading,
+    temporary_verse_display_active,
     post_holyrics_update,
     format_missing_holyrics_permissions,
     required_holyrics_permissions,
@@ -377,6 +378,7 @@ class JsonlLogger:
         self.enabled = enabled
         self.run_dir: Path | None = None
         self.events_path: Path | None = None
+        self._write_lock = threading.Lock()
         if not enabled:
             return
         self.run_dir = log_dir / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -391,8 +393,9 @@ class JsonlLogger:
             "event": event,
             **payload,
         }
-        with self.events_path.open("a", encoding="utf-8") as file:
-            file.write(json.dumps(row, ensure_ascii=False) + "\n")
+        with self._write_lock:
+            with self.events_path.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     def write_session(self, payload: dict) -> None:
         if not self.enabled or self.run_dir is None:
@@ -416,6 +419,27 @@ class JsonlLogger:
 
 def holyrics_output_enabled(args: argparse.Namespace) -> bool:
     return args.slide_output in {"holyrics", "both"}
+
+
+def safe_command_argv(argv: list[str]) -> list[str]:
+    """Remove access tokens from the engine command stored in diagnostics."""
+    safe: list[str] = []
+    hide_next = False
+    for item in argv:
+        if hide_next:
+            safe.append("[скрыто]")
+            hide_next = False
+            continue
+        option, separator, _value = str(item).partition("=")
+        if option in {"--holyrics-token", "--token"}:
+            if separator:
+                safe.append(f"{option}=[скрыто]")
+            else:
+                safe.append(option)
+                hide_next = True
+            continue
+        safe.append(str(item))
+    return safe
 
 
 def run_holyrics_first_setup(args: argparse.Namespace) -> None:
@@ -1534,6 +1558,14 @@ def address_recognition_allowed(address_detection_enabled: bool, long_passage_re
     return bool(address_detection_enabled and not long_passage_reading)
 
 
+def citation_recognition_paused(args: Any, long_passage_reading: bool) -> bool:
+    """Pause new matches while a timed verse is visible, except for long-range paging."""
+    return bool(
+        temporary_verse_display_active(args)
+        and not long_passage_reading
+    )
+
+
 def audio_level_percent(peak: int) -> int:
     """Map a 16-bit audio peak to a useful zero-to-100 microphone indicator."""
     if peak <= 0:
@@ -2223,9 +2255,17 @@ def run_microphone(args: argparse.Namespace) -> int:
         else build_grammar()
     )
     logger = JsonlLogger(Path(args.log_dir), enabled=not args.no_log)
+    setattr(args, "_holyrics_event_logger", logger.write)
+    command_argv = safe_command_argv(list(sys.argv))
     logger.write_session(
         {
-            "command": " ".join(sys.argv),
+            "liverse_version": __version__,
+            "command": " ".join(command_argv),
+            "command_argv": command_argv,
+            "engine_executable": sys.executable,
+            "packaged": bool(getattr(sys, "frozen", False)),
+            "python_version": sys.version.split()[0],
+            "process_id": os.getpid(),
             "asr_engine": args.asr_engine,
             "model": str(
                 args.sherpa_model if args.asr_engine == "sherpa-0.54" else args.model
@@ -2301,6 +2341,16 @@ def run_microphone(args: argparse.Namespace) -> int:
                     "text_id": active.get("text_id") or active.get("id"),
                     "slides": nonempty_slide_count,
                     "current_slide": active.get("slide_number"),
+                    "selected_theme_id": getattr(
+                        args, "_holyrics_sermon_plan_theme_id", ""
+                    ),
+                    "slide_theme_ids": [
+                        {
+                            "slide_number": index + 1,
+                            "theme_id": str(slide.get("theme_id") or ""),
+                        }
+                        for index, slide in enumerate(slides)
+                    ],
                 },
             )
             print(
@@ -2584,6 +2634,23 @@ def run_microphone(args: argparse.Namespace) -> int:
                                     if text_detector is not None:
                                         text_detector.clear()
                             long_passage_reading = scripture_range_reading_active(args)
+                            if citation_recognition_paused(args, long_passage_reading):
+                                pipeline.text_buffer.clear()
+                                if text_detector is not None:
+                                    text_detector.clear()
+                                if sermon_plan is not None:
+                                    sermon_plan["speech_parts"] = []
+                                logger.write(
+                                    "TEMPORARY_VERSE_READING",
+                                    {
+                                        "vosk_text": text,
+                                        "action": "recognition_paused",
+                                    },
+                                )
+                                console.status(
+                                    "показываю стих; поиск новых ссылок приостановлен"
+                                )
+                                continue
                             if address_recognition_allowed(
                                 address_detection_enabled,
                                 long_passage_reading,
@@ -3130,9 +3197,17 @@ def main() -> int:
     if args.text:
         grammar = None if args.open_vocabulary else build_grammar()
         logger = JsonlLogger(Path(args.log_dir), enabled=not args.no_log)
+        setattr(args, "_holyrics_event_logger", logger.write)
+        command_argv = safe_command_argv(list(sys.argv))
         logger.write_session(
             {
-                "command": " ".join(sys.argv),
+                "liverse_version": __version__,
+                "command": " ".join(command_argv),
+                "command_argv": command_argv,
+                "engine_executable": sys.executable,
+                "packaged": bool(getattr(sys, "frozen", False)),
+                "python_version": sys.version.split()[0],
+                "process_id": os.getpid(),
                 "mode": "text",
                 "asr_engine": args.asr_engine,
                 "model": str(

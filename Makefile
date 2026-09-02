@@ -12,7 +12,7 @@ PY := $(BIN_DIR)/python
 PIP := $(BIN_DIR)/pip
 endif
 
-.PHONY: install test windows-vm-test windows-vm-engine windows-vm-installer windows-release liverse gui analyze slides sword-russinodal check-sword-russinodal clean
+.PHONY: install test windows-vm-test windows-vm-engine windows-vm-installer windows-vm-inspect-holyrics windows-vm-recover-holyrics windows-release liverse gui analyze slides sword-russinodal check-sword-russinodal clean
 
 install:
 	$(PYTHON) -m venv $(VENV)
@@ -35,6 +35,12 @@ windows-vm-engine: test
 
 windows-vm-installer: test
 	./tools/sync_windows_build.sh --build-installer
+
+windows-vm-recover-holyrics:
+	./tools/recover_holyrics_vm.sh
+
+windows-vm-inspect-holyrics:
+	./tools/inspect_holyrics_vm.sh $(ARGS)
 
 windows-release:
 	@if [ -z "$(VERSION)" ]; then echo 'Укажите VERSION, например: make windows-release VERSION=1.2.0' >&2; exit 2; fi

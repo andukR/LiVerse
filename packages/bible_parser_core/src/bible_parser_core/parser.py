@@ -804,6 +804,8 @@ def book_candidates(normalized: str) -> list[BookCandidate]:
             # «Быт», но сами по себе не должны означать книгу Бытие.
             if candidate_text in {"бы", "быть"}:
                 continue
+            if candidate_text in {"фи", "послание фи"}:
+                continue
             if re.search(r"\b\d+\b", candidate_text):
                 trailing_context_number = re.search(r"\D\s+\d+\b", candidate_text)
                 if trailing_context_number:
@@ -1623,13 +1625,24 @@ def parse_live_reference(text: str, bible_path: Path = DEFAULT_BIBLE) -> ParsedR
                 best = (score, book_candidate, ref_candidate)
 
     if best is None:
+        selected_book_candidate = books[0]
         book, confidence = books[0].book, books[0].score
         chapter, verses = infer_chapter_and_verses(normalized, book, bible)
         ref_candidate = None
     else:
         _score, book_candidate, ref_candidate = best
+        selected_book_candidate = book_candidate
         book, confidence = book_candidate.book, book_candidate.score
         chapter, verses = ref_candidate.chapter, ref_candidate.verses
+
+    if book in ONE_CHAPTER_BOOKS:
+        for chapter_match in re.finditer(r"\b(\d+)\s+глава\b", normalized):
+            if (
+                int(chapter_match.group(1)) != 1
+                and chapter_match.start() >= selected_book_candidate.end
+                and (ref_candidate is None or chapter_match.start() <= ref_candidate.start)
+            ):
+                return None
 
     if not chapter or not verses:
         return None
