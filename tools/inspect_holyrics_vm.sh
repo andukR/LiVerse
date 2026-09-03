@@ -5,7 +5,8 @@ usage() {
   cat <<'EOF'
 Usage:
   tools/inspect_holyrics_vm.sh [--vm NAME] [--user WINDOWS_USER]
-      [--show-test id|name|name-background|close]
+      [--show-test id|name|name-background|verse-quick|close]
+      [--restore-text-id ID] [--restore-index INDEX]
 
 Reads the current Holyrics presentation, theme and background through the
 local API inside a Windows VM. The API token is never printed.
@@ -13,12 +14,17 @@ local API inside a Windows VM. The API token is never printed.
 With --show-test, sends one temporary John 3:16 slide using the current theme
 by id, by name, or by name plus the current background. This changes only the
 Holyrics public screen.
+
+With --restore-text-id, opens the specified Text presentation at the requested
+zero-based slide index. The default index is 0.
 EOF
 }
 
 vm_name="win10"
 windows_user="kriwoscheev"
 show_test=""
+restore_text_id=""
+restore_index=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -33,12 +39,28 @@ while [[ $# -gt 0 ]]; do
     --show-test)
       show_test=${2:?missing mode for --show-test}
       case "$show_test" in
-        id|name|name-background|close) ;;
+        id|name|name-background|verse-quick|close) ;;
         *)
           printf 'Unknown --show-test mode: %s\n' "$show_test" >&2
           exit 2
           ;;
       esac
+      shift 2
+      ;;
+    --restore-text-id)
+      restore_text_id=${2:?missing value for --restore-text-id}
+      if [[ ! "$restore_text_id" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        printf 'Invalid --restore-text-id value: %s\n' "$restore_text_id" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --restore-index)
+      restore_index=${2:?missing value for --restore-index}
+      if [[ ! "$restore_index" =~ ^[0-9]+$ ]]; then
+        printf 'Invalid --restore-index value: %s\n' "$restore_index" >&2
+        exit 2
+      fi
       shift 2
       ;;
     -h|--help)
@@ -92,6 +114,16 @@ function Invoke-Holy([string]\$endpoint, [hashtable]\$body) {
   } catch {
     [pscustomobject]@{ endpoint = \$endpoint; error = \$_.Exception.Message }
   }
+}
+if ('${restore_text_id}') {
+  @((Invoke-Holy 'ShowText' @{ id = '${restore_text_id}'; initial_index = ${restore_index} })) |
+    ConvertTo-Json -Depth 20 -Compress
+  exit
+}
+if ('${show_test}' -eq 'verse-quick') {
+  @((Invoke-Holy 'ShowVerse' @{ id = '43003016'; quick_presentation = \$true })) |
+    ConvertTo-Json -Depth 20 -Compress
+  exit
 }
 if ('${show_test}' -eq 'close') {
   @((Invoke-Holy 'CloseCurrentQuickPresentation' @{})) |

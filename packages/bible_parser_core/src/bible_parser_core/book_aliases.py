@@ -29,6 +29,7 @@ books_data = [
             "не михея",
             "ниемии",
             "книга ниемии",
+            "книга пророка ниеми",
             "немии",
             "немия",
             "книга немии",
@@ -298,45 +299,3 @@ book_lookup = {}
 for std, variants in book_synonyms.items():
     for v in variants:
         book_lookup[v] = std
-
-
-# Prefer the newer shared dictionary when this project is used from the
-# current multi-project workspace. Keep the local definitions above as a
-# fallback so old standalone copies of this project still run.
-try:
-    import importlib.util
-    from pathlib import Path
-
-    def find_canonical_synonyms_path() -> Path | None:
-        current = Path(__file__).resolve()
-        for parent in current.parents:
-            candidates = (
-                parent / "verses_from_searmon" / "synonyms_canonical_titles.py",
-                parent.parent / "verses_from_searmon" / "synonyms_canonical_titles.py",
-            )
-            for candidate in candidates:
-                if candidate.exists():
-                    return candidate
-        return None
-
-    canonical_path = find_canonical_synonyms_path()
-    if canonical_path and canonical_path.exists():
-        spec = importlib.util.spec_from_file_location("synonyms_canonical_titles", canonical_path)
-        if spec and spec.loader:
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            canonical_synonyms = module.book_synonyms
-            canonical_lookup = module.book_lookup
-            for canonical, variants in canonical_synonyms.items():
-                if canonical not in book_synonyms:
-                    book_synonyms[canonical] = []
-                for variant in variants:
-                    if variant not in book_synonyms[canonical]:
-                        book_synonyms[canonical].append(variant)
-            book_lookup.update(canonical_lookup)
-            books_data = [
-                (canonical, [variant for variant in variants if variant != canonical.lower()])
-                for canonical, variants in book_synonyms.items()
-            ]
-except Exception:
-    pass
