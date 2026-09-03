@@ -949,7 +949,10 @@ def restore_holyrics_presentation(args: Any, base_url: str, previous: dict[str, 
     if not previous:
         return
 
-    holyrics_log(f"восстановление презентации типа {presentation_type or '(empty)'} пока не поддержано")
+    holyrics_log(
+        f"предыдущая презентация типа {presentation_type or '(empty)'} не восстановлена намеренно; "
+        "это штатное поведение"
+    )
 
 
 def restore_holyrics_presentation_later(args: Any, base_url: str, previous: dict[str, Any] | None, minutes: float) -> None:
