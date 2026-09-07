@@ -75,9 +75,14 @@ DETECTION_LABELS = {
     "address_only": "Только произнесённые адреса",
     "text_only": "Только поиск стихов по тексту",
 }
+LONG_RANGE_SLIDE_LABELS = {
+    "compact": "Компактнее",
+    "one_verse": "По одному стиху",
+}
 RUN_MODE_VALUES = {label: value for value, label in RUN_MODE_LABELS.items()}
 APPROVAL_VALUES = {label: value for value, label in APPROVAL_LABELS.items()}
 DETECTION_VALUES = {label: value for value, label in DETECTION_LABELS.items()}
+LONG_RANGE_SLIDE_VALUES = {label: value for value, label in LONG_RANGE_SLIDE_LABELS.items()}
 INSTANCE_PORT = 45871
 BRAND_BLUE = "#0B5EA8"
 BRAND_BLUE_ACTIVE = "#084A84"
@@ -244,6 +249,7 @@ class GuiConfig:
     holyrics_token: str = ""
     holyrics_port: int = DEFAULT_PORT
     quick_seconds: float = 5.0
+    long_range_slide_mode: str = "compact"
     open_operator_qr: bool = True
     auto_hide: bool = True
     text_detection_db: Path = DEFAULT_TEXT_DETECTION_DB
@@ -329,6 +335,11 @@ def load_gui_config() -> GuiConfig:
         DETECTION_LABELS,
         "hybrid_confirm",
     )
+    long_range_slide_mode = _valid_choice(
+        str(settings.get("long_range_slide_mode") or ""),
+        LONG_RANGE_SLIDE_LABELS,
+        "compact",
+    )
     try:
         quick_seconds = max(0.0, float(settings.get("holyrics_quick_minutes") or 0.0) * 60.0)
     except (TypeError, ValueError):
@@ -357,6 +368,7 @@ def load_gui_config() -> GuiConfig:
         holyrics_token=env_setting("HOLYRICS_TOKEN"),
         holyrics_port=port,
         quick_seconds=quick_seconds,
+        long_range_slide_mode=long_range_slide_mode,
         open_operator_qr=bool(settings.get("open_operator_qr", True)),
         auto_hide=bool(settings.get("gui_auto_hide", True)),
         text_detection_db=Path(
@@ -379,6 +391,7 @@ def save_gui_config(config: GuiConfig) -> None:
         gui_auto_hide=config.auto_hide,
         holyrics_theme=str(previous.get("holyrics_theme") or ""),
         holyrics_quick_minutes=config.quick_seconds / 60.0,
+        long_range_slide_mode=config.long_range_slide_mode,
     )
     save_startup_settings(args)
 
@@ -412,6 +425,8 @@ def engine_command(
         f"http://localhost:{config.holyrics_port}",
         "--holyrics-quick-minutes",
         f"{config.quick_seconds / 60.0:g}",
+        "--long-range-slide-mode",
+        config.long_range_slide_mode,
         "--text-detection-db",
         str(config.text_detection_db),
         "--print-log-path",
@@ -530,6 +545,9 @@ class LiVerseGui:
         self.microphone_var = tk.StringVar(value=self.config.audio_device_name or "Автоматический выбор")
         self.detection_var = tk.StringVar(value=DETECTION_LABELS[self.config.citation_detection_mode])
         self.quick_seconds_var = tk.StringVar(value=f"{self.config.quick_seconds:g}")
+        self.long_range_slide_var = tk.StringVar(
+            value=LONG_RANGE_SLIDE_LABELS[self.config.long_range_slide_mode]
+        )
         self.token_var = tk.StringVar(value=self.config.holyrics_token)
         self.port_var = tk.StringVar(value=str(self.config.holyrics_port))
         self.auto_hide_var = tk.BooleanVar(value=self.config.auto_hide)
@@ -711,6 +729,17 @@ class LiVerseGui:
         ttk.Entry(self.settings_tab, textvariable=self.quick_seconds_var, width=12).grid(
             row=row, column=1, sticky="w", pady=7
         )
+        row += 1
+        add_combo(
+            "Длинные отрывки",
+            self.long_range_slide_var,
+            list(LONG_RANGE_SLIDE_LABELS.values()),
+        )
+        ttk.Label(
+            self.settings_tab,
+            text="Настройка действует только на диапазоны из нескольких стихов.",
+            wraplength=430,
+        ).grid(row=row, column=1, sticky="w", pady=(0, 7))
         row += 1
 
         ttk.Separator(self.settings_tab).grid(row=row, column=0, columnspan=2, sticky="ew", pady=12)
@@ -1015,6 +1044,10 @@ class LiVerseGui:
             holyrics_token=self.token_var.get().strip(),
             holyrics_port=port,
             quick_seconds=quick_seconds,
+            long_range_slide_mode=LONG_RANGE_SLIDE_VALUES.get(
+                self.long_range_slide_var.get(),
+                "compact",
+            ),
             open_operator_qr=bool(self.open_qr_var.get()),
             auto_hide=bool(self.auto_hide_var.get()),
             text_detection_db=self.config.text_detection_db,

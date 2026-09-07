@@ -320,6 +320,8 @@ def training_row(cases_path: Path, case: dict) -> dict:
 
 
 def training_exclusion_reason(cases_path: Path, case: dict) -> str | None:
+    if str(case.get("review_category") or "") == "excluded_cascade":
+        return "cascade_after_primary_error"
     return TRAINING_EXCLUDED_CASES.get((cases_path.parent.name, str(case.get("case_id") or "")))
 
 

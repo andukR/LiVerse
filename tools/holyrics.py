@@ -777,6 +777,13 @@ def holyrics_quick_minutes(args: Any) -> float:
         return 0.0
 
 
+def holyrics_long_range_slide_max_verses(args: Any, default: int) -> int:
+    """Return the configured verse limit for a long Bible range slide."""
+    if str(getattr(args, "long_range_slide_mode", "compact") or "compact") == "one_verse":
+        return 1
+    return max(1, int(default))
+
+
 def get_holyrics_current_presentation(
     args: Any,
     base_url: str,
@@ -1394,7 +1401,13 @@ def current_bible_theme_filter(args: Any, base_url: str) -> dict[str, str]:
 
 
 def cross_chapter_quick_presentation_body(args: Any, base_url: str, payload: dict) -> dict | None:
-    slides = cross_chapter_quick_presentation_slides(payload)
+    slides = cross_chapter_quick_presentation_slides(
+        payload,
+        max_verses=holyrics_long_range_slide_max_verses(
+            args,
+            DEFAULT_CROSS_CHAPTER_SLIDE_MAX_VERSES,
+        ),
+    )
     if not slides:
         return None
     body: dict[str, Any] = {"slides": slides}
@@ -1405,7 +1418,13 @@ def cross_chapter_quick_presentation_body(args: Any, base_url: str, payload: dic
 
 
 def scripture_range_quick_presentation_body(args: Any, base_url: str, payload: dict) -> dict | None:
-    slides = scripture_range_quick_presentation_slides(payload)
+    slides = scripture_range_quick_presentation_slides(
+        payload,
+        max_verses=holyrics_long_range_slide_max_verses(
+            args,
+            DEFAULT_LONG_RANGE_SLIDE_MAX_VERSES,
+        ),
+    )
     if not slides:
         return None
     body: dict[str, Any] = {"slides": slides}

@@ -25,6 +25,8 @@ from urllib.parse import quote
 
 _POPUP_APPROVAL_LOCK = threading.Lock()
 _POPUP_APPROVAL_REVISION = 0
+_POPUP_TK_ROOT = None
+_POPUP_TK_THREAD_ID: int | None = None
 
 
 class GracefulStopRequested(Exception):
@@ -79,6 +81,7 @@ from tools.holyrics import (
     control_holyrics_presentation,
     default_holyrics_url,
     describe_holyrics_target,
+    ensure_holyrics_sermon_plan_presentation,
     env_setting,
     get_holyrics_current_presentation,
     get_holyrics_theme_options,
@@ -255,6 +258,7 @@ def save_startup_settings(args: argparse.Namespace) -> None:
         "gui_auto_hide": bool(getattr(args, "gui_auto_hide", True)),
         "holyrics_theme": str(getattr(args, "holyrics_theme", "") or ""),
         "holyrics_quick_minutes": float(getattr(args, "holyrics_quick_minutes", 0.0) or 0.0),
+        "long_range_slide_mode": str(getattr(args, "long_range_slide_mode", "compact") or "compact"),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -892,6 +896,73 @@ def session_summary_dimensions(screen_width: int, screen_height: int) -> tuple[i
     )
 
 
+def popup_tk_window(tk, title: str):
+    """Reuse the engine's one visible Tk popup window.
+
+    Tk must be created and destroyed by the same thread.  In particular, do
+    not create a new ``tk.Tk`` interpreter for each detected citation: on
+    Windows that can terminate Tcl with ``Tcl_AsyncDelete`` during a burst of
+    approval popups. Reusing the root itself also avoids leaving a half-drawn
+    child window behind on Linux after a decision.
+    """
+    global _POPUP_TK_ROOT, _POPUP_TK_THREAD_ID
+
+    current_thread_id = threading.get_ident()
+    if _POPUP_TK_ROOT is None:
+        root = tk.Tk()
+        root.withdraw()
+        _POPUP_TK_ROOT = root
+        _POPUP_TK_THREAD_ID = current_thread_id
+    elif _POPUP_TK_THREAD_ID != current_thread_id:
+        raise RuntimeError("popup_tk_wrong_thread")
+
+    root = _POPUP_TK_ROOT
+    for child in root.winfo_children():
+        child.destroy()
+    for sequence in (
+        "<Return>",
+        "<Escape>",
+        "<space>",
+        "<Tab>",
+        "<KP_0>",
+        "<KP_Insert>",
+        "w",
+        "W",
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+    ):
+        root.unbind(sequence)
+    root.title(title)
+    root.deiconify()
+    return root
+
+
+def close_popup_tk_root() -> None:
+    """Release the one Tk interpreter from the same recognition thread."""
+    global _POPUP_TK_ROOT, _POPUP_TK_THREAD_ID
+
+    root = _POPUP_TK_ROOT
+    if root is None:
+        return
+    if _POPUP_TK_THREAD_ID != threading.get_ident():
+        return
+    try:
+        root.destroy()
+    except Exception:
+        pass
+    finally:
+        _POPUP_TK_ROOT = None
+        _POPUP_TK_THREAD_ID = None
+
+
 def show_session_summary_popup(records: list[dict]) -> None:
     try:
         import tkinter as tk
@@ -906,8 +977,7 @@ def show_session_summary_popup(records: list[dict]) -> None:
     text = session_references_text(records)
     whatsapp_url = f"https://wa.me/?text={quote(text)}" if text else ""
 
-    root = tk.Tk()
-    root.title("LiVerse — итоги сеанса")
+    root = popup_tk_window(tk, "LiVerse — итоги сеанса")
     root.attributes("-topmost", True)
     root.configure(bg="#101820")
     root.resizable(True, True)
@@ -958,6 +1028,11 @@ def show_session_summary_popup(records: list[dict]) -> None:
     buttons.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 18))
     buttons.grid_columnconfigure(0, weight=1, uniform="summary-buttons")
     buttons.grid_columnconfigure(1, weight=1, uniform="summary-buttons")
+    closed = tk.BooleanVar(master=root, value=False)
+
+    def close() -> None:
+        root.withdraw()
+        closed.set(True)
 
     def share_whatsapp() -> None:
         if whatsapp_url:
@@ -979,10 +1054,10 @@ def show_session_summary_popup(records: list[dict]) -> None:
         wraplength=max(180, (width - 80) // 2),
         state="normal" if whatsapp_url else "disabled",
     )
-    close = tk.Button(
+    close_button = tk.Button(
         buttons,
         text="Закрыть",
-        command=root.destroy,
+        command=close,
         bg="#334155",
         fg="white",
         activebackground="#475569",
@@ -993,12 +1068,13 @@ def show_session_summary_popup(records: list[dict]) -> None:
         pady=10,
     )
     share.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-    close.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+    close_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
-    root.bind("<Escape>", lambda _event: root.destroy())
+    root.bind("<Escape>", lambda _event: close())
+    root.protocol("WM_DELETE_WINDOW", close)
     root.after(100, root.focus_force)
     root.after(150, root.lift)
-    root.mainloop()
+    root.wait_variable(closed)
 
 
 def read_single_key() -> str:
@@ -1340,6 +1416,10 @@ def apply_saved_startup_settings(args: argparse.Namespace, settings: dict) -> No
             args.holyrics_quick_minutes = float(settings.get("holyrics_quick_minutes") or 0.0)
         except (TypeError, ValueError):
             args.holyrics_quick_minutes = 0.0
+    if not setting_was_explicit("--long-range-slide-mode"):
+        slide_mode = str(settings.get("long_range_slide_mode") or "").strip()
+        if slide_mode in {"compact", "one_verse"}:
+            args.long_range_slide_mode = slide_mode
 
 
 def configure_interactive_approval_mode(args: argparse.Namespace) -> None:
@@ -1659,8 +1739,7 @@ def popup_approval_decision(slide: dict) -> str:
 
     decision = {"action": "skip"}
     approval_revision = popup_approval_revision()
-    root = tk.Tk()
-    root.title("LiVerse")
+    root = popup_tk_window(tk, "LiVerse")
     root.attributes("-topmost", True)
     root.configure(bg="#101820")
     root.resizable(True, True)
@@ -1668,6 +1747,7 @@ def popup_approval_decision(slide: dict) -> str:
     alternatives = [item for item in slide.get("alternatives") or [] if isinstance(item, dict)]
     has_context_button = bool(slide.get("can_set_context"))
     is_sermon_plan = slide.get("source") == "sermon_plan"
+    wrong_reference_key = "Tab" if os.name == "nt" else "W"
     screen_width = int(root.winfo_screenwidth())
     screen_height = int(root.winfo_screenheight())
     row_count = 1 + len(alternatives) + int(has_context_button) + (1 if is_sermon_plan else 3)
@@ -1697,7 +1777,11 @@ def popup_approval_decision(slide: dict) -> str:
             else (
                 "Enter — показать    1/2/... — другой вариант"
                 + ("    0 — запомнить отрывок" if has_context_button else "")
-                + "\nSpace — это не цитата    Tab — ссылка неверна    Esc — пропустить"
+                + (
+                    "\nSpace — это не цитата    "
+                    f"{wrong_reference_key} — LiVerse неверно распознал цитату    "
+                    "Esc — пропустить"
+                )
             )
         ),
         bg="#101820",
@@ -1709,17 +1793,27 @@ def popup_approval_decision(slide: dict) -> str:
 
     buttons = tk.Frame(root, bg="#101820")
     buttons.pack(fill="both", expand=True, padx=30, pady=(0, 20))
+    closed = tk.BooleanVar(master=root, value=False)
+    close_if_superseded_job = None
 
     def close(action: str) -> None:
+        nonlocal close_if_superseded_job
+        if bool(closed.get()):
+            return
         decision["action"] = action
-        root.destroy()
+        if close_if_superseded_job is not None:
+            root.after_cancel(close_if_superseded_job)
+            close_if_superseded_job = None
+        root.withdraw()
+        closed.set(True)
 
     def close_if_superseded() -> None:
+        nonlocal close_if_superseded_job
         if popup_approval_revision() != approval_revision:
             close("skip")
             return
         if root.winfo_exists():
-            root.after(100, close_if_superseded)
+            close_if_superseded_job = root.after(100, close_if_superseded)
 
     approve = tk.Button(
         buttons,
@@ -1784,7 +1878,7 @@ def popup_approval_decision(slide: dict) -> str:
         ).pack(fill="x", pady=(0, 7))
         tk.Button(
             buttons,
-            text="Tab — цитата есть, но ссылка неверна",
+            text=f"{wrong_reference_key} — LiVerse неверно распознал цитату",
             command=lambda: close("wrong_reference"),
             bg="#a45d13",
             fg="white",
@@ -1819,16 +1913,17 @@ def popup_approval_decision(slide: dict) -> str:
         root.bind(str(index), lambda _event, choice=index - 1: close(f"alternative:{choice}"))
     if not is_sermon_plan:
         root.bind("<space>", lambda _event: close("not_citation"))
-        root.bind(
-            "<Tab>",
-            lambda _event: (close("wrong_reference"), "break")[1],
-        )
+        if os.name == "nt":
+            root.bind("<Tab>", lambda _event: (close("wrong_reference"), "break")[1])
+        else:
+            root.bind("w", lambda _event: close("wrong_reference"))
+            root.bind("W", lambda _event: close("wrong_reference"))
     root.bind("<Escape>", lambda _event: close("skip"))
     root.protocol("WM_DELETE_WINDOW", lambda: close("skip"))
-    root.after(100, close_if_superseded)
+    close_if_superseded_job = root.after(100, close_if_superseded)
     root.after(100, root.focus_force)
     root.after(150, root.lift)
-    root.mainloop()
+    root.wait_variable(closed)
     return decision["action"]
 
 
@@ -1839,8 +1934,7 @@ def show_popup_message(title: str, message: str) -> None:
     except Exception:
         return
 
-    root = tk.Tk()
-    root.title(title)
+    root = popup_tk_window(tk, title)
     root.attributes("-topmost", True)
     root.configure(bg="#101820")
     root.resizable(True, True)
@@ -1874,9 +1968,11 @@ def show_popup_message(title: str, message: str) -> None:
 
     buttons = tk.Frame(root, bg="#101820")
     buttons.pack(fill="x", padx=36, pady=(0, 30))
+    closed = tk.BooleanVar(master=root, value=False)
 
     def close() -> None:
-        root.destroy()
+        root.withdraw()
+        closed.set(True)
 
     ok = tk.Button(
         buttons,
@@ -1898,7 +1994,7 @@ def show_popup_message(title: str, message: str) -> None:
     root.protocol("WM_DELETE_WINDOW", close)
     root.after(100, root.focus_force)
     root.after(150, root.lift)
-    root.mainloop()
+    root.wait_variable(closed)
 
 
 def notify_operator_message(args: argparse.Namespace, payload: dict) -> None:
@@ -1991,6 +2087,27 @@ def sermon_plan_match_requires_approval(args: argparse.Namespace, match: dict) -
         float(match.get("score") or 0.0) >= 0.68
         and int(match.get("matched_content_words") or 0) >= 4
         and float(match.get("target_coverage") or 0.0) >= 0.65
+    )
+
+
+def ensure_sermon_plan_for_recognition(
+    args: argparse.Namespace,
+    sermon_plan: dict | None,
+    *,
+    pipeline_matched: bool,
+    long_passage_reading: bool,
+) -> dict | None:
+    """Reload a plan that became current after LiVerse started."""
+    if (
+        sermon_plan is not None
+        or not args.sermon_plan
+        or pipeline_matched
+        or long_passage_reading
+    ):
+        return sermon_plan
+    return ensure_holyrics_sermon_plan_presentation(
+        args,
+        str(args.holyrics_url).rstrip("/"),
     )
 
 
@@ -2677,6 +2794,33 @@ def run_microphone(args: argparse.Namespace) -> int:
                             plan_search_with_review = bool(
                                 args.require_approval or args.semi_auto_approval
                             )
+                            recovered_sermon_plan = sermon_plan is None
+                            sermon_plan = ensure_sermon_plan_for_recognition(
+                                args,
+                                sermon_plan,
+                                pipeline_matched=bool(pipeline_payload.get("matched")),
+                                long_passage_reading=long_passage_reading,
+                            )
+                            if recovered_sermon_plan and sermon_plan is not None:
+                                logger.write(
+                                    "sermon_plan_loaded",
+                                    {
+                                        "name": sermon_plan.get("name"),
+                                        "text_id": sermon_plan.get("text_id")
+                                        or sermon_plan.get("id"),
+                                        "slides": sum(
+                                            1
+                                            for slide in sermon_plan.get("slides") or []
+                                            if str(slide.get("text") or "").strip()
+                                        ),
+                                        "current_slide": sermon_plan.get("slide_number"),
+                                        "loaded_after_startup": True,
+                                    },
+                                )
+                                print(
+                                    f"План проповеди загружен после возврата: {sermon_plan.get('name')}",
+                                    flush=True,
+                                )
                             if (
                                 sermon_plan is not None
                                 and not pipeline_payload.get("matched")
@@ -2864,7 +3008,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 elif action == "not_citation":
                                     console.status(f"оператор отметил: это не цитата ({ref})")
                                 elif action == "wrong_reference":
-                                    console.status(f"оператор отметил неверную ссылку: {ref}")
+                                    console.status(f"оператор: LiVerse неверно распознал цитату: {ref}")
                                 elif action == "skip":
                                     console.status(f"пропущено без обучения: {ref}")
                                 else:
@@ -2943,6 +3087,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                 show_session_summary_popup(session_refs)
             return 0
         finally:
+            close_popup_tk_root()
             if audio_log:
                 audio_log.close()
             if text_searcher is not None:
@@ -3152,6 +3297,12 @@ def main() -> int:
         type=float,
         default=float(env_setting("HOLYRICS_QUICK_MINUTES", "0") or "0"),
         help="Show Bible verses temporarily and restore the previous Holyrics text presentation after this many minutes. 0 disables it.",
+    )
+    parser.add_argument(
+        "--long-range-slide-mode",
+        choices=("compact", "one_verse"),
+        default="compact",
+        help="Split long Bible ranges compactly or show one verse per slide.",
     )
     parser.set_defaults(session_summary_popup=True, log_audio=True)
     args = parser.parse_args()

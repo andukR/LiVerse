@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 import tempfile
 import argparse
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,6 +26,7 @@ def hit(
     book_id: int = 43,
     chapter: int = 3,
     verse: int = 16,
+    end_verse: int | None = None,
 ) -> BibleTextSearchResult:
     return BibleTextSearchResult(
         reference=reference,
@@ -39,7 +41,7 @@ def hit(
         book_id=book_id,
         chapter=chapter,
         start_verse=verse,
-        end_verse=verse,
+        end_verse=end_verse or verse,
     )
 
 
@@ -350,6 +352,39 @@ class ScriptureTextDetectorTest(unittest.TestCase):
         self.assertTrue(decision.accepted)
         self.assertEqual("Лк. 14:28-30", decision.reference)
 
+    def test_broader_range_wins_when_strong_suffix_leads_by_under_ten_points(self) -> None:
+        suffix = hit(
+            "Флп. 3:9", 92.686,
+            matched=("через", "веру", "христос", "праведность", "бог"),
+            bigram=70.0,
+            trigram=55.0,
+            book_id=50,
+            chapter=3,
+            verse=9,
+        )
+        full_range = hit(
+            "Флп. 3:8-9", 83.844,
+            matched=("приобрести", "христос", "найтись", "праведность", "вера"),
+            bigram=65.0,
+            trigram=50.0,
+            book_id=50,
+            chapter=3,
+            verse=8,
+        )
+        full_range = BibleTextSearchResult(**{**full_range.__dict__, "end_verse": 9})
+        detector = ScriptureTextDetector(
+            FakeSearcher([[suffix], [full_range]]),
+            self.config(window_sizes=(5, 10), buffer_words=10, immediate_score=90.0),
+        )
+
+        decision = detector.process_fragment(
+            "приобрести христос найтись праведность вера через христос праведность бог по вере",
+            now=0.0,
+        )
+
+        self.assertTrue(decision.accepted)
+        self.assertEqual("Флп. 3:8-9", decision.reference)
+
     def test_weak_two_verse_range_does_not_use_relaxed_range_rule(self) -> None:
         weak_range = hit(
             "Пс. 22:1-2", 65.0,
@@ -444,6 +479,87 @@ class ScriptureTextDetectorTest(unittest.TestCase):
         self.assertFalse(duplicate.accepted)
         self.assertEqual("duplicate_cooldown", duplicate.reason)
 
+    def test_text_range_suppresses_contained_repeat_and_accepts_next_verse(self) -> None:
+        repeated = hit(
+            "Еф. 3:18", 91.0,
+            matched=("широта", "долгота", "глубина", "высота"),
+            trigram=75.0,
+            book_id=49,
+            chapter=3,
+            verse=18,
+        )
+        following = hit(
+            "Еф. 3:19", 77.0,
+            matched=("уразуметь", "превосходящий", "разумение", "любовь", "христов"),
+            bigram=50.0,
+            trigram=25.0,
+            book_id=49,
+            chapter=3,
+            verse=19,
+        )
+        detector = ScriptureTextDetector(
+            FakeSearcher([[repeated], [following]]),
+            self.config(immediate_score=99.0),
+        )
+        detector.mark_shown("Ефесянам 3:17-18", now=0.0)
+
+        duplicate = detector.process_fragment("широта долгота глубина высота любовь", now=1.0)
+        continuation = detector.process_fragment(
+            "уразуметь превосходящий разумение любовь христов", now=2.0,
+        )
+
+        self.assertFalse(duplicate.accepted)
+        self.assertEqual("duplicate_cooldown", duplicate.reason)
+        self.assertTrue(continuation.accepted)
+        self.assertEqual("Еф. 3:19", continuation.reference)
+        self.assertEqual("continuation_after_shown_range", continuation.reason)
+
+    def test_expanded_range_never_auto_narrows_to_a_verse_from_older_range(self) -> None:
+        verse = hit(
+            "Флп. 3:15", 95.0,
+            matched=("мыслить", "бог", "открыть"),
+            trigram=75.0,
+            book_id=50,
+            chapter=3,
+            verse=15,
+        )
+        detector = ScriptureTextDetector(
+            FakeSearcher([[verse]]),
+            self.config(immediate_score=99.0),
+        )
+        detector.mark_shown("Филиппийцам 3:13-14", now=0.0)
+        detector.mark_shown("Филиппийцам 3:13-15", now=1.0)
+
+        decision = detector.process_fragment("мыслить бог это открыть любовь", now=2.0)
+
+        self.assertFalse(decision.accepted)
+        self.assertEqual("duplicate_cooldown", decision.reason)
+
+    def test_expanded_range_is_not_repeated_when_an_older_range_ends_before_it(self) -> None:
+        repeated_range = hit(
+            "Флп. 3:15-16", 86.0,
+            matched=("впрочем", "достигнуть", "должный", "мыслить", "правило", "жить"),
+            bigram=70.0,
+            trigram=55.0,
+            book_id=50,
+            chapter=3,
+            verse=15,
+            end_verse=16,
+        )
+        detector = ScriptureTextDetector(
+            FakeSearcher([[repeated_range], [repeated_range]]),
+            self.config(immediate_score=99.0),
+        )
+        detector.mark_shown("Филиппийцам 3:13-14", now=0.0)
+        detector.mark_shown("Филиппийцам 3:15-16", now=1.0)
+
+        decision = detector.process_fragment(
+            "впрочем достигли должны мыслить потому правилу жить", now=2.0,
+        )
+
+        self.assertFalse(decision.accepted)
+        self.assertEqual("duplicate_cooldown", decision.reason)
+
 
 class ReplayTranscriptTest(unittest.TestCase):
     def test_jsonl_fragments_are_replayed_in_order(self) -> None:
@@ -493,6 +609,14 @@ class ReplayTranscriptTest(unittest.TestCase):
 
 
 class TextCitationIntegrationTest(unittest.TestCase):
+    def test_subtitle_markers_cover_psalm_asr_variants_without_plain_salo(self) -> None:
+        from tools.replay_audio_files import ADDRESS_MARKER_RE
+
+        self.assertIsNotNone(ADDRESS_MARKER_RE.search("Откроем псалом девяностый."))
+        self.assertIsNotNone(ADDRESS_MARKER_RE.search("пса лом двадцать второй"))
+        self.assertIsNotNone(ADDRESS_MARKER_RE.search("сало двадцать второй"))
+        self.assertIsNone(ADDRESS_MARKER_RE.search("после обеда было сало и хлеб"))
+
     def test_startup_explains_how_to_install_missing_text_database(self) -> None:
         from tools.vosk_grammar_probe import text_detection_database_startup_message
 
@@ -553,6 +677,224 @@ class TextCitationIntegrationTest(unittest.TestCase):
         self.assertTrue(lines[2].startswith(
             "3. 00:03:04.000  Иаков 1:27 — по адресу\n   Текст:"
         ))
+
+    def test_replay_inventory_finds_video_id_in_parent_directory(self) -> None:
+        from tools.replay_audio_files import (
+            collect_audio_youtube_sources,
+            collect_subtitle_youtube_ids,
+        )
+
+        video_id = "67IR5lBlUqs"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            audio_dir = root / "audio" / video_id
+            subtitle_dir = root / "subtitles" / video_id
+            audio_dir.mkdir(parents=True)
+            subtitle_dir.mkdir(parents=True)
+            (audio_dir / "Воскресное богослужение 21 07 24_16k_mono.wav").touch()
+            (subtitle_dir / "transcript.vtt").write_text(
+                "WEBVTT\n\n00:00.000 --> 00:01.000\nТекст\n",
+                encoding="utf-8",
+            )
+
+            audio = collect_audio_youtube_sources([root / "audio"], root / "download", False)
+            subtitles = collect_subtitle_youtube_ids([root / "subtitles"])
+
+        self.assertIn(video_id, audio)
+        self.assertIn(video_id, subtitles)
+        self.assertNotIn("24_16k_mono", audio)
+
+    def test_subtitle_window_plan_uses_timed_cues_and_merges_nearby_markers(self) -> None:
+        from tools.replay_audio_files import write_subtitle_window_plan
+
+        video_id = "67IR5lBlUqs"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            audio = root / "audio" / video_id / "sermon.wav"
+            subtitle = root / "subtitles" / video_id / "sermon.srt"
+            audio.parent.mkdir(parents=True)
+            subtitle.parent.mkdir(parents=True)
+            audio.touch()
+            subtitle.write_text(
+                "1\n00:01:00,000 --> 00:01:03,000\nОткроем вторую главу.\n\n"
+                "2\n00:01:20,000 --> 00:01:23,000\nПрочитаем пятый стих.\n",
+                encoding="utf-8",
+            )
+            plans = write_subtitle_window_plan([audio], [root / "subtitles"], root / "plans")
+            plan = json.loads(plans[0].read_text(encoding="utf-8"))
+
+        self.assertEqual(video_id, plan["video_id"])
+        self.assertEqual("explicit_address_markers_and_bible_text_similarity", plan["selection"])
+        self.assertEqual(1, len(plan["windows"]))
+        self.assertEqual(15.0, plan["windows"][0]["start_seconds"])
+        self.assertEqual(128.0, plan["windows"][0]["end_seconds"])
+        self.assertEqual(["главу", "откроем", "прочитаем", "стих"], plan["windows"][0]["markers"])
+
+    def test_subtitle_text_candidates_keep_only_strong_bible_matches(self) -> None:
+        from tools.replay_audio_files import subtitle_text_candidates
+
+        candidate = hit(
+            "Ин. 3:16", 92.0,
+            matched=("так", "возлюбить", "бог", "мир"),
+            bigram=80.0,
+            trigram=70.0,
+        )
+        searcher = FakeSearcher([[candidate]])
+        cues = [
+            {"start_seconds": 10.0, "end_seconds": 12.0, "text": "Ибо так"},
+            {"start_seconds": 12.0, "end_seconds": 14.0, "text": "возлюбил Бог"},
+            {"start_seconds": 14.0, "end_seconds": 16.0, "text": "мир"},
+        ]
+
+        candidates = subtitle_text_candidates(cues, searcher)
+
+        self.assertEqual(1, len(candidates))
+        self.assertEqual("bible_text_similarity", candidates[0]["sources"][0])
+        self.assertEqual("Ин. 3:16", candidates[0]["matches"][0]["reference"])
+
+    def test_subtitle_controls_are_ordinary_speech_outside_citation_windows(self) -> None:
+        from tools.replay_audio_files import subtitle_control_candidates
+
+        cues = [
+            {"start_seconds": 20.0, "end_seconds": 25.0, "text": "Обычная речь до цитаты сегодня"},
+            {"start_seconds": 75.0, "end_seconds": 80.0, "text": "Это не должно попасть в контроль"},
+            {"start_seconds": 180.0, "end_seconds": 185.0, "text": "Обычная речь после цитаты сегодня"},
+            {"start_seconds": 280.0, "end_seconds": 285.0, "text": "Завершающая обычная речь проповеди"},
+            {"start_seconds": 300.0, "end_seconds": 305.0, "text": "Откроем следующую главу пожалуйста"},
+        ]
+        citation_windows = [{"start_seconds": 60.0, "end_seconds": 150.0}]
+
+        controls = subtitle_control_candidates(cues, citation_windows, limit=2)
+
+        self.assertEqual(2, len(controls))
+        self.assertTrue(all(item["sources"] == ["plain_speech_control"] for item in controls))
+        self.assertTrue(all(
+            item["end_seconds"] <= 60.0 or item["start_seconds"] >= 150.0
+            for item in controls
+        ))
+        self.assertNotIn("Откроем", " ".join(item["cue_text"] for item in controls))
+
+    def test_window_audio_jobs_preserve_plan_origin_and_control_kind(self) -> None:
+        from tools.replay_audio_files import window_audio_jobs
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.wav"
+            source.touch()
+            plan_path = root / "plan.json"
+            plan_path.write_text(json.dumps({
+                "video_id": "67IR5lBlUqs",
+                "audio": str(source),
+                "windows": [
+                    {"start_seconds": 10, "end_seconds": 55, "sources": ["plain_speech_control"]},
+                    {"start_seconds": 60, "end_seconds": 110, "sources": ["explicit_address_marker"]},
+                ],
+            }), encoding="utf-8")
+
+            jobs = window_audio_jobs([plan_path], root / "windows")
+
+        self.assertEqual(2, len(jobs))
+        self.assertEqual(45.0, jobs[0]["duration_seconds"])
+        self.assertIn("01_control_part01_000010_000055.wav", jobs[0]["output_audio"])
+        self.assertIn("02_citation_part01_000060_000110.wav", jobs[1]["output_audio"])
+
+    def test_window_audio_jobs_split_long_windows_with_small_overlap(self) -> None:
+        from tools.replay_audio_files import window_audio_jobs
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.wav"
+            source.touch()
+            plan_path = root / "plan.json"
+            plan_path.write_text(json.dumps({
+                "video_id": "67IR5lBlUqs",
+                "audio": str(source),
+                "windows": [{"start_seconds": 0, "end_seconds": 250, "sources": ["explicit_address_marker"]}],
+            }), encoding="utf-8")
+
+            jobs = window_audio_jobs([plan_path], root / "windows")
+
+        self.assertEqual([(0.0, 120.0), (115.0, 235.0), (230.0, 250.0)], [
+            (job["start_seconds"], job["end_seconds"]) for job in jobs
+        ])
+
+    def test_replay_window_parts_keep_only_semantic_context(self) -> None:
+        from bible_parser_core.live_pipeline import LiveReferencePipeline
+        from tools.replay_audio_files import (
+            restore_replay_session_context,
+            save_replay_session_context,
+        )
+
+        first = LiveReferencePipeline()
+        self.assertTrue(first.set_context_range({
+            "book": "Бытие", "chapter": 22, "start_verse": 1,
+            "end_chapter": 22, "end_verse": 19,
+        }))
+        state: dict[str, object] = {}
+        save_replay_session_context(first, {"long_passage": {"ref": "Бытие 22:1-19"}}, state)
+
+        following = LiveReferencePipeline()
+        following.text_buffer.add("старый буфер не переносится")
+        replay_state: dict[str, dict | None] = {"long_passage": None}
+        self.assertTrue(restore_replay_session_context(following, replay_state, state))
+
+        self.assertEqual("Бытие", following.context_range["book"])
+        self.assertEqual(22, following.context_current_chapter)
+        self.assertEqual({"ref": "Бытие 22:1-19"}, replay_state["long_passage"])
+        self.assertEqual(["старый буфер не переносится"], list(following.text_buffer.parts))
+
+    def test_excluded_cascade_is_recorded_but_not_exported_for_training(self) -> None:
+        from tools.analyze_vosk_probe_logs import export_training_data
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run = root / "20260907_130000_000001"
+            run.mkdir()
+            (run / "session.json").write_text('{"asr_engine": "sherpa-0.54"}\n', encoding="utf-8")
+            (run / "trigger_cases.jsonl").write_text(
+                json.dumps({"case_id": "trigger_0001", "ref": "Притчи 1:1", "status": "reviewed", "review_category": "excluded_cascade"}) + "\n"
+                + json.dumps({"case_id": "trigger_0002", "ref": "Иоанн 3:16", "status": "reviewed", "review_category": "true_reference"}) + "\n",
+                encoding="utf-8",
+            )
+            output = root / "training.csv"
+            report = export_training_data(root, output, asr_engine="sherpa-0.54")
+            csv_text = output.read_text(encoding="utf-8")
+
+        self.assertEqual(1, report["rows"])
+        self.assertEqual(1, report["excluded"])
+        self.assertNotIn("excluded_cascade", csv_text)
+        self.assertIn("trigger_0002", csv_text)
+
+    def test_replay_batch_summary_lists_source_file_citations_and_timecodes(self) -> None:
+        from tools.replay_audio_files import replay_batch_summary_lines, write_replay_batch_summary
+
+        with tempfile.TemporaryDirectory() as temporary:
+            log_dir = Path(temporary)
+            first_run = log_dir / "20260903_120000_000001"
+            second_run = log_dir / "20260903_120100_000001"
+            first_run.mkdir()
+            second_run.mkdir()
+            (first_run / "session.json").write_text(
+                '{"source_audio": "C:/audio/first_sermon.wav"}\n', encoding="utf-8"
+            )
+            (second_run / "session.json").write_text(
+                '{"source_audio": "C:/audio/second_sermon.wav"}\n', encoding="utf-8"
+            )
+            (first_run / "trigger_cases.jsonl").write_text(
+                '{"timecode":"00:01:02.000","ref":"Иоанн 3:16",'
+                '"payload":{"source":"parser"}}\n',
+                encoding="utf-8",
+            )
+
+            lines = replay_batch_summary_lines([first_run, second_run])
+            summary_path = write_replay_batch_summary(log_dir, [first_run, second_run])
+
+            self.assertIn("Файл: first_sermon.wav", lines)
+            self.assertIn("  1. 00:01:02.000  Иоанн 3:16 — по адресу", lines)
+            self.assertIn("Файл: second_sermon.wav", lines)
+            self.assertIn("  Цитаты не обнаружены.", lines)
+            self.assertIsNotNone(summary_path)
+            self.assertEqual("\n".join(lines) + "\n", summary_path.read_text(encoding="utf-8"))
 
     def test_sherpa_subwords_are_converted_to_timed_vosk_words(self) -> None:
         from bible_parser_core.sherpa_streaming import DEFAULT_SHERPA_THREADS

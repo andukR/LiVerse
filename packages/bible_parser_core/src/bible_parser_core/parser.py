@@ -337,6 +337,7 @@ ASR_REPLACEMENTS = (
     (r"\bеклисяст[а-я]*\b", "екклесиаст"),
     (r"\bклесяст[а-я]*\b", "екклесиаст"),
     (r"\bи\s+клесяст[а-я]*\b", "екклесиаст"),
+    (r"\bбытья\b", "бытия"),
     (r"\bизход\b", "исход"),
     (r"\b([1234])\s+мега\s+царств\b", r"\1 книга царств"),
     (r"\b2\s+законе\b", "второзаконие"),
@@ -350,6 +351,7 @@ ASR_REPLACEMENTS = (
     (r"\b(книга|пророка)\s+ио\s+иль\b", r"\1 иоиля"),
     (r"\bио\s+иль\b", "иоиль"),
     (r"\b(книга|книги)\s+ио\b", r"\1 иова"),
+    (r"\bеванглий\s+от\s+матвеевич\b", "евангелие от матфея"),
     (r"\bивангел[а-я]*\b", "евангелие"),
     (r"\bивангед[а-я]*\b", "евангелие"),
     (r"\bевангелия\b", "евангелие"),
@@ -403,6 +405,7 @@ ASR_REPLACEMENTS = (
     (r"\bколос\s+нам\b", "колоссянам"),
     (r"\bколос\s+са\s+нам\b", "колоссянам"),
     (r"\bколоса\s+нам\b", "колоссянам"),
+    (r"\bкоренция\s+нам\b", "коринфянам"),
     (r"\bкаринфен[а-я]*\b", "коринфянам"),
     (r"\bкаримфин[а-я]*\b", "коринфянам"),
     (
@@ -545,6 +548,15 @@ def normalize_text(text: str) -> str:
     normalized = re.sub(
         r"\b(\d+)\s+глава\s+\d+\s+(\d+)\s+стих\s+(\d+)\s+(давайте|прочитаем)\b",
         r"\1 глава \3 \2 стих \4",
+        normalized,
+    )
+    # Sherpa can turn the book name "Притчи" into "речи" in the very
+    # specific imperative phrase "откроем Притчи <chapter> главу".  Do not
+    # make ordinary "речи" a book synonym: it becomes Proverbs only when a
+    # chapter number and the opening verb are present together.
+    normalized = re.sub(
+        r"\b(откро\w*)\s+речи(?=\s+\d+\s+глав)",
+        r"\1 притчи",
         normalized,
     )
     return normalized
@@ -806,6 +818,15 @@ def book_candidates(normalized: str) -> list[BookCandidate]:
                 continue
             if candidate_text in {"фи", "послание фи"}:
                 continue
+            # «Апостола» само по себе — обычное слово, а не название книги.
+            # Иначе нечёткое сопоставление с «апостол Иуда» даёт ложную Иуд. 1:8.
+            if candidate_text == "апостола":
+                continue
+            # Ordinary "нам" must not fuzzy-match the book form "Наума".
+            # Other short ASR fragments have established, separately tested
+            # handling below and must remain available to the resolver.
+            if candidate_text == "нам":
+                continue
             if re.search(r"\b\d+\b", candidate_text):
                 trailing_context_number = re.search(r"\D\s+\d+\b", candidate_text)
                 if trailing_context_number:
@@ -885,9 +906,16 @@ def reference_numbers(normalized: str, book: str) -> list[tuple[int, int, int]]:
     if not book_family:
         return numbers
 
+    # The canonical book name is "Тимофею", while a spoken reference often
+    # contains the genitive form "Тимофея".  The preceding number is still
+    # the book number, never the chapter number.
+    book_family_pattern = re.escape(book_family)
+    if book_family == "тимофею":
+        book_family_pattern = r"тимофе[яю]"
+
     book_number_spans = {
         (match.start(1), match.end(1))
-        for match in re.finditer(rf"\b([1234])\s+{re.escape(book_family)}\b", normalized)
+        for match in re.finditer(rf"\b([1234])\s+{book_family_pattern}\b", normalized)
     }
     return [number for number in numbers if (number[1], number[2]) not in book_number_spans]
 
@@ -1063,9 +1091,9 @@ def ref_candidates(normalized: str, book: str, bible: dict[str, dict[int, dict[i
             )
 
     range_patterns = (
-        (r"(\d+)\s+глава\s+с\s+(\d+)\s+по\s+(\d+)\s+стих", 1, 2, 3, 0.99),
-        (r"(\d+)\s+глава\s+(\d+)\s+по\s+(\d+)\s+стих", 1, 2, 3, 0.99),
-        (r"(\d+)\s+глава\s+с\s+(\d+)\s+стих\s+по\s+(\d+)(?:\s+стих)?", 1, 2, 3, 0.99),
+        (r"(\d+)\s+глава\s+с\s+(\d+)(?:\s+и)?\s+по\s+(\d+)\s+стих", 1, 2, 3, 0.99),
+        (r"(\d+)\s+глава\s+(\d+)(?:\s+и)?\s+по\s+(\d+)\s+стих", 1, 2, 3, 0.99),
+        (r"(\d+)\s+глава\s+с\s+(\d+)\s+стих(?:\s+и)?\s+по\s+(\d+)(?:\s+стих)?", 1, 2, 3, 0.99),
         (r"(\d+)\s+глава\s+(\d+)\s+стих\s+по\s+(\d+)(?:\s+стих)?", 1, 2, 3, 0.99),
         (r"(\d+)\s+глава\s+с\s+(\d+)\s+стих\s+и\s+до\s+(\d+)(?:\s+стих)?", 1, 2, 3, 0.99),
         (r"(\d+)\s+глава\s+(\d+)\s*-\s*(\d+)\s+стих", 1, 2, 3, 0.99),
@@ -1086,6 +1114,23 @@ def ref_candidates(normalized: str, book: str, bible: dict[str, dict[int, dict[i
                     match.end(),
                         score,
                     )
+
+    # Иногда Sherpa сохраняет числа и порядок «с 1 по 3 стих, 22 ... Бытия»,
+    # но теряет слово «глава». Если после числа вскоре всё же названо то же
+    # самое библейское произведение, это надёжнее, чем собирать 1:3-22.
+    for match in re.finditer(r"\bс\s+(\d+)\s+(?:и\s+)?по\s+(\d+)\s+стих\s+(\d+)\b", normalized):
+        start_verse = int(match.group(1))
+        end_verse = int(match.group(2))
+        chapter = int(match.group(3))
+        suffix = normalized[match.end() :]
+        trailing_books = book_candidates(suffix)
+        has_near_trailing_book = any(
+            candidate.book == book
+            and len(token_spans(suffix[: candidate.start])) <= 2
+            for candidate in trailing_books
+        )
+        if has_near_trailing_book and start_verse <= end_verse:
+            add(chapter, list(range(start_verse, end_verse + 1)), match.start(), match.end(), 1.03)
 
     for match in re.finditer(r"(\d+)\s+глава\s+(?:с\s+)?(\d)\s+([2-9]\d)\s+стих", normalized):
         chapter = int(match.group(1))
@@ -1153,7 +1198,7 @@ def ref_candidates(normalized: str, book: str, bible: dict[str, dict[int, dict[i
                     max(chapter[2], end),
                     0.95,
                 )
-        for match in re.finditer(r"с\s+(\d+)\s+по\s+(\d+)(?:\s+стих)?", normalized):
+        for match in re.finditer(r"с\s+(\d+)(?:\s+и)?\s+по\s+(\d+)(?:\s+стих)?", normalized):
             start_verse = int(match.group(1))
             end_verse = int(match.group(2))
             if start_verse <= end_verse:
@@ -1164,7 +1209,7 @@ def ref_candidates(normalized: str, book: str, bible: dict[str, dict[int, dict[i
                     max(chapter[2], match.end()),
                     0.95,
                 )
-        for match in re.finditer(r"с\s+(\d+)\s+стих\s+по\s+(\d+)(?:\s+стих)?", normalized):
+        for match in re.finditer(r"с\s+(\d+)\s+стих(?:\s+и)?\s+по\s+(\d+)(?:\s+стих)?", normalized):
             start_verse = int(match.group(1))
             end_verse = int(match.group(2))
             if start_verse <= end_verse:

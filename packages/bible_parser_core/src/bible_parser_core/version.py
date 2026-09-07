@@ -1,3 +1,3 @@
 """Single source of the LiVerse application version."""
 
-__version__ = "1.2.3"
+__version__ = "1.2.4"

@@ -22,6 +22,7 @@ COMMON_SPEECH_LEMMAS = {
     "на", "не", "но", "о", "он", "она", "они", "от", "по", "при", "с", "со",
     "так", "то", "у", "что", "это", "я",
 }
+BROADER_RANGE_SCORE_TOLERANCE = 10.0
 
 
 def _reference_key(reference: str) -> tuple[str, int, int, int, int] | str:
@@ -259,7 +260,10 @@ class ScriptureTextDetector:
                 and item.top_candidate is not None
                 and _candidate_span(item.top_candidate) > _candidate_span(best.top_candidate)
                 and _candidate_contains(item.top_candidate, best.top_candidate)
-                and item.score >= best.score - 5.0
+                # A wider, independently strong range is more useful than a
+                # high-scoring suffix: it preserves the beginning of the
+                # passage that is still audible in the same speech window.
+                and item.score >= best.score - BROADER_RANGE_SCORE_TOLERANCE
             ]
             if broader:
                 best = max(
@@ -318,8 +322,8 @@ class ScriptureTextDetector:
             for lemma in top.matched_lemmas
             if lemma in content_lemmas and lemma not in COMMON_SPEECH_LEMMAS
         )
-        shown_at = self._shown_at.get(_candidate_key(top))
-        if shown_at is not None and now - shown_at < self.config.duplicate_cooldown_seconds:
+        shown_relation = self._recent_shown_relation(top, now)
+        if shown_relation == "contained":
             return self._decision(
                 reference=top.reference, score=top.score, margin=margin,
                 matched_words=matched_words, window_text=window_text,
@@ -368,6 +372,19 @@ class ScriptureTextDetector:
             and top.bigram_overlap >= 60.0
             and top.trigram_overlap >= 45.0
         )
+        continuation = (
+            shown_relation == "next"
+            and top.score >= self.config.acceptance_score
+            and margin >= self.config.minimum_margin
+            and matched_words >= self.config.minimum_matched_content_words
+            and (top.bigram_overlap > 0 or top.ordered_similarity >= 70.0)
+        )
+        if continuation:
+            return self._decision(
+                accepted=True, reference=top.reference, score=top.score, margin=margin,
+                matched_words=matched_words, window_text=window_text,
+                reason="continuation_after_shown_range", confirmations=1, top=top, second=second,
+            )
         if immediate or exact_phrase or exact_short_verse or strong_range:
             return self._decision(
                 accepted=True, reference=top.reference, score=top.score, margin=margin,
@@ -405,6 +422,27 @@ class ScriptureTextDetector:
             matched_words=matched_words, window_text=window_text,
             reason=reason, top=top, second=second,
         )
+
+    def _recent_shown_relation(self, candidate: BibleTextSearchResult, now: float) -> str | None:
+        """Classify a candidate relative to a recently displayed text range."""
+        candidate_book, candidate_chapter, candidate_start, candidate_end_chapter, candidate_end = _candidate_key(candidate)
+        has_next = False
+        for key, shown_at in self._shown_at.items():
+            if not isinstance(key, tuple) or len(key) != 5:
+                continue
+            if now - shown_at >= self.config.duplicate_cooldown_seconds:
+                continue
+            book, chapter, start, end_chapter, end = key
+            if book != candidate_book or chapter != candidate_chapter or end_chapter != candidate_end_chapter:
+                continue
+            if start <= candidate_start and candidate_end <= end:
+                return "contained"
+            if candidate_start == end + 1:
+                has_next = True
+        # A range may first have been displayed narrowly and then expanded.
+        # Never let the older narrow range turn a verse already inside the
+        # expanded display into a new "next" slide.
+        return "next" if has_next else None
 
     def _confirm(self, decision: TextCitationDecision, now: float) -> TextCitationDecision:
         same_candidate = (

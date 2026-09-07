@@ -26,6 +26,10 @@ CATEGORIES = {
     "7": ("unclear", "непонятно, нужно переслушать позже"),
     "8": ("parser_error", "Vosk услышал достаточно, но мозг LiVerse разобрал неверно"),
     "9": ("speaker_error", "ошибка произношения: говорящий назвал ссылку неполно или оговорился"),
+    "0": (
+        "excluded_cascade",
+        "исключить из обучения: следствие ошибки или повтор уже показанной/активной цитаты",
+    ),
 }
 CATEGORY_LABELS = {category: label for category, label in CATEGORIES.values()}
 CATEGORY_LABELS["wrong_reference"] = "ссылка была названа, но Vosk/LiVerse разобрал её неверно"
@@ -240,7 +244,7 @@ def print_case(case: dict[str, Any], position: int, total: int, *, cases_path: P
     for key, (_category, label) in CATEGORIES.items():
         print(f"  {key}. {label}")
     print(
-        "\nКоманды: Enter/зв - прослушать | зв+ - длиннее | 1-7 - выбрать | "
+        "\nКоманды: Enter/зв - прослушать | зв+ - длиннее | 0-9 - выбрать | "
         "к N/исправить N - перейти к случаю N | н заметка | п пропустить | вых выход"
     )
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import re
 import shutil
@@ -51,7 +52,8 @@ from tools.vosk_grammar_probe import (
 
 
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".opus", ".ogg", ".flac", ".webm", ".mp4"}
-SUBTITLE_EXTENSIONS = {".srt", ".txt"}
+SUBTITLE_EXTENSIONS = {".srt", ".txt", ".vtt"}
+TIMED_SUBTITLE_EXTENSIONS = {".srt", ".vtt"}
 YOUTUBE_ID_RE = re.compile(r"(?<![A-Za-z0-9-])([A-Za-z0-9_-]{11})(?![A-Za-z0-9_-])")
 YOUTUBE_URL_RE = re.compile(
     r"(?:youtube\.com/(?:watch\?v=|shorts/|embed/)|youtu\.be/)([A-Za-z0-9_-]{11})"
@@ -76,8 +78,27 @@ DEFAULT_SEARCH_ROOTS = (
     PROJECTS_ROOT / "live_scripture_presenter" / ".cache" / "live_case_replay" / "audio",
     PROJECTS_ROOT / "liveverse-public-release" / ".cache" / "live_emulator" / "audio",
 )
+DEFAULT_SUBTITLE_ROOTS = (
+    PROJECTS_ROOT / "bible_parser_cli" / "transcripts",
+    PROJECTS_ROOT / "bible_parser_cli" / ".cache" / "whisper_runs",
+)
 LATEST_REPLAY_BATCH = "latest_replay_batch.json"
 DEFAULT_TARGET_ANNOTATIONS = 200
+DEFAULT_WINDOW_PLAN_DIR = Path(".cache") / "liverse" / "replay_window_plans"
+DEFAULT_WINDOW_AUDIO_DIR = Path(".cache") / "liverse" / "replay_window_audio"
+DEFAULT_CONTROL_WINDOWS_PER_PLAN = 3
+CONTROL_WINDOW_SECONDS = 45.0
+MAX_REPLAY_WINDOW_SECONDS = 120.0
+REPLAY_WINDOW_OVERLAP_SECONDS = 5.0
+ADDRESS_MARKER_RE = re.compile(
+    r"\b(?:стих\w*|глав\w*|послани\w*|евангели\w*|пророк\w*|книг\w*|"
+    r"прочита\w*|откро\w*|псал\w*|пса\s+лом\w*|"
+    r"сало(?=\s+(?:\d{1,3}|перв\w*|втор\w*|трет\w*|четв[её]рт\w*|пят\w*|"
+    r"шест\w*|седьм\w*|восьм\w*|девят\w*|десят\w*|двадцат\w*|тридцат\w*|"
+    r"сорок\w*|пятидесят\w*|шестидесят\w*|семидесят\w*|восьмидесят\w*|"
+    r"девяност\w*|сот\w*)))\b",
+    re.IGNORECASE,
+)
 DEFAULT_SHERPA_MODEL_PATH = (
     PROJECT_ROOT
     / ".cache"
@@ -128,6 +149,46 @@ def replay_long_passage_match(decision: object, passage: dict) -> dict:
         "reason": "long_passage_completed" if completed else "inside_long_passage",
         "candidate": str(getattr(candidate, "reference", "") or ""),
     }
+
+
+def restore_replay_session_context(
+    pipeline: LiveReferencePipeline,
+    replay_state: dict[str, dict | None],
+    session_state: dict[str, object] | None,
+) -> bool:
+    """Restore only semantic state when the next WAV continues one window.
+
+    ASR buffers deliberately remain per WAV: neighbouring parts overlap by a
+    few seconds and carrying recognised words would process that speech twice.
+    """
+    if not session_state:
+        return False
+    context_range = session_state.get("context_range")
+    if isinstance(context_range, dict):
+        pipeline.context_range = dict(context_range)
+        pipeline.context_current_chapter = int(
+            session_state.get("context_current_chapter") or context_range.get("chapter") or 0
+        ) or None
+    long_passage = session_state.get("long_passage")
+    if isinstance(long_passage, dict):
+        replay_state["long_passage"] = dict(long_passage)
+    return pipeline.context_range is not None or replay_state.get("long_passage") is not None
+
+
+def save_replay_session_context(
+    pipeline: LiveReferencePipeline,
+    replay_state: dict[str, dict | None],
+    session_state: dict[str, object] | None,
+) -> None:
+    """Keep selected range state for the following part of the same window."""
+    if session_state is None:
+        return
+    session_state["context_range"] = (
+        dict(pipeline.context_range) if isinstance(pipeline.context_range, dict) else None
+    )
+    session_state["context_current_chapter"] = pipeline.context_current_chapter
+    long_passage = replay_state.get("long_passage")
+    session_state["long_passage"] = dict(long_passage) if isinstance(long_passage, dict) else None
 
 
 def audio_duration(path: Path) -> float | None:
@@ -197,8 +258,10 @@ def collect_subtitle_youtube_ids(search_roots: list[Path]) -> dict[str, Path]:
         if not root.exists():
             continue
         for path in iter_subtitle_files(root):
-            for video_id in youtube_ids_from_text(path.stem):
-                ids.setdefault(video_id, path)
+            for video_id in youtube_ids_from_path(path):
+                current = ids.get(video_id)
+                if current is None or subtitle_file_preference(path) < subtitle_file_preference(current):
+                    ids[video_id] = path
             if path.name.lower().endswith(".url.txt"):
                 try:
                     text = path.read_text(encoding="utf-8", errors="ignore")
@@ -207,6 +270,353 @@ def collect_subtitle_youtube_ids(search_roots: list[Path]) -> dict[str, Path]:
                 for video_id in youtube_ids_from_text(text):
                     ids.setdefault(video_id, path)
     return ids
+
+
+def subtitle_file_preference(path: Path) -> tuple[int, str]:
+    """Prefer timed subtitle formats over plain transcript text."""
+    return (0 if path.suffix.lower() in TIMED_SUBTITLE_EXTENSIONS else 1, str(path))
+
+
+def parse_subtitle_time(value: str) -> float:
+    hours, minutes, seconds = value.strip().replace(",", ".").split(":")
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
+def read_timed_subtitle_cues(path: Path) -> list[dict[str, object]]:
+    """Read the small SRT/VTT subset needed for selecting replay windows."""
+    if path.suffix.lower() not in TIMED_SUBTITLE_EXTENSIONS:
+        raise ValueError(f"У субтитров нет таймкодов: {path}")
+    text = path.read_text(encoding="utf-8", errors="replace").replace("\r\n", "\n")
+    cues: list[dict[str, object]] = []
+    for block in re.split(r"\n\s*\n", text):
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        timing_index = next((index for index, line in enumerate(lines) if "-->" in line), None)
+        if timing_index is None:
+            continue
+        start_text, end_text = (part.strip().split()[0] for part in lines[timing_index].split("-->", 1))
+        try:
+            start_seconds = parse_subtitle_time(start_text)
+            end_seconds = parse_subtitle_time(end_text)
+        except (ValueError, IndexError):
+            continue
+        cue_text = html.unescape(" ".join(lines[timing_index + 1 :]))
+        cue_text = re.sub(r"<[^>]+>", "", cue_text).strip()
+        if cue_text and end_seconds >= start_seconds:
+            cues.append({"start_seconds": start_seconds, "end_seconds": end_seconds, "text": cue_text})
+    return cues
+
+
+def subtitle_marker_candidates(
+    cues: list[dict[str, object]], *, padding_seconds: float = 45.0,
+) -> list[dict[str, object]]:
+    """Return context candidates around explicit Bible-reference markers."""
+    candidates: list[dict[str, object]] = []
+    for cue in cues:
+        text = str(cue["text"])
+        markers = sorted({match.group(0).lower() for match in ADDRESS_MARKER_RE.finditer(text)})
+        if not markers:
+            continue
+        candidates.append(
+            {
+                "start_seconds": max(0.0, float(cue["start_seconds"]) - padding_seconds),
+                "end_seconds": float(cue["end_seconds"]) + padding_seconds,
+                "sources": ["explicit_address_marker"],
+                "markers": markers,
+                "cue_text": text,
+            }
+        )
+    return candidates
+
+
+def subtitle_text_candidates(
+    cues: list[dict[str, object]],
+    searcher: BibleTextSearcher,
+    *,
+    padding_seconds: float = 45.0,
+) -> list[dict[str, object]]:
+    """Find high-confidence Bible-text matches in three consecutive subtitle cues."""
+    candidates: list[dict[str, object]] = []
+    for index in range(max(0, len(cues) - 2)):
+        fragment = cues[index : index + 3]
+        text = " ".join(str(cue["text"]) for cue in fragment)
+        _lemmas, results = searcher.search(text, limit=1)
+        if not results:
+            continue
+        top = results[0]
+        if not (
+            top.score >= 85.0
+            and top.coverage >= 80.0
+            and top.bigram_overlap >= 50.0
+            and len(top.matched_lemmas) >= 3
+        ):
+            continue
+        candidates.append(
+            {
+                "start_seconds": max(0.0, float(fragment[0]["start_seconds"]) - padding_seconds),
+                "end_seconds": float(fragment[-1]["end_seconds"]) + padding_seconds,
+                "sources": ["bible_text_similarity"],
+                "matches": [{
+                    "reference": top.reference,
+                    "score": round(top.score, 3),
+                    "coverage": round(top.coverage, 3),
+                }],
+                "cue_text": text,
+            }
+        )
+    return candidates
+
+
+def merge_subtitle_window_candidates(candidates: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Merge overlapping candidates while retaining why each window was selected."""
+    candidates.sort(key=lambda item: float(item["start_seconds"]))
+    merged: list[dict[str, object]] = []
+    for candidate in candidates:
+        candidate_texts = list(candidate.get("cue_texts") or [candidate.get("cue_text") or ""])
+        if merged and float(candidate["start_seconds"]) <= float(merged[-1]["end_seconds"]):
+            previous = merged[-1]
+            previous["end_seconds"] = max(float(previous["end_seconds"]), float(candidate["end_seconds"]))
+            previous["sources"] = sorted(set(previous["sources"]) | set(candidate["sources"]))
+            previous["markers"] = sorted(set(previous["markers"]) | set(candidate.get("markers") or []))
+            previous["matches"].extend(candidate.get("matches") or [])
+            previous["cue_texts"].extend(candidate_texts)
+            continue
+        merged.append(
+            {
+                "start_seconds": candidate["start_seconds"],
+                "end_seconds": candidate["end_seconds"],
+                "sources": candidate["sources"],
+                "markers": candidate.get("markers") or [],
+                "matches": candidate.get("matches") or [],
+                "cue_texts": candidate_texts,
+            }
+        )
+    return merged
+
+
+def subtitle_marker_windows(cues: list[dict[str, object]], *, padding_seconds: float = 45.0) -> list[dict[str, object]]:
+    return merge_subtitle_window_candidates(
+        subtitle_marker_candidates(cues, padding_seconds=padding_seconds)
+    )
+
+
+def subtitle_control_candidates(
+    cues: list[dict[str, object]],
+    selected_windows: list[dict[str, object]],
+    *,
+    limit: int = DEFAULT_CONTROL_WINDOWS_PER_PLAN,
+) -> list[dict[str, object]]:
+    """Select a few subtitle-backed ordinary-speech windows between candidates."""
+    if limit <= 0 or not cues:
+        return []
+    duration = max(float(cue["end_seconds"]) for cue in cues)
+    gaps: list[tuple[float, float]] = []
+    previous_end = 0.0
+    for window in selected_windows:
+        start_seconds = float(window["start_seconds"])
+        if start_seconds - previous_end >= CONTROL_WINDOW_SECONDS:
+            gaps.append((previous_end, start_seconds))
+        previous_end = max(previous_end, float(window["end_seconds"]))
+    if duration - previous_end >= CONTROL_WINDOW_SECONDS:
+        gaps.append((previous_end, duration))
+    controls: list[dict[str, object]] = []
+    for gap_start, gap_end in gaps:
+        midpoint = (gap_start + gap_end) / 2.0
+        speech_cues = [
+            cue for cue in cues
+            if gap_start <= float(cue["start_seconds"])
+            and float(cue["end_seconds"]) <= gap_end
+            and not ADDRESS_MARKER_RE.search(str(cue["text"]))
+            and len(str(cue["text"]).split()) >= 4
+        ]
+        if not speech_cues:
+            continue
+        cue = min(
+            speech_cues,
+            key=lambda item: abs((float(item["start_seconds"]) + float(item["end_seconds"])) / 2.0 - midpoint),
+        )
+        cue_middle = (float(cue["start_seconds"]) + float(cue["end_seconds"])) / 2.0
+        start_seconds = max(gap_start, cue_middle - CONTROL_WINDOW_SECONDS / 2.0)
+        start_seconds = min(start_seconds, gap_end - CONTROL_WINDOW_SECONDS)
+        controls.append(
+            {
+                "start_seconds": round(start_seconds, 3),
+                "end_seconds": round(start_seconds + CONTROL_WINDOW_SECONDS, 3),
+                "sources": ["plain_speech_control"],
+                "cue_text": str(cue["text"]),
+            }
+        )
+    controls.sort(key=lambda item: (float(item["end_seconds"]) - float(item["start_seconds"])), reverse=True)
+    return sorted(controls[:limit], key=lambda item: float(item["start_seconds"]))
+
+
+def write_subtitle_window_plan(
+    audio_paths: list[Path],
+    subtitle_roots: list[Path],
+    output_dir: Path,
+    text_detection_db: Path = DEFAULT_TEXT_DETECTION_DB,
+    control_windows: int = DEFAULT_CONTROL_WINDOWS_PER_PLAN,
+) -> list[Path]:
+    """Write marker-based candidate windows; this never reads or changes audio."""
+    subtitles = collect_subtitle_youtube_ids(subtitle_roots)
+    if not text_detection_db.is_file():
+        raise ValueError(f"Индекс библейского текста не найден: {text_detection_db}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plans: list[Path] = []
+    searcher = BibleTextSearcher(text_detection_db)
+    try:
+        for audio_path in audio_paths:
+            video_ids = youtube_ids_from_path(audio_path)
+            matching_ids = [video_id for video_id in video_ids if video_id in subtitles]
+            if not matching_ids:
+                raise ValueError(f"Не удалось сопоставить аудио и субтитры по YouTube ID: {audio_path}")
+            # A temporary parent directory can accidentally look like an ID; the
+            # closest matching component belongs to the actual recording path.
+            video_id = matching_ids[-1]
+            subtitle_path = subtitles.get(video_id)
+            if subtitle_path is None:
+                raise ValueError(f"Для {video_id} не найдены локальные субтитры.")
+            cues = read_timed_subtitle_cues(subtitle_path)
+            marker_candidates = subtitle_marker_candidates(cues)
+            text_candidates = subtitle_text_candidates(cues, searcher)
+            citation_windows = merge_subtitle_window_candidates([*marker_candidates, *text_candidates])
+            control_candidates = subtitle_control_candidates(
+                cues,
+                citation_windows,
+                limit=control_windows,
+            )
+            windows = merge_subtitle_window_candidates([*citation_windows, *control_candidates])
+            plan_path = output_dir / f"{video_id}.json"
+            plan_path.write_text(
+                json.dumps(
+                    {
+                        "video_id": video_id,
+                        "audio": str(audio_path),
+                        "subtitle": str(subtitle_path),
+                        "selection": "explicit_address_markers_and_bible_text_similarity",
+                        "padding_seconds": 45,
+                        "windows": windows,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            plans.append(plan_path)
+            print(
+                f"План {video_id}: {len(windows)} объединённых окон "
+                f"({len(marker_candidates)} адресных, {len(text_candidates)} текстовых, "
+                f"{len(control_candidates)} контрольных) → {plan_path}",
+                flush=True,
+            )
+    finally:
+        searcher.close()
+    return plans
+
+
+def window_audio_jobs(
+    plan_paths: list[Path],
+    output_dir: Path,
+    *,
+    max_window_seconds: float = MAX_REPLAY_WINDOW_SECONDS,
+) -> list[dict[str, object]]:
+    """Read saved plans and describe the WAV copies that would be produced."""
+    jobs: list[dict[str, object]] = []
+    for plan_path in plan_paths:
+        try:
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"Не удалось прочитать план окон {plan_path}: {error}") from error
+        video_id = str(plan.get("video_id") or "").strip()
+        source_audio = Path(str(plan.get("audio") or "")).expanduser()
+        if not source_audio.exists():
+            raise ValueError(f"Исходное аудио из плана не найдено: {source_audio}")
+        if not video_id or not plan.get("windows"):
+            raise ValueError(f"В плане нет video_id или окон: {plan_path}")
+        for index, window in enumerate(plan["windows"], start=1):
+            try:
+                start_seconds = float(window["start_seconds"])
+                end_seconds = float(window["end_seconds"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(f"Некорректные границы окна {index} в {plan_path}") from error
+            if start_seconds < 0 or end_seconds <= start_seconds:
+                raise ValueError(f"Некорректная длительность окна {index} в {plan_path}")
+            sources = [str(source) for source in window.get("sources") or []]
+            kind = "control" if sources == ["plain_speech_control"] else "citation"
+            if max_window_seconds <= REPLAY_WINDOW_OVERLAP_SECONDS:
+                raise ValueError("Максимальная длина фрагмента должна быть больше перекрытия.")
+            part_start = start_seconds
+            part_index = 1
+            while part_start < end_seconds:
+                part_end = min(part_start + max_window_seconds, end_seconds)
+                output_path = output_dir / video_id / (
+                    f"{index:02d}_{kind}_part{part_index:02d}_"
+                    f"{int(part_start):06d}_{int(part_end):06d}.wav"
+                )
+                jobs.append(
+                    {
+                        "video_id": video_id,
+                        "plan": str(plan_path),
+                        "source_audio": str(source_audio),
+                        "parent_window_index": index,
+                        "start_seconds": part_start,
+                        "end_seconds": part_end,
+                        "duration_seconds": part_end - part_start,
+                        "sources": sources,
+                        "references": [str(match.get("reference")) for match in window.get("matches") or []],
+                        "output_audio": str(output_path),
+                    }
+                )
+                if part_end >= end_seconds:
+                    break
+                part_start = part_end - REPLAY_WINDOW_OVERLAP_SECONDS
+                part_index += 1
+    return jobs
+
+
+def print_window_audio_jobs(jobs: list[dict[str, object]]) -> None:
+    total_seconds = sum(float(job["duration_seconds"]) for job in jobs)
+    estimated_bytes = int(total_seconds * 16000 * 2)
+    print(f"Окон для нарезки: {len(jobs)}", flush=True)
+    print(f"Суммарная длительность: {format_timecode(total_seconds)}", flush=True)
+    print(f"Оценка места для WAV: {format_size(estimated_bytes)}", flush=True)
+    for job in jobs:
+        kinds = ", ".join(job["sources"]) or "неизвестный источник"
+        print(
+            f"  {format_timecode(float(job['start_seconds']))}–"
+            f"{format_timecode(float(job['end_seconds']))}  {kinds}\n"
+            f"    → {job['output_audio']}",
+            flush=True,
+        )
+
+
+def extract_window_audio(jobs: list[dict[str, object]]) -> None:
+    """Create 16 kHz mono WAV copies without touching the original recordings."""
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("ffmpeg не найден; нарезка WAV невозможна.")
+    manifests: dict[Path, list[dict[str, object]]] = {}
+    for job in jobs:
+        output_path = Path(str(job["output_audio"]))
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        manifests.setdefault(output_path.parent, []).append(job)
+        if output_path.exists() and output_path.stat().st_size > 0:
+            print(f"Уже существует, пропускаю: {output_path}", flush=True)
+            continue
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-n",
+            "-ss", f"{float(job['start_seconds']):.3f}",
+            "-t", f"{float(job['duration_seconds']):.3f}",
+            "-i", str(job["source_audio"]),
+            "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
+            "-c:a", "pcm_s16le", str(output_path),
+        ]
+        subprocess.run(command, check=True)
+        print(f"Создано: {output_path}", flush=True)
+    for directory, manifest_jobs in manifests.items():
+        (directory / "window_manifest.json").write_text(
+            json.dumps({"windows": manifest_jobs}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
 
 def iter_subtitle_files(root: Path):
@@ -252,12 +662,39 @@ def looks_like_youtube_id(video_id: str) -> bool:
     return has_alpha and (has_digit or (has_lower and has_upper))
 
 
-def collect_audio_youtube_ids(search_roots: list[Path], download_dir: Path, include_chunks: bool) -> set[str]:
-    audio_files = collect_audio_files([*search_roots, download_dir], include_chunks)
-    ids: set[str] = set()
-    for path in audio_files:
-        ids.update(youtube_ids_from_text(path.stem))
+def youtube_ids_from_path(path: Path) -> list[str]:
+    """Extract IDs only from path components that can genuinely identify a video."""
+    ids: list[str] = []
+    seen: set[str] = set()
+
+    def add(video_id: str) -> None:
+        if video_id not in seen and looks_like_youtube_id(video_id):
+            ids.append(video_id)
+            seen.add(video_id)
+
+    for component in path.parts:
+        if len(component) == 11:
+            add(component)
+    trailing = re.search(r"(?:^|_)([A-Za-z0-9_-]{11})$", path.stem)
+    if trailing:
+        add(trailing.group(1))
     return ids
+
+
+def collect_audio_youtube_ids(search_roots: list[Path], download_dir: Path, include_chunks: bool) -> set[str]:
+    return set(collect_audio_youtube_sources(search_roots, download_dir, include_chunks))
+
+
+def collect_audio_youtube_sources(
+    search_roots: list[Path],
+    download_dir: Path,
+    include_chunks: bool,
+) -> dict[str, Path]:
+    sources: dict[str, Path] = {}
+    for path in collect_audio_files([*search_roots, download_dir], include_chunks):
+        for video_id in youtube_ids_from_path(path):
+            sources.setdefault(video_id, path)
+    return sources
 
 
 def collect_audio_files_by_youtube_ids(root: Path, video_ids: list[str]) -> list[Path]:
@@ -265,7 +702,7 @@ def collect_audio_files_by_youtube_ids(root: Path, video_ids: list[str]) -> list
         return []
     by_id: dict[str, list[Path]] = {video_id: [] for video_id in video_ids}
     for path in collect_audio_files([root], include_chunks=False):
-        for video_id in youtube_ids_from_text(path.stem):
+        for video_id in youtube_ids_from_path(path):
             if video_id in by_id:
                 by_id[video_id].append(path)
     selected: list[Path] = []
@@ -578,6 +1015,36 @@ def print_latest_citation_summary(log_dir: Path, bible_path: Path = DEFAULT_BIBL
             print(f"  {line}", flush=True)
 
 
+def replay_batch_summary_lines(run_dirs: list[Path]) -> list[str]:
+    """Describe every detected citation in a replay batch for the operator."""
+    lines = ["Итоги эмуляции:"]
+    for run_dir in run_dirs:
+        source_audio = session_source_audio(run_dir / "trigger_cases.jsonl")
+        display_name = Path(source_audio).name if source_audio else run_dir.name
+        cases = load_jsonl(run_dir / "trigger_cases.jsonl")
+        lines.append("")
+        lines.append(f"Файл: {display_name}")
+        if not cases:
+            lines.append("  Цитаты не обнаружены.")
+            continue
+        for index, case in enumerate(cases, start=1):
+            timecode = str(case.get("timecode") or "время не записано")
+            ref = str(case.get("ref") or "ссылка не определена")
+            lines.append(f"  {index}. {timecode}  {ref} — {citation_detection_label(case)}")
+    return lines
+
+
+def write_replay_batch_summary(log_dir: Path, run_dirs: list[Path]) -> Path | None:
+    if not run_dirs:
+        return None
+    summary_path = log_dir / f"replay_summary_{run_dirs[-1].name}.txt"
+    summary_path.write_text(
+        "\n".join(replay_batch_summary_lines(run_dirs)) + "\n",
+        encoding="utf-8",
+    )
+    return summary_path
+
+
 def is_unreviewed_case(case: dict) -> bool:
     return str(case.get("status") or "unreviewed") == "unreviewed"
 
@@ -720,6 +1187,33 @@ def print_discovered_youtube_ids(
     return missing
 
 
+def print_replay_inventory(
+    search_roots: list[Path],
+    subtitle_roots: list[Path],
+    download_dir: Path,
+    *,
+    include_chunks: bool,
+) -> None:
+    audio_sources = collect_audio_youtube_sources(search_roots, download_dir, include_chunks)
+    subtitle_sources = collect_subtitle_youtube_ids(subtitle_roots)
+    both = sorted(set(audio_sources) & set(subtitle_sources))
+    audio_without_subtitles = sorted(set(audio_sources) - set(subtitle_sources))
+    subtitles_without_audio = sorted(set(subtitle_sources) - set(audio_sources))
+
+    print("Инвентаризация набора Rodnik:", flush=True)
+    print(f"  роликов с аудио: {len(audio_sources)}", flush=True)
+    print(f"  роликов с субтитрами: {len(subtitle_sources)}", flush=True)
+    print(f"  готовы для отбора окон: {len(both)}", flush=True)
+    print(f"  аудио без субтитров: {len(audio_without_subtitles)}", flush=True)
+    print(f"  субтитры без аудио: {len(subtitles_without_audio)}", flush=True)
+    if not audio_without_subtitles:
+        return
+    print("", flush=True)
+    print("Ролики, для которых нужно искать или скачать субтитры:", flush=True)
+    for video_id in audio_without_subtitles:
+        print(f"  {video_id}  audio={audio_sources[video_id]}", flush=True)
+
+
 def pcm_chunks(path: Path, sample_rate: int, chunk_bytes: int):
     if path.suffix.lower() == ".wav":
         try:
@@ -771,6 +1265,7 @@ def replay_audio_file(
     model: object,
     grammar: list[str] | None,
     text_searcher: BibleTextSearcher | None,
+    session_state: dict[str, object] | None = None,
 ) -> Path | None:
     logger = JsonlLogger(args.log_dir, enabled=not args.no_log)
     pipeline = LiveReferencePipeline(args.bible, buffer_parts=args.vosk_buffer_parts)
@@ -780,6 +1275,7 @@ def replay_audio_file(
         else None
     )
     replay_state: dict[str, dict | None] = {"long_passage": None}
+    context_restored = restore_replay_session_context(pipeline, replay_state, session_state)
     if args.asr_engine == "sherpa-0.54":
         recognizer = SherpaReplayRecognizer(model, args.samplerate)
     else:
@@ -821,6 +1317,7 @@ def replay_audio_file(
             "vosk_buffer_parts": args.vosk_buffer_parts,
             "audio": "audio.wav" if audio_path else "",
             "grammar": None if grammar is None else grammar_diagnostics(grammar),
+            "continued_window_context": context_restored,
         }
     )
 
@@ -874,6 +1371,7 @@ def replay_audio_file(
         if audio_log:
             audio_log.close()
         recognizer = None
+        save_replay_session_context(pipeline, replay_state, session_state)
 
     print(f"Готово: {path}", flush=True)
     if logger.run_dir:
@@ -1005,6 +1503,46 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Directory to search for .srt/.txt files with YouTube IDs.",
     )
+    parser.add_argument(
+        "--inventory",
+        action="store_true",
+        help="Print local audio/subtitle coverage by YouTube video ID without downloading or replaying.",
+    )
+    parser.add_argument(
+        "--plan-subtitle-windows",
+        action="store_true",
+        help="Write candidate windows from timed local subtitles; does not process audio.",
+    )
+    parser.add_argument(
+        "--window-plan-dir",
+        type=Path,
+        default=DEFAULT_WINDOW_PLAN_DIR,
+        help="Directory for --plan-subtitle-windows JSON plans.",
+    )
+    parser.add_argument(
+        "--control-windows",
+        type=int,
+        default=DEFAULT_CONTROL_WINDOWS_PER_PLAN,
+        help="Number of ordinary-speech control windows per subtitle plan (default: 3).",
+    )
+    parser.add_argument(
+        "--extract-window-plan",
+        action="append",
+        type=Path,
+        help="Create WAV copies from one or more saved subtitle-window plans.",
+    )
+    parser.add_argument(
+        "--window-audio-dir",
+        type=Path,
+        default=DEFAULT_WINDOW_AUDIO_DIR,
+        help="Directory for WAV copies created by --extract-window-plan.",
+    )
+    parser.add_argument(
+        "--replay-window-plan",
+        action="append",
+        type=Path,
+        help="Replay all WAV copies belonging to one or more extracted window plans.",
+    )
     parser.add_argument("--audio", action="append", type=Path, help="Specific audio file to replay.")
     parser.add_argument("--include-chunks", action="store_true", help="Include *_chunks directories in auto search.")
     parser.add_argument("--limit", type=int, default=0, help="Limit auto-selected files.")
@@ -1077,7 +1615,69 @@ def main() -> int:
         print_latest_citation_summary(args.log_dir, bible_path=args.bible)
         return 0
     search_roots = args.search_root or list(DEFAULT_SEARCH_ROOTS)
-    subtitle_roots = args.subtitle_root or [PROJECTS_ROOT]
+    subtitle_roots = args.subtitle_root or list(DEFAULT_SUBTITLE_ROOTS)
+    if args.inventory:
+        print_replay_inventory(
+            search_roots,
+            subtitle_roots,
+            args.download_dir,
+            include_chunks=args.include_chunks,
+        )
+        return 0
+    if args.plan_subtitle_windows:
+        audio_paths = list(args.audio or [])
+        if not audio_paths:
+            raise SystemExit("Для --plan-subtitle-windows укажите хотя бы один --audio файл.")
+        missing_audio = [path for path in audio_paths if not path.exists()]
+        if missing_audio:
+            raise SystemExit("Указанные --audio файлы не найдены:\n" + "\n".join(map(str, missing_audio)))
+        try:
+            write_subtitle_window_plan(
+                audio_paths,
+                subtitle_roots,
+                args.window_plan_dir,
+                text_detection_db=args.text_detection_db,
+                control_windows=max(0, args.control_windows),
+            )
+        except (OSError, ValueError) as error:
+            raise SystemExit(str(error)) from error
+        return 0
+    if args.extract_window_plan:
+        try:
+            jobs = window_audio_jobs(list(args.extract_window_plan), args.window_audio_dir)
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
+        print_window_audio_jobs(jobs)
+        if not args.run:
+            print("Это только предварительный просмотр. Для нарезки добавьте --run.", flush=True)
+            return 0
+        try:
+            extract_window_audio(jobs)
+        except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+            raise SystemExit(f"Нарезка не завершена: {error}") from error
+        return 0
+    planned_audio: list[Path] = []
+    planned_session_keys: dict[Path, str] = {}
+    if args.replay_window_plan:
+        try:
+            jobs = window_audio_jobs(list(args.replay_window_plan), args.window_audio_dir)
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
+        planned_audio = [Path(str(job["output_audio"])) for job in jobs]
+        planned_session_keys = {
+            Path(str(job["output_audio"])).resolve(): (
+                f"{Path(str(job['plan'])).resolve()}:{int(job['parent_window_index'])}"
+            )
+            for job in jobs
+        }
+        missing_planned_audio = [path for path in planned_audio if not path.is_file()]
+        if missing_planned_audio:
+            missing_list = "\n".join(f"  - {path}" for path in missing_planned_audio)
+            raise SystemExit(
+                "WAV-фрагменты ещё не созданы. Сначала выполните "
+                "--extract-window-plan ... --run:\n" + missing_list
+            )
+        print(f"Фрагментов из плана для replay: {len(planned_audio)}", flush=True)
     download_urls = list(args.download_url)
     download_video_ids: list[str] = []
     if args.download_from_subtitles:
@@ -1105,7 +1705,7 @@ def main() -> int:
     downloaded = download_audio(download_urls, args.download_dir)
     if args.download_from_subtitles and args.run and download_video_ids:
         downloaded = collect_audio_files_by_youtube_ids(args.download_dir, download_video_ids)
-    explicit_audio = list(args.audio or [])
+    explicit_audio = [*planned_audio, *(args.audio or [])]
     missing_explicit_audio = [path for path in explicit_audio if not path.exists()]
     if missing_explicit_audio:
         missing_list = "\n".join(f"  - {path}" for path in missing_explicit_audio)
@@ -1160,16 +1760,27 @@ def main() -> int:
     if text_detection_enabled:
         text_searcher = BibleTextSearcher(args.text_detection_db)
     run_dirs: list[Path] = []
+    window_sessions: dict[str, dict[str, object]] = {}
     try:
         for index, path in enumerate(files, start=1):
             print(f"\nReplay {index}/{len(files)}: {path}", flush=True)
-            run_dir = replay_audio_file(path, args, model, grammar, text_searcher)
+            session_key = planned_session_keys.get(path.resolve())
+            session_state = window_sessions.setdefault(session_key, {}) if session_key else None
+            run_dir = replay_audio_file(
+                path,
+                args,
+                model,
+                grammar,
+                text_searcher,
+                session_state=session_state,
+            )
             if run_dir:
                 run_dirs.append(run_dir)
     finally:
         if text_searcher is not None:
             text_searcher.close()
     batch_path = write_latest_replay_batch(args.log_dir, run_dirs)
+    summary_path = write_replay_batch_summary(args.log_dir, run_dirs)
     print_annotation_summary(
         args.log_dir,
         run_dirs,
@@ -1178,6 +1789,10 @@ def main() -> int:
     if batch_path:
         print("", flush=True)
         print(f"Последняя пачка replay: {batch_path}", flush=True)
+        if summary_path:
+            print(f"Итоги эмуляции сохранены: {summary_path}", flush=True)
+            for line in replay_batch_summary_lines(run_dirs):
+                print(line, flush=True)
         print(
             ".venv/bin/python tools/review_trigger_cases.py --latest-batch",
             flush=True,
