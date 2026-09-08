@@ -263,7 +263,13 @@ class ScriptureTextDetector:
                 # A wider, independently strong range is more useful than a
                 # high-scoring suffix: it preserves the beginning of the
                 # passage that is still audible in the same speech window.
-                and item.score >= best.score - BROADER_RANGE_SCORE_TOLERANCE
+                and (
+                    item.score >= best.score - BROADER_RANGE_SCORE_TOLERANCE
+                    # A range meeting the stricter range-evidence rule must
+                    # not lose merely because its last verse was recognized
+                    # more cleanly in a short suffix window.
+                    or item.reason == "immediate_strong_range_match"
+                )
             ]
             if broader:
                 best = max(

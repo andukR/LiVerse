@@ -86,6 +86,10 @@ LATEST_REPLAY_BATCH = "latest_replay_batch.json"
 DEFAULT_TARGET_ANNOTATIONS = 200
 DEFAULT_WINDOW_PLAN_DIR = Path(".cache") / "liverse" / "replay_window_plans"
 DEFAULT_WINDOW_AUDIO_DIR = Path(".cache") / "liverse" / "replay_window_audio"
+WINDOW_AUDIO_PART_RE = re.compile(
+    r"^(?P<window>\d+)_(?:citation|control)_part\d+_"
+    r"(?P<start>\d+)_(?P<end>\d+)\.wav$"
+)
 DEFAULT_CONTROL_WINDOWS_PER_PLAN = 3
 CONTROL_WINDOW_SECONDS = 45.0
 MAX_REPLAY_WINDOW_SECONDS = 120.0
@@ -871,6 +875,81 @@ def load_jsonl(path: Path) -> list[dict]:
     return rows
 
 
+def save_jsonl(path: Path, rows: list[dict]) -> None:
+    path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
+def replay_case_audio_position(case: dict, cases_path: Path) -> tuple[str, str, float, float, float] | None:
+    """Return video/window and source-time position of a replay trigger."""
+    source_path = Path(session_source_audio(cases_path))
+    match = WINDOW_AUDIO_PART_RE.fullmatch(source_path.name)
+    if not match:
+        return None
+    asr = case.get("asr") if isinstance(case.get("asr"), dict) else {}
+    words = asr.get("result") if isinstance(asr.get("result"), list) else []
+    if not words or not isinstance(words[0], dict):
+        return None
+    try:
+        part_start = float(match.group("start"))
+        part_end = float(match.group("end"))
+        first_word = float(words[0].get("start"))
+    except (TypeError, ValueError):
+        return None
+    return (
+        source_path.parent.name,
+        match.group("window"),
+        part_start,
+        part_end,
+        part_start + first_word,
+    )
+
+
+def exclude_replay_overlap_duplicates(run_dirs: list[Path]) -> int:
+    """Exclude only triggers duplicated by overlapping WAV parts of one window."""
+    seen: list[tuple[str, str, str, float, float, float]] = []
+    excluded = 0
+    for run_dir in run_dirs:
+        cases_path = run_dir / "trigger_cases.jsonl"
+        cases = load_jsonl(cases_path)
+        changed = False
+        for case in cases:
+            if not is_unreviewed_case(case):
+                continue
+            ref = str(case.get("ref") or "").strip()
+            position = replay_case_audio_position(case, cases_path)
+            if not ref or position is None:
+                continue
+            video, window, start, end, first_word_at = position
+            duplicate = False
+            for prior_video, prior_window, prior_ref, prior_start, prior_end, prior_first_word_at in seen:
+                overlap_start = max(start, prior_start)
+                overlap_end = min(end, prior_end)
+                if (
+                    video == prior_video
+                    and window == prior_window
+                    and ref == prior_ref
+                    and overlap_start <= overlap_end
+                    and overlap_start <= first_word_at <= overlap_end
+                    and overlap_start <= prior_first_word_at <= overlap_end
+                ):
+                    duplicate = True
+                    break
+            if duplicate:
+                case["status"] = "reviewed"
+                case["review_category"] = "excluded_cascade"
+                case["note"] = "Автоматически исключено: повтор в перекрытии соседних WAV-фрагментов."
+                changed = True
+                excluded += 1
+                continue
+            seen.append((video, window, ref, start, end, first_word_at))
+        if changed:
+            save_jsonl(cases_path, cases)
+    return excluded
+
+
 def citation_detection_label(case: dict) -> str:
     payload = case.get("payload") if isinstance(case.get("payload"), dict) else {}
     return "по тексту" if payload.get("source") == "text_citation" else "по адресу"
@@ -1086,6 +1165,17 @@ def trigger_case_files(log_dir: Path) -> list[Path]:
     return sorted(log_dir.glob("*/trigger_cases.jsonl"), key=lambda path: path.parent.name)
 
 
+def annotation_history_case_files(log_dir: Path) -> tuple[list[Path], str]:
+    """Return all Rodnik batches when replay is running inside that archive."""
+    history_root = log_dir.parent.parent
+    if log_dir.name == "logs" and history_root.name == "rodnik_replay_batches":
+        return (
+            sorted(history_root.glob("*/logs/*/trigger_cases.jsonl")),
+            "Во всех пачках Родника",
+        )
+    return trigger_case_files(log_dir), "Всего в логах"
+
+
 def annotation_stats(cases_paths: list[Path]) -> dict[str, int]:
     total = 0
     reviewed_signatures: set[tuple[str, str, str, str, str]] = set()
@@ -1122,7 +1212,8 @@ def annotation_stats(cases_paths: list[Path]) -> dict[str, int]:
 
 
 def print_annotation_summary(log_dir: Path, run_dirs: list[Path], *, target_annotations: int) -> None:
-    all_stats = annotation_stats(trigger_case_files(log_dir))
+    history_paths, history_label = annotation_history_case_files(log_dir)
+    all_stats = annotation_stats(history_paths)
     batch_paths = [path / "trigger_cases.jsonl" for path in run_dirs if (path / "trigger_cases.jsonl").exists()]
     batch_stats = annotation_stats(batch_paths)
     remaining_to_target = max(0, target_annotations - all_stats["reviewed"])
@@ -1137,7 +1228,7 @@ def print_annotation_summary(log_dir: Path, run_dirs: list[Path], *, target_anno
         flush=True,
     )
     print(
-        f"  Всего в логах: файлов {all_stats['files']}, "
+        f"  {history_label}: файлов {all_stats['files']}, "
         f"срабатываний {all_stats['total']}, размечено {all_stats['reviewed']}, "
         f"неразмечено {all_stats['unreviewed']}",
         flush=True,
@@ -1779,6 +1870,12 @@ def main() -> int:
     finally:
         if text_searcher is not None:
             text_searcher.close()
+    overlap_duplicates = exclude_replay_overlap_duplicates(run_dirs)
+    if overlap_duplicates:
+        print(
+            f"Автоматически исключено повторов из перекрытия WAV-фрагментов: {overlap_duplicates}",
+            flush=True,
+        )
     batch_path = write_latest_replay_batch(args.log_dir, run_dirs)
     summary_path = write_replay_batch_summary(args.log_dir, run_dirs)
     print_annotation_summary(

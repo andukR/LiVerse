@@ -1435,7 +1435,7 @@ def scripture_range_quick_presentation_body(args: Any, base_url: str, payload: d
 
 
 def scripture_range_reading_state(payload: dict, slides: list[dict]) -> dict | None:
-    """Describe the last Bible verse on each generated Holyrics slide."""
+    """Describe the Bible verse bounds on each generated Holyrics slide."""
     book = str(payload.get("book") or "").strip()
     book_id = HOLYRICS_BOOK_INDEX.get(book)
     ref = str(payload.get("ref") or "").strip()
@@ -1446,10 +1446,13 @@ def scripture_range_reading_state(payload: dict, slides: list[dict]) -> dict | N
         matches = list(_VERSE_LINE_RE.finditer(str(slide.get("text") or "")))
         if not matches:
             return None
+        first = matches[0]
         last = matches[-1]
         targets.append(
             {
                 "slide_index": slide_index,
+                "start_chapter": int(first.group(1)),
+                "start_verse": int(first.group(2)),
                 "chapter": int(last.group(1)),
                 "verse": int(last.group(2)),
                 "text": last.group(3).strip(),
@@ -1547,6 +1550,42 @@ def handle_scripture_range_reading_match(args: Any, candidate: Any) -> dict:
         and candidate_start <= int(target["verse"]) <= candidate_end
     )
     if not matched_boundary:
+        # A preacher may announce the whole range but start reading at a later
+        # verse.  Synchronize directly to the slide containing that verse.
+        # Never move backwards automatically.
+        candidate_position = (candidate_chapter, candidate_start)
+        if candidate_book_id == int(state.get("book_id") or 0):
+            for later_index in range(current_index + 1, len(targets)):
+                later = targets[later_index]
+                if "start_chapter" not in later or "start_verse" not in later:
+                    continue
+                start_position = (int(later["start_chapter"]), int(later["start_verse"]))
+                end_position = (int(later["chapter"]), int(later["verse"]))
+                if not start_position <= candidate_position <= end_position:
+                    continue
+                base_url = str(getattr(args, "holyrics_url", "")).rstrip("/")
+                ok, reason, _body = post_holyrics_api(
+                    args,
+                    base_url,
+                    "ActionGoToIndex",
+                    {"index": later_index},
+                )
+                if ok:
+                    state["current_index"] = later_index
+                return {
+                    "active": True,
+                    "matched_boundary": False,
+                    "advanced": ok,
+                    "synchronized_forward": ok,
+                    "reason": reason or (
+                        "long_passage_slide_synchronized_forward"
+                        if ok
+                        else "long_passage_sync_forward_failed"
+                    ),
+                    "current_index": current_index,
+                    "next_index": later_index,
+                    "target": later,
+                }
         return {
             "active": True,
             "matched_boundary": False,

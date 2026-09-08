@@ -385,6 +385,40 @@ class ScriptureTextDetectorTest(unittest.TestCase):
         self.assertTrue(decision.accepted)
         self.assertEqual("Флп. 3:8-9", decision.reference)
 
+    def test_strong_full_range_beats_much_cleaner_last_verse_suffix(self) -> None:
+        suffix = hit(
+            "1Фес. 5:5", 91.62,
+            matched=("ибо", "все", "свет", "сыны", "дня"),
+            bigram=70.0,
+            trigram=55.0,
+            book_id=52,
+            chapter=5,
+            verse=5,
+        )
+        full_range = hit(
+            "1Фес. 5:4-5", 72.14,
+            matched=("тьма", "чтобы", "тать", "ибо", "сыны"),
+            bigram=61.9,
+            trigram=45.0,
+            book_id=52,
+            chapter=5,
+            verse=4,
+            end_verse=5,
+        )
+        unrelated = hit("Есф. 8:12", 40.0, matched=("вы",), bigram=0.0, trigram=0.0)
+        detector = ScriptureTextDetector(
+            FakeSearcher([[suffix, unrelated], [full_range, unrelated]]),
+            self.config(window_sizes=(5, 10), buffer_words=10, immediate_score=90.0),
+        )
+
+        decision = detector.process_fragment(
+            "но вы братья не во тьме чтобы татья ибо все вы сыны дня",
+            now=0.0,
+        )
+
+        self.assertTrue(decision.accepted)
+        self.assertEqual("1Фес. 5:4-5", decision.reference)
+
     def test_weak_two_verse_range_does_not_use_relaxed_range_rule(self) -> None:
         weak_range = hit(
             "Пс. 22:1-2", 65.0,
@@ -895,6 +929,66 @@ class TextCitationIntegrationTest(unittest.TestCase):
             self.assertIn("  Цитаты не обнаружены.", lines)
             self.assertIsNotNone(summary_path)
             self.assertEqual("\n".join(lines) + "\n", summary_path.read_text(encoding="utf-8"))
+
+    def test_rodnik_annotation_history_includes_previous_batches(self) -> None:
+        from tools.replay_audio_files import annotation_history_case_files, annotation_stats
+
+        with tempfile.TemporaryDirectory() as temporary:
+            history_root = Path(temporary) / "rodnik_replay_batches"
+            first = history_root / "20260907_120000" / "logs" / "first"
+            current = history_root / "20260908_120000" / "logs" / "current"
+            first.mkdir(parents=True)
+            current.mkdir(parents=True)
+            (first / "trigger_cases.jsonl").write_text(
+                json.dumps({"case_id": "trigger_0001", "status": "reviewed", "ref": "Иоанн 3:16"}) + "\n",
+                encoding="utf-8",
+            )
+            (current / "trigger_cases.jsonl").write_text(
+                json.dumps({"case_id": "trigger_0001", "status": "unreviewed", "ref": "Ефесянам 3:14"}) + "\n",
+                encoding="utf-8",
+            )
+
+            paths, label = annotation_history_case_files(current.parent)
+            stats = annotation_stats(paths)
+
+        self.assertEqual("Во всех пачках Родника", label)
+        self.assertEqual(2, stats["files"])
+        self.assertEqual(1, stats["reviewed"])
+        self.assertEqual(1, stats["unreviewed"])
+
+    def test_replay_overlap_duplicate_is_excluded_from_annotation(self) -> None:
+        from tools.replay_audio_files import exclude_replay_overlap_duplicates, load_jsonl
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first_run = root / "first"
+            second_run = root / "second"
+            first_run.mkdir()
+            second_run.mkdir()
+            for run, source_name, first_word in (
+                (first_run, "08_citation_part01_001286_001406.wav", 115.39),
+                (second_run, "08_citation_part02_001401_001469.wav", 0.0),
+            ):
+                source = root / "video" / source_name
+                (run / "session.json").write_text(
+                    json.dumps({"source_audio": str(source)}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                (run / "trigger_cases.jsonl").write_text(
+                    json.dumps({
+                        "case_id": "trigger_0001",
+                        "status": "unreviewed",
+                        "ref": "Марк 12:29-30",
+                        "asr": {"result": [{"start": first_word}]},
+                    }, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+
+            self.assertEqual(1, exclude_replay_overlap_duplicates([first_run, second_run]))
+            self.assertEqual("unreviewed", load_jsonl(first_run / "trigger_cases.jsonl")[0]["status"])
+            duplicate = load_jsonl(second_run / "trigger_cases.jsonl")[0]
+            self.assertEqual("reviewed", duplicate["status"])
+            self.assertEqual("excluded_cascade", duplicate["review_category"])
 
     def test_sherpa_subwords_are_converted_to_timed_vosk_words(self) -> None:
         from bible_parser_core.sherpa_streaming import DEFAULT_SHERPA_THREADS

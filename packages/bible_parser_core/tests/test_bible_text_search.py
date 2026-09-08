@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from bible_parser_core.bible_text_search import normalize_bible_text
+
 
 class _IdentityMorph:
     def parse(self, token: str) -> list[SimpleNamespace]:
@@ -15,6 +17,12 @@ class _IdentityMorph:
 
 
 class BibleTextSearcherTest(unittest.TestCase):
+    def test_normalize_text_search_tatya_sherpa_distortion(self) -> None:
+        self.assertEqual(
+            ["как", "тать", "ибо"],
+            normalize_bible_text("как татья ибо"),
+        )
+
     def test_search_ranks_matching_verse_first(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             db_path = Path(temporary) / "bible_index.db"

@@ -2074,6 +2074,31 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
                 self.assertEqual("Ефесянам 2:9-10", result.get("parsed", {}).get("ref"))
 
+    def test_ephesians_sixth_chapter_sherpa_distortion_keeps_range(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text(
+            "послание вся нам читаю глава с первого очетвёртый стих"
+        )
+
+        self.assertEqual("Ефесянам 6:1-4", result.get("parsed", {}).get("ref"))
+
+    def test_ephesians_fused_vsyana_sherpa_distortion(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text(
+            "послание всяна пятая глава четырнадцать стих встане спящий и воскреснее из мёртвых осветить тебя христос"
+        )
+
+        self.assertEqual("Ефесянам 5:14", result.get("parsed", {}).get("ref"))
+
+    def test_leviticus_limits_sherpa_distortion(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("книга лимитов двадцатое глава девятый стиль")
+
+        self.assertEqual("Левит 20:9", result.get("parsed", {}).get("ref"))
+
     def test_numbered_fes_still_resolves_to_thessalonians(self):
         pipeline = LiveReferencePipeline()
 
@@ -2570,6 +2595,57 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertEqual("Бытие 22:1-3", result.get("parsed", {}).get("ref"))
 
+    def test_sherpa_truncated_twenty_fourth_verse_does_not_become_range(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("деньга бытие вторая глава двадцать четвёрт стих")
+
+        self.assertEqual("Бытие 2:24", result.get("parsed", {}).get("ref"))
+
+    def test_sherpa_truncated_twenty_ordinal_verse_endings_are_single_verses(self):
+        pipeline = LiveReferencePipeline()
+        endings = (
+            ("перв", 21),
+            ("втор", 22),
+            ("трет", 23),
+            ("четверт", 24),
+            ("пят", 25),
+            ("шест", 26),
+            ("седьм", 27),
+            ("восьм", 28),
+            ("девят", 29),
+        )
+
+        for ending, verse in endings:
+            with self.subTest(ending=ending):
+                result = pipeline.process_text(
+                    f"бытие двадцать четвертая глава двадцать {ending} стих"
+                )
+                self.assertEqual(f"Бытие 24:{verse}", result.get("parsed", {}).get("ref"))
+
+    def test_sherpa_other_truncated_ordinal_verse_endings_are_single_verses(self):
+        pipeline = LiveReferencePipeline()
+        endings = (
+            ("одиннад", 11),
+            ("двенад", 12),
+            ("тринад", 13),
+            ("четырнад", 14),
+            ("пятнад", 15),
+            ("шестнад", 16),
+            ("семнад", 17),
+            ("восемнад", 18),
+            ("девятнад", 19),
+            ("двад", 20),
+            ("трид", 30),
+        )
+
+        for ending, verse in endings:
+            with self.subTest(ending=ending):
+                result = pipeline.process_text(
+                    f"бытие двадцать четвертая глава {ending} стих"
+                )
+                self.assertEqual(f"Бытие 24:{verse}", result.get("parsed", {}).get("ref"))
+
     def test_full_jude_apostle_name_still_parses(self):
         pipeline = LiveReferencePipeline()
 
@@ -2606,7 +2682,7 @@ class LiveReferencePipelineTest(unittest.TestCase):
         )
 
         self.assertFalse(result.get("matched"))
-        self.assertEqual("resolver_conflicts_with_timothy", result.get("blocked_weak_context"))
+        self.assertTrue(result.get("blocked_no_book_context"))
 
     def test_explicit_numbered_timothy_still_works(self):
         pipeline = LiveReferencePipeline()
@@ -2924,6 +3000,10 @@ class LiveReferencePipelineTest(unittest.TestCase):
             [6, 11, 15, 20],
             [item["verse"] for item in args._holyrics_scripture_range_reading["targets"]],
         )
+        self.assertEqual(
+            [1, 7, 12, 16],
+            [item["start_verse"] for item in args._holyrics_scripture_range_reading["targets"]],
+        )
 
     def test_showing_long_range_caches_current_text_presentation_for_restore(self):
         pipeline = LiveReferencePipeline()
@@ -3023,6 +3103,89 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertTrue(result["active"])
         self.assertFalse(result["matched_boundary"])
         self.assertTrue(scripture_range_reading_active(args))
+
+    def test_later_verse_synchronizes_one_verse_long_range_forward(self):
+        args = SimpleNamespace(
+            holyrics_url="http://127.0.0.1:8091",
+            _holyrics_scripture_range_reading={
+                "ref": "Матфей 24:40-46",
+                "book": "Матфей",
+                "book_id": 40,
+                "current_index": 2,
+                "targets": [
+                    {
+                        "slide_index": index,
+                        "start_chapter": 24,
+                        "start_verse": verse,
+                        "chapter": 24,
+                        "verse": verse,
+                        "text": "стих",
+                    }
+                    for index, verse in enumerate(range(40, 47))
+                ],
+            },
+        )
+        verse_forty_three = SimpleNamespace(
+            book_id=40,
+            chapter=24,
+            start_verse=43,
+            end_verse=43,
+        )
+
+        with patch("tools.holyrics.post_holyrics_api", return_value=(True, "", "")) as api:
+            result = handle_scripture_range_reading_match(args, verse_forty_three)
+
+        self.assertTrue(result["advanced"])
+        self.assertTrue(result["synchronized_forward"])
+        self.assertEqual(3, args._holyrics_scripture_range_reading["current_index"])
+        api.assert_called_once_with(
+            args,
+            "http://127.0.0.1:8091",
+            "ActionGoToIndex",
+            {"index": 3},
+        )
+
+    def test_verse_inside_current_compact_slide_does_not_advance(self):
+        args = SimpleNamespace(
+            _holyrics_scripture_range_reading={
+                "ref": "Матфей 24:40-46",
+                "book": "Матфей",
+                "book_id": 40,
+                "current_index": 0,
+                "targets": [
+                    {
+                        "slide_index": 0,
+                        "start_chapter": 24,
+                        "start_verse": 40,
+                        "chapter": 24,
+                        "verse": 44,
+                        "text": "стих",
+                    },
+                    {
+                        "slide_index": 1,
+                        "start_chapter": 24,
+                        "start_verse": 45,
+                        "chapter": 24,
+                        "verse": 46,
+                        "text": "стих",
+                    },
+                ],
+            }
+        )
+        verse_forty_three = SimpleNamespace(
+            book_id=40,
+            chapter=24,
+            start_verse=43,
+            end_verse=43,
+        )
+
+        with patch("tools.holyrics.post_holyrics_api") as api:
+            result = handle_scripture_range_reading_match(args, verse_forty_three)
+
+        self.assertFalse(result["matched_boundary"])
+        self.assertNotIn("advanced", result)
+        self.assertEqual(0, args._holyrics_scripture_range_reading["current_index"])
+        api.assert_not_called()
 
     def test_manual_right_arrow_synchronizes_long_range_slide(self):
         args = SimpleNamespace(
@@ -3849,6 +4012,70 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertEqual("Даниил 1:5", result.get("parsed", {}).get("ref"))
         self.assertGreaterEqual(result.get("risk_score"), 0.6)
         self.assertEqual("high", result.get("risk_level"))
+
+    def test_fuzzy_book_match_with_low_confidence_requires_high_risk(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text(
+            "написано небытие вторая глава от вас четвёртой стены а ставит",
+            asr_result={
+                "result": [
+                    {"word": "написано", "start": 46.28, "end": 47.24, "conf": 0.588385},
+                    {"word": "небытие", "start": 47.24, "end": 47.88, "conf": 0.410196},
+                    {"word": "вторая", "start": 47.88, "end": 48.24, "conf": 0.852452},
+                    {"word": "глава", "start": 48.24, "end": 48.52, "conf": 0.642504},
+                    {"word": "от", "start": 48.52, "end": 48.68, "conf": 0.166842},
+                    {"word": "вас", "start": 48.68, "end": 48.84, "conf": 0.195274},
+                    {"word": "четвёртой", "start": 48.84, "end": 49.24, "conf": 0.626118},
+                    {"word": "стены", "start": 49.24, "end": 50.12, "conf": 0.314994},
+                    {"word": "а", "start": 50.12, "end": 50.16, "conf": 0.329638},
+                    {"word": "ставит", "start": 50.16, "end": 50.64, "conf": 0.197898},
+                ]
+            },
+        )
+
+        self.assertEqual("Бытие 2:4", result.get("parsed", {}).get("ref"))
+        self.assertEqual("high", result.get("risk_level"))
+        self.assertIn("fuzzy_book_match", result.get("risk_reasons"))
+        self.assertEqual(0.833, result.get("risk", {}).get("metrics", {}).get("book_match_confidence"))
+
+    def test_first_n_chapters_discussion_is_not_a_scripture_reference(self):
+        for phrase in (
+            "первые три главы",
+            "первые пять глав",
+            "в первых десяти главах",
+            "первых трёх глав",
+        ):
+            with self.subTest(phrase=phrase):
+                result = LiveReferencePipeline().process_text(
+                    f"без понимания {phrase} послания к ефесянам "
+                    "мы не поймём четвёртую пятую и шестую главу послания"
+                )
+
+                self.assertFalse(result.get("matched"))
+
+    def test_first_n_chapters_discussion_keeps_explicit_verse_reference(self):
+        result = LiveReferencePipeline().process_text(
+            "первые три главы послания к ефесянам важны, "
+            "но прочитаем ефесянам четвёртая глава пятый стих"
+        )
+
+        self.assertEqual("Ефесянам 4:5", result.get("parsed", {}).get("ref"))
+
+    def test_kofessionam_distortion_selects_ephesians_not_first_john(self):
+        result = LiveReferencePipeline().process_text(
+            "и давайте для этого мы прочитаем первую половину сегодняшнего отрывка "
+            "до послания кофессионам в третья глава с четырнадцатого девятнадцатый стих"
+        )
+
+        self.assertEqual("Ефесянам 3:14-19", result.get("parsed", {}).get("ref"))
+
+    def test_standalone_plural_epistles_is_not_a_book_name(self):
+        result = LiveReferencePipeline().process_text(
+            "мы изучаем послания третья глава с четырнадцатого по девятнадцатый стих"
+        )
+
+        self.assertFalse(result.get("matched"))
 
     def test_missing_twenty_before_range_end_is_restored(self):
         pipeline = LiveReferencePipeline()

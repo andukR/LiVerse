@@ -1332,6 +1332,21 @@ def score_reference_risk(payload: dict, asr_result: dict | None = None) -> dict:
         reasons.append("confusable_book_form")
 
     parsed = payload.get("parsed") or {}
+    try:
+        book_match_confidence = float(parsed.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        book_match_confidence = 0.0
+    # A book name accepted through fuzzy matching can turn unrelated ASR
+    # syllables into a valid, but wrong, reference.  Treat that as an
+    # additional warning; exact names and known normalizations keep 1.0.
+    if (
+        parsed
+        and 0.0 < book_match_confidence < 0.999
+        and {"low_word_confidence", "low_average_confidence"}.intersection(reasons)
+    ):
+        score += 0.25
+        reasons.append("fuzzy_book_match")
+        metrics["book_match_confidence"] = round(book_match_confidence, 3)
     if (
         parsed
         and parsed.get("start_verse") == parsed.get("end_verse")

@@ -414,8 +414,12 @@ ASR_REPLACEMENTS = (
     ),
     (r"\bе\s+фес\b", "ефесянам"),
     (r"\bефес\s+нам\b", "ефесянам"),
+    # Sherpa: «Ефесянам» -> «кофессионам» / «кофессианам».
+    (r"\bкофесси[оа]н[а-я]*\b", "ефесянам"),
     (r"\bфи\s+левит\b", "филиппийцам"),
     (r"\bпослани[ея]\s+фи\s+левит\b", "послание филиппийцам"),
+    # Sherpa: "книга Левитов" -> "книга лимитов".
+    (r"\bкнига\s+лимитов\b", "книга левит"),
     (r"\bфилиппитс\b", "филиппийцам"),
     (
         r"\b(?:1|первое|первая|первого)\s+(?:послани[ея]\s+)?фес+с?\s+салон(?:ик|ики)?\b",
@@ -446,6 +450,10 @@ ASR_REPLACEMENTS = (
     (r"\bвтор\w*\s+книг\w*\W+(?:пар|пара)ли\s+помин[а-я]*\b", "2 паралипоменон"),
     (r"\bи\s+вся\s+на\b", "ефесянам"),
     (r"\bвся\s+на\b", "ефесянам"),
+    (r"\b(?:и\s+)?всяна\b", "ефесянам"),
+    # Sherpa: "Ефесянам шестая глава" -> "вся нам читаю глава".
+    (r"\b(?:и\s+)?вся\s+нам\b", "ефесянам"),
+    (r"\bефесянам\s+читаю\s+глава\b", "ефесянам шестая глава"),
     (r"\bпервое\s+послание\s+(?:апостола\s+павл[аы]\s+)?ф[еэ]с[еоа]лоник[еий]*ц[ае]м\b", "1 фессалоникийцам"),
     (r"\bвторое\s+послание\s+(?:апостола\s+павл[аы]\s+)?ф[еэ]с[еоа]лоник[еий]*ц[ае]м\b", "2 фессалоникийцам"),
     (r"\b(?:первое|первая|1)\s+(?:послание\s+)?фес+с?\b", "1 фессалоникийцам"),
@@ -482,6 +490,42 @@ GENERIC_BOOK_VARIANTS = {
     "евангелие",
 }
 
+TRUNCATED_TWENTY_ORDINALS = {
+    "перв": 21,
+    "втор": 22,
+    "трет": 23,
+    "четверт": 24,
+    "пят": 25,
+    "шест": 26,
+    "седьм": 27,
+    "восьм": 28,
+    "девят": 29,
+}
+
+TRUNCATED_ORDINAL_VERSES = {
+    "одиннад": 11,
+    "двенад": 12,
+    "тринад": 13,
+    "четырнад": 14,
+    "пятнад": 15,
+    "шестнад": 16,
+    "семнад": 17,
+    "восемнад": 18,
+    "девятнад": 19,
+    "двад": 20,
+    "трид": 30,
+}
+
+
+def replace_truncated_twenty_ordinal(match: re.Match[str]) -> str:
+    """Restore a Sherpa-truncated ordinal immediately before ``стих``."""
+    return f"{TRUNCATED_TWENTY_ORDINALS[match.group(1)]} стих"
+
+
+def replace_truncated_ordinal_verse(match: re.Match[str]) -> str:
+    """Restore an observed Sherpa-truncated verse ordinal."""
+    return f"{TRUNCATED_ORDINAL_VERSES[match.group(1)]} стих"
+
 
 def normalize_text(text: str) -> str:
     normalized = text.lower().replace("ё", "е")
@@ -503,6 +547,19 @@ def normalize_text(text: str) -> str:
     normalized = re.sub(r"(\d+)\s*[-–]\s*(\d+)\s*[-–]?\s*х\b", r"\1-\2 стих", normalized)
     normalized = re.sub(r"(\d+)[-–]?(?:й|я|ю|е|го|му|м)\b", r"\1", normalized)
     normalized = re.sub(r"[^0-9а-яa-z]+", " ", normalized)
+    # Sherpa can cut the ending off an ordinal such as "двадцать пятый".
+    # Without this correction the number extractor leaves "20 пят", which
+    # the later fuzzy range rule mistakes for a range from verse 20.
+    normalized = re.sub(
+        r"\bдвадцать\s+(перв|втор|трет|четверт|пят|шест|седьм|восьм|девят)\w*\s+стих\b",
+        replace_truncated_twenty_ordinal,
+        normalized,
+    )
+    normalized = re.sub(
+        r"\b(одиннад|двенад|тринад|четырнад|пятнад|шестнад|семнад|восемнад|девятнад|двад|трид)\w*\s+стих\b",
+        replace_truncated_ordinal_verse,
+        normalized,
+    )
     normalized = replace_number_phrases(normalized)
     tokens = normalized.split()
     tokens = replace_number_words(tokens)
@@ -519,6 +576,7 @@ def normalize_text(text: str) -> str:
     normalized = re.sub(r"\b(\d+)\s+голова\b", r"\1 глава", normalized)
     normalized = re.sub(r"\b(\d+)\s+лас\b", r"\1 глава", normalized)
     normalized = re.sub(r"\b(\d+)\s+рюмке\b", r"\1 глава", normalized)
+    normalized = re.sub(r"\bс\s+(\d+)\s+очетверт\w*\s+стих", r"с \1 по 4 стих", normalized)
     normalized = re.sub(r"\b(\d+)\s+из\s+них\b", r"\1 стих", normalized)
     normalized = re.sub(r"\b(\d+)\s+из\s+тех\b", r"\1 стих", normalized)
     normalized = re.sub(r"\b(\d{1,3})\s+стезе\b", r"\1 стих", normalized)
@@ -790,6 +848,14 @@ def token_spans(normalized: str) -> list[tuple[str, int, int]]:
     return [(match.group(0), match.start(), match.end()) for match in re.finditer(r"\S+", normalized)]
 
 
+def is_first_n_chapters_discussion(normalized: str) -> bool:
+    """Recognize discussion of the first N chapters, not a verse address."""
+    return bool(
+        re.search(r"\b1\s+\d+\s+глав\w*\b", normalized)
+        and not re.search(r"\bстих\w*\b", normalized)
+    )
+
+
 def book_candidates(normalized: str) -> list[BookCandidate]:
     candidates: list[BookCandidate] = []
     seen: dict[tuple[str, int, int], BookCandidate] = {}
@@ -820,7 +886,7 @@ def book_candidates(normalized: str) -> list[BookCandidate]:
                 continue
             # «Апостола» само по себе — обычное слово, а не название книги.
             # Иначе нечёткое сопоставление с «апостол Иуда» даёт ложную Иуд. 1:8.
-            if candidate_text == "апостола":
+            if candidate_text in {"апостола", "послания"}:
                 continue
             # Ordinary "нам" must not fuzzy-match the book form "Наума".
             # Other short ASR fragments have established, separately tested
@@ -1351,7 +1417,10 @@ def ref_candidates(normalized: str, book: str, bible: dict[str, dict[int, dict[i
                     verse_end,
                     0.94,
                 )
-    if not candidates and len(numbers) >= 3:
+    # «Первые N глав» — это рассуждение о структуре книги, а не ссылка
+    # на главу 1 и стихи N...  После нормализации такая фраза имеет вид
+    # "1 N глава" и не должна запускать запасную сборку диапазона.
+    if not candidates and len(numbers) >= 3 and not is_first_n_chapters_discussion(normalized):
         for first, second, third in ((numbers[0], numbers[1], numbers[2]), (numbers[-3], numbers[-2], numbers[-1])):
             chapter_value, chapter_start, _chapter_end = first
             start_verse, _start_start, _start_end = second
@@ -1618,6 +1687,8 @@ def split_compact_range_token(token: str, chapter_map: dict[int, str], require_r
 
 def parse_live_reference(text: str, bible_path: Path = DEFAULT_BIBLE) -> ParsedReference | None:
     normalized = normalize_text(text)
+    if is_first_n_chapters_discussion(normalized):
+        return None
     bible = bible_map(bible_path)
     books = book_candidates(normalized)
     if not books:

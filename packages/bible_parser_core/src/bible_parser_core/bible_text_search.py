@@ -18,6 +18,12 @@ from typing import Sequence
 
 TOKEN_RE = re.compile(r"[а-яё]+(?:-[а-яё]+)*|\d+", re.IGNORECASE)
 
+# Наблюдаемые Sherpa-искажения слов библейского текста.  Это не словарь
+# адресов: замены применяются только к запросу текстового поиска.
+TEXT_ASR_TOKEN_ALIASES = {
+    "татья": "тать",
+}
+
 try:
     from rapidfuzz.fuzz import ratio as fuzzy_ratio
     from rapidfuzz.fuzz import token_set_ratio
@@ -57,7 +63,8 @@ class BibleTextSearchResult:
 
 
 def normalize_bible_text(text: str) -> list[str]:
-    return TOKEN_RE.findall((text or "").lower().replace("ё", "е"))
+    tokens = TOKEN_RE.findall((text or "").lower().replace("ё", "е"))
+    return [TEXT_ASR_TOKEN_ALIASES.get(token, token) for token in tokens]
 
 
 def _ngrams(tokens: Sequence[str], size: int) -> set[tuple[str, ...]]:
