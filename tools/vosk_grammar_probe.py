@@ -2784,11 +2784,21 @@ def run_microphone(args: argparse.Namespace) -> int:
                                     "parsed": None,
                                     "source": "text_only",
                                 }
+                            text_detection_for_high_risk_address = False
                             if text_detector is not None and pipeline_payload.get("matched"):
                                 explicit_ref = str(
                                     (pipeline_payload.get("parsed") or {}).get("ref") or ""
                                 )
-                                text_detector.suppress_after_address(explicit_ref, recognition_time)
+                                # A high-risk spoken address may have lost a range boundary.
+                                # Do not repeat its slide, but allow Bible text to widen or
+                                # correct it as soon as there is stronger textual evidence.
+                                text_detection_for_high_risk_address = (
+                                    pipeline_payload.get("risk_level") == "high"
+                                )
+                                if text_detection_for_high_risk_address:
+                                    text_detector.mark_shown(explicit_ref, recognition_time)
+                                else:
+                                    text_detector.suppress_after_address(explicit_ref, recognition_time)
                             plan_match = None
                             # Явно названный адрес всегда важнее строки плана.
                             plan_search_with_review = bool(
@@ -2907,7 +2917,10 @@ def run_microphone(args: argparse.Namespace) -> int:
                             text_decision = None
                             if (
                                 text_detector is not None
-                                and not pipeline_payload.get("matched")
+                                and (
+                                    not pipeline_payload.get("matched")
+                                    or text_detection_for_high_risk_address
+                                )
                                 and plan_match is None
                             ):
                                 text_decision = text_detector.process_fragment(text, recognition_time)

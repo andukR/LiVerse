@@ -1008,6 +1008,24 @@ def should_block_matched_payload(payload: dict) -> str | None:
         if candidate.book == parsed.get("book")
     ]
     strongest_book_score = max((candidate.score for candidate in matching_books), default=0.0)
+    # A preacher can introduce a quotation conversationally: "один очень
+    # хороший стих".  This is not an address "глава 1, стих 1", even if a
+    # preceding fragment happened to contain a book name.  In particular, do
+    # not let the rolling ASR buffer suppress Bible-text recognition here.
+    descriptive_verse_mention = re.search(
+        r"\b(?:один|одна|одну|одним|перв\w*)\s+"
+        r"(?:(?:очень|такой|какой(?:-то)?|ещ[её])\s+){0,3}"
+        r"(?:хорош\w*|прост\w*|понят\w*|важн\w*|интересн\w*|"
+        r"замечательн\w*|сильн\w*)\s+стих\w*\b",
+        raw_text,
+    )
+    if (
+        descriptive_verse_mention
+        and parsed.get("start_verse") == 1
+        and parsed.get("end_verse") == 1
+        and not re.search(r"\bглав\w*\b", raw_text)
+    ):
+        return "descriptive_verse_mention"
     if (
         strongest_book_score < 0.85
         and parsed.get("start_verse") == 1

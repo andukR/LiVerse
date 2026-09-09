@@ -1505,12 +1505,22 @@ def handle_result(
             "source": "text_only",
         }
 
+    text_detection_for_high_risk_address = False
     if text_detector is not None and pipeline_payload.get("matched"):
         explicit_ref = str((pipeline_payload.get("parsed") or {}).get("ref") or "")
-        text_detector.suppress_after_address(explicit_ref, replay_seconds)
+        # A high-risk spoken address may have lost a range boundary.  Keep the
+        # displayed verse in the duplicate guard, but let the following Bible
+        # text immediately widen or correct it when the evidence is stronger.
+        text_detection_for_high_risk_address = pipeline_payload.get("risk_level") == "high"
+        if text_detection_for_high_risk_address:
+            text_detector.mark_shown(explicit_ref, replay_seconds)
+        else:
+            text_detector.suppress_after_address(explicit_ref, replay_seconds)
 
     text_decision = None
-    if text_detector is not None and not pipeline_payload.get("matched"):
+    if text_detector is not None and (
+        not pipeline_payload.get("matched") or text_detection_for_high_risk_address
+    ):
         text_decision = text_detector.process_fragment(text, replay_seconds)
 
     if long_passage is not None:

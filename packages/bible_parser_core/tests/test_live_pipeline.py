@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import call, patch
 
-from bible_parser_core.live_pipeline import LiveReferencePipeline, build_grammar
+from bible_parser_core.live_pipeline import LiveReferencePipeline, build_grammar, should_block_matched_payload
 from bible_parser_core.parser import normalize_text
 from bible_parser_core.risk_model import load_risk_model, score_payload_with_model
 from tools.holyrics import (
@@ -463,7 +463,7 @@ class LiveReferencePipelineTest(unittest.TestCase):
         project_root = Path(__file__).resolve().parents[3]
         metadata = tomllib.loads((project_root / "pyproject.toml").read_text(encoding="utf-8"))
 
-        self.assertEqual("1.2.4", core_version)
+        self.assertEqual("1.2.5", core_version)
         self.assertEqual(core_version, tools_version)
         self.assertEqual(core_version, slide_server_version)
         self.assertEqual(["version"], metadata["project"]["dynamic"])
@@ -2301,7 +2301,26 @@ class LiveReferencePipelineTest(unittest.TestCase):
         )
 
         self.assertFalse(result.get("matched"))
-        self.assertEqual("weak_fuzzy_book_without_chapter", result.get("blocked_weak_context"))
+        self.assertEqual("descriptive_verse_mention", result.get("blocked_weak_context"))
+
+    def test_descriptive_good_verse_phrase_does_not_become_one_one_reference(self):
+        reason = should_block_matched_payload(
+            {
+                "text": (
+                    "послание евреям тоже есть одним один очень хороший стих "
+                    "мы имеем такого первосещенника который знает все наши немощи"
+                ),
+                "source": "parser",
+                "parsed": {
+                    "book": "Евреям",
+                    "ref": "Евреям 1:1",
+                    "start_verse": 1,
+                    "end_verse": 1,
+                },
+            }
+        )
+
+        self.assertEqual("descriptive_verse_mention", reason)
 
     def test_confident_book_without_chapter_marker_still_parses(self):
         pipeline = LiveReferencePipeline()

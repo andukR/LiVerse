@@ -490,6 +490,32 @@ class ScriptureTextDetectorTest(unittest.TestCase):
         self.assertFalse(decision.accepted)
         self.assertEqual("address_suppression", decision.reason)
 
+    def test_high_risk_address_allows_text_to_widen_displayed_range(self) -> None:
+        widened = hit(
+            "Иер. 32:40-42", 96.0,
+            matched=("заключить", "завет", "вечный", "страх", "сердце"),
+            trigram=75.0,
+            book_id=24,
+            chapter=32,
+            verse=40,
+            end_verse=42,
+        )
+        detector = ScriptureTextDetector(
+            FakeSearcher([[widened]] * 8),
+            self.config(immediate_score=90.0),
+        )
+
+        # This is the high-risk path: the address slide is remembered only to
+        # prevent a duplicate 32:42, not to suppress the text search.
+        detector.mark_shown("Иеремия 32:42", now=2.0)
+        decision = detector.process_fragment(
+            "заключу с ними завет вечный страх мой вложу в сердца их",
+            now=2.1,
+        )
+
+        self.assertTrue(decision.accepted)
+        self.assertEqual("Иер. 32:40-42", decision.reference)
+
     def test_full_and_abbreviated_reference_share_duplicate_cooldown(self) -> None:
         strong = hit(
             "Иак. 1:26", 96.0,
@@ -898,6 +924,27 @@ class TextCitationIntegrationTest(unittest.TestCase):
         self.assertEqual(1, report["excluded"])
         self.assertNotIn("excluded_cascade", csv_text)
         self.assertIn("trigger_0002", csv_text)
+
+    def test_training_export_includes_nested_rodnik_replay_runs(self) -> None:
+        from tools.analyze_vosk_probe_logs import export_training_data
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run = root / "20260909_072205" / "logs" / "20260909_072750_688325"
+            run.mkdir(parents=True)
+            (run / "session.json").write_text('{"asr_engine": "sherpa-0.54"}\n', encoding="utf-8")
+            (run / "trigger_cases.jsonl").write_text(
+                json.dumps({
+                    "case_id": "trigger_0002", "ref": "Иеремия 32:42",
+                    "status": "reviewed", "review_category": "vosk_distortion",
+                }) + "\n",
+                encoding="utf-8",
+            )
+            output = root / "training.csv"
+            report = export_training_data(root, output, asr_engine="sherpa-0.54")
+
+        self.assertEqual(1, report["rows"])
+        self.assertEqual(1, report["target_confirm"])
 
     def test_replay_batch_summary_lists_source_file_citations_and_timecodes(self) -> None:
         from tools.replay_audio_files import replay_batch_summary_lines, write_replay_batch_summary

@@ -135,7 +135,10 @@ def trigger_case_paths(log_dir: Path) -> list[Path]:
         return [log_dir] if log_dir.name == "trigger_cases.jsonl" else []
     if (log_dir / "trigger_cases.jsonl").is_file():
         return [log_dir / "trigger_cases.jsonl"]
-    return sorted(log_dir.glob("*/trigger_cases.jsonl"), key=lambda path: path.parent.name)
+    # Replay batches are stored as <batch>/logs/<run>/trigger_cases.jsonl,
+    # while live sessions use <run>/trigger_cases.jsonl.  Accept both shapes
+    # so a retrained model is not accidentally built from only one batch.
+    return sorted(log_dir.rglob("trigger_cases.jsonl"), key=lambda path: str(path))
 
 
 def reviewed_trigger_cases(log_dir: Path, *, asr_engine: str = "") -> list[tuple[Path, dict]]:
