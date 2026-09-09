@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from tools import __version__ as tools_version
 from tools.liverse_gui import (
     check_gui_update,
     packaged_windows_runtime,
@@ -106,7 +107,7 @@ class ReleaseUpdaterTest(unittest.TestCase):
             result = check_gui_update(frozen=True, platform="win32")
 
         self.assertEqual(expected, result)
-        binary_check.assert_called_once_with("1.2.5")
+        binary_check.assert_called_once_with(tools_version)
         source_check.assert_not_called()
 
     def test_gui_keeps_git_updater_for_source_installation(self):
