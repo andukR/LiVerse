@@ -1188,6 +1188,10 @@ def prepare_sermon_plan_custom_theme(args: Any, base_url: str) -> dict[str, Any]
         if key not in {"id", "name", "metadata"}
     }
     background = dict(custom_theme.get("background") or {})
+    # The image's own "Position" belongs to HoLyrics.  Do not pass the
+    # adjustment inherited from the theme: HoLyrics then uses the saved
+    # setting of the selected image itself.
+    background.pop("adjust_type", None)
     background.update(
         {
             "type": background_type,

@@ -1290,7 +1290,7 @@ class LiveReferencePipelineTest(unittest.TestCase):
             custom_theme = prepare_sermon_plan_custom_theme(args, "http://127.0.0.1:8091")
 
         self.assertEqual(
-            {"font": {"name": "Arial"}, "background": {"type": "my_image", "id": "saved-image", "adjust_type": "fill"}},
+            {"font": {"name": "Arial"}, "background": {"type": "my_image", "id": "saved-image"}},
             custom_theme,
         )
         self.assertEqual(
