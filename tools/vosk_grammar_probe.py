@@ -896,6 +896,17 @@ def session_summary_dimensions(screen_width: int, screen_height: int) -> tuple[i
     )
 
 
+def approval_popup_dimensions(
+    screen_width: int,
+    screen_height: int,
+    requested_height: int,
+) -> tuple[int, int]:
+    """Fit the approval popup to its real content, leaving a screen margin."""
+    width = min(760, max(520, screen_width - 80))
+    max_height = max(420, screen_height - 60)
+    return width, min(max(1, requested_height), max_height)
+
+
 def popup_tk_window(tk, title: str):
     """Reuse the engine's one visible Tk popup window.
 
@@ -1750,14 +1761,14 @@ def popup_approval_decision(slide: dict) -> str:
     wrong_reference_key = "Tab" if os.name == "nt" else "W"
     screen_width = int(root.winfo_screenwidth())
     screen_height = int(root.winfo_screenheight())
-    row_count = 1 + len(alternatives) + int(has_context_button) + (1 if is_sermon_plan else 3)
     width = min(760, max(520, screen_width - 80))
-    height = min(max(500, 245 + row_count * 62), max(500, screen_height - 100))
-    center_tk_window(root, width, height)
+    center_tk_window(root, width, min(500, max(420, screen_height - 60)))
 
     ref_font = tkfont.Font(family="Segoe UI", size=38, weight="bold")
     hint_font = tkfont.Font(family="Segoe UI", size=17, weight="bold")
     button_font = tkfont.Font(family="Segoe UI", size=18, weight="bold")
+    button_height = 1
+    button_pady = 8
 
     tk.Label(
         root,
@@ -1795,6 +1806,12 @@ def popup_approval_decision(slide: dict) -> str:
     buttons.pack(fill="both", expand=True, padx=30, pady=(0, 20))
     closed = tk.BooleanVar(master=root, value=False)
     close_if_superseded_job = None
+    keyboard_bindings: list[str] = []
+
+    def bind_popup_key(sequence: str, action: str) -> None:
+        """Handle the key even when a Button, rather than the root, has focus."""
+        root.bind_all(sequence, lambda _event: (close(action), "break")[1])
+        keyboard_bindings.append(sequence)
 
     def close(action: str) -> None:
         nonlocal close_if_superseded_job
@@ -1804,6 +1821,8 @@ def popup_approval_decision(slide: dict) -> str:
         if close_if_superseded_job is not None:
             root.after_cancel(close_if_superseded_job)
             close_if_superseded_job = None
+        for sequence in keyboard_bindings:
+            root.unbind_all(sequence)
         root.withdraw()
         closed.set(True)
 
@@ -1826,7 +1845,8 @@ def popup_approval_decision(slide: dict) -> str:
         font=button_font,
         relief="flat",
         padx=18,
-        pady=10,
+        pady=button_pady,
+        height=button_height,
     )
     approve.pack(fill="x", pady=(0, 7))
 
@@ -1842,7 +1862,8 @@ def popup_approval_decision(slide: dict) -> str:
             font=button_font,
             relief="flat",
             padx=18,
-            pady=10,
+            pady=button_pady,
+            height=button_height,
         )
         button.pack(fill="x", pady=(0, 7))
 
@@ -1858,7 +1879,8 @@ def popup_approval_decision(slide: dict) -> str:
             font=button_font,
             relief="flat",
             padx=18,
-            pady=10,
+            pady=button_pady,
+            height=button_height,
         )
         context_button.pack(fill="x", pady=(0, 7))
 
@@ -1874,7 +1896,8 @@ def popup_approval_decision(slide: dict) -> str:
             font=button_font,
             relief="flat",
             padx=18,
-            pady=10,
+            pady=button_pady,
+            height=button_height,
         ).pack(fill="x", pady=(0, 7))
         tk.Button(
             buttons,
@@ -1887,7 +1910,8 @@ def popup_approval_decision(slide: dict) -> str:
             font=button_font,
             relief="flat",
             padx=18,
-            pady=10,
+            pady=button_pady,
+            height=button_height,
         ).pack(fill="x", pady=(0, 7))
 
     tk.Button(
@@ -1901,28 +1925,67 @@ def popup_approval_decision(slide: dict) -> str:
         font=button_font,
         relief="flat",
         padx=18,
-        pady=10,
+        pady=button_pady,
+        height=button_height,
     ).pack(fill="x")
 
-    root.bind("<Return>", lambda _event: close("approve"))
+    # The old formula assumed every row was 62 pixels high and capped the
+    # window at 500 pixels.  Tk knows the actual height after fonts, wrapping
+    # and optional buttons are laid out, so use that value instead.
+    root.update_idletasks()
+    width, height = approval_popup_dimensions(
+        screen_width,
+        screen_height,
+        int(root.winfo_reqheight()) + 4,
+    )
+    center_tk_window(root, width, height)
+
+    bind_popup_key("<Return>", "approve")
     if has_context_button:
-        root.bind("0", lambda _event: close("approve_context"))
-        root.bind("<KP_0>", lambda _event: close("approve_context"))
-        root.bind("<KP_Insert>", lambda _event: close("approve_context"))
+        bind_popup_key("0", "approve_context")
+        bind_popup_key("<KP_0>", "approve_context")
+        bind_popup_key("<KP_Insert>", "approve_context")
     for index, _alternative in enumerate(alternatives, start=1):
-        root.bind(str(index), lambda _event, choice=index - 1: close(f"alternative:{choice}"))
+        bind_popup_key(str(index), f"alternative:{index - 1}")
     if not is_sermon_plan:
-        root.bind("<space>", lambda _event: close("not_citation"))
+        bind_popup_key("<space>", "not_citation")
         if os.name == "nt":
-            root.bind("<Tab>", lambda _event: (close("wrong_reference"), "break")[1])
+            bind_popup_key("<Tab>", "wrong_reference")
         else:
-            root.bind("w", lambda _event: close("wrong_reference"))
-            root.bind("W", lambda _event: close("wrong_reference"))
-    root.bind("<Escape>", lambda _event: close("skip"))
+            bind_popup_key("w", "wrong_reference")
+            bind_popup_key("W", "wrong_reference")
+    bind_popup_key("<Escape>", "skip")
     root.protocol("WM_DELETE_WINDOW", lambda: close("skip"))
+
+    def claim_keyboard_focus() -> None:
+        """Give keystrokes to the approval window, not the main LiVerse GUI.
+
+        A withdrawn/reused Tk root can be visible and topmost while Windows
+        keeps the keyboard focus in the GUI window.  Focus the actual default
+        button as well as the toplevel: its key events still bubble to the
+        existing root bindings above.
+        """
+        if not root.winfo_exists() or bool(closed.get()):
+            return
+        root.lift()
+        if os.name == "nt":
+            try:
+                import ctypes
+
+                window = root.winfo_id()
+                user32 = ctypes.windll.user32
+                user32.ShowWindow(window, 9)  # SW_RESTORE
+                user32.BringWindowToTop(window)
+                user32.SetForegroundWindow(window)
+            except Exception:
+                pass
+        root.focus_force()
+        approve.focus_set()
+        approve.focus_force()
+
     close_if_superseded_job = root.after(100, close_if_superseded)
-    root.after(100, root.focus_force)
-    root.after(150, root.lift)
+    root.after_idle(claim_keyboard_focus)
+    root.after(100, claim_keyboard_focus)
     root.wait_variable(closed)
     return decision["action"]
 

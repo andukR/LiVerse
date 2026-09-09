@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from time import perf_counter
 from typing import Callable, Iterable
 
@@ -276,6 +276,43 @@ class ScriptureTextDetector:
                     broader,
                     key=lambda item: (_candidate_span(item.top_candidate), item.score),
                 )
+            else:
+                # A full passage can be slightly ambiguous because its first
+                # verse is less clearly recognized, while its final verse is
+                # an unambiguous suffix.  Do not discard the well-supported
+                # beginning merely because the suffix was evaluated first.
+                broader_ambiguous = [
+                    item
+                    for item in evaluated
+                    if not item.accepted
+                    and item.reason == "margin_below_threshold"
+                    and item.top_candidate is not None
+                    and _candidate_span(item.top_candidate) > _candidate_span(best.top_candidate)
+                    and _candidate_contains(item.top_candidate, best.top_candidate)
+                    and item.score >= max(
+                        self.config.acceptance_score,
+                        best.score - BROADER_RANGE_SCORE_TOLERANCE,
+                    )
+                    and item.matched_words >= max(
+                        self.config.minimum_matched_content_words * 2,
+                        best.matched_words + 2,
+                    )
+                    and (
+                        item.top_candidate.bigram_overlap > 0
+                        or item.top_candidate.ordered_similarity >= 70.0
+                    )
+                ]
+                if broader_ambiguous:
+                    selected = max(
+                        broader_ambiguous,
+                        key=lambda item: (_candidate_span(item.top_candidate), item.score),
+                    )
+                    best = replace(
+                        selected,
+                        accepted=True,
+                        reason="broader_range_with_strong_suffix",
+                        confirmations=1,
+                    )
         if best.accepted:
             assert best.top_candidate is not None
             self._shown_at[_candidate_key(best.top_candidate)] = now
@@ -385,11 +422,27 @@ class ScriptureTextDetector:
             and matched_words >= self.config.minimum_matched_content_words
             and (top.bigram_overlap > 0 or top.ordered_similarity >= 70.0)
         )
-        if continuation:
+        # Speech recognition can distort several words at the transition
+        # between verses.  A next, well-supported range remains safer than a
+        # free-standing candidate, so allow a small score reduction only when
+        # it has substantially more matching content words than usual.
+        relaxed_continuation = (
+            shown_relation == "next"
+            and top.score >= max(0.0, self.config.acceptance_score - 7.0)
+            and margin >= self.config.minimum_margin
+            and matched_words >= self.config.minimum_matched_content_words + 5
+            and (top.bigram_overlap > 0 or top.ordered_similarity >= 70.0)
+        )
+        if continuation or relaxed_continuation:
             return self._decision(
                 accepted=True, reference=top.reference, score=top.score, margin=margin,
                 matched_words=matched_words, window_text=window_text,
-                reason="continuation_after_shown_range", confirmations=1, top=top, second=second,
+                reason=(
+                    "continuation_after_shown_range"
+                    if continuation
+                    else "relaxed_continuation_after_shown_range"
+                ),
+                confirmations=1, top=top, second=second,
             )
         if immediate or exact_phrase or exact_short_verse or strong_range:
             return self._decision(

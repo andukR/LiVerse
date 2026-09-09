@@ -419,6 +419,45 @@ class ScriptureTextDetectorTest(unittest.TestCase):
         self.assertTrue(decision.accepted)
         self.assertEqual("1Фес. 5:4-5", decision.reference)
 
+    def test_ambiguous_broader_range_keeps_well_matched_verse_before_strong_suffix(self) -> None:
+        suffix = hit(
+            "Быт. 2:17", 92.609,
+            matched=("который", "вкусить", "от", "он", "смерть", "умереть"),
+            bigram=70.0,
+            trigram=55.0,
+            book_id=1,
+            chapter=2,
+            verse=17,
+        )
+        full_range = hit(
+            "Быт. 2:16-17", 85.516,
+            matched=(
+                "человек", "всякий", "дерево", "сад", "есть", "дерево", "познание",
+                "добро", "зло", "есть", "вкусить", "смерть", "умереть",
+            ),
+            bigram=65.0,
+            trigram=50.0,
+            book_id=1,
+            chapter=2,
+            verse=16,
+            end_verse=17,
+        )
+        competing = hit(
+            "Исх. 1:1", 82.268, matched=("дерево", "есть"), bigram=10.0, trigram=0.0)
+        detector = ScriptureTextDetector(
+            FakeSearcher([[suffix], [full_range, competing]]),
+            self.config(window_sizes=(5, 20), buffer_words=20, immediate_score=90.0),
+        )
+
+        decision = detector.process_fragment(
+            "человек всякий дерева сад есть дерево познание добро зло не есть вкусить смерть умереть",
+            now=0.0,
+        )
+
+        self.assertTrue(decision.accepted)
+        self.assertEqual("Быт. 2:16-17", decision.reference)
+        self.assertEqual("broader_range_with_strong_suffix", decision.reason)
+
     def test_weak_two_verse_range_does_not_use_relaxed_range_rule(self) -> None:
         weak_range = hit(
             "Пс. 22:1-2", 65.0,
@@ -573,6 +612,35 @@ class ScriptureTextDetectorTest(unittest.TestCase):
         self.assertTrue(continuation.accepted)
         self.assertEqual("Еф. 3:19", continuation.reference)
         self.assertEqual("continuation_after_shown_range", continuation.reason)
+
+    def test_noisy_next_range_with_many_matches_is_accepted_after_shown_range(self) -> None:
+        following = hit(
+            "Ис. 40:5-6", 63.012,
+            matched=(
+                "явиться", "слава", "господень", "узреть", "всякий", "плоть",
+                "спасение", "божий", "уста", "изречь",
+            ),
+            bigram=30.0,
+            trigram=20.0,
+            book_id=23,
+            chapter=40,
+            verse=5,
+            end_verse=6,
+        )
+        competing = hit("Иер. 1:1", 48.553, matched=("господень", "всякий"), bigram=0.0, trigram=0.0)
+        detector = ScriptureTextDetector(
+            FakeSearcher([[following, competing]]),
+            self.config(immediate_score=99.0, window_sizes=(11,)),
+        )
+        detector.mark_shown("Исаия 40:3-4", now=0.0)
+
+        decision = detector.process_fragment(
+            "явиться слава господень узреть всякий плоть спасение божий уста изречь голос", now=1.0,
+        )
+
+        self.assertTrue(decision.accepted)
+        self.assertEqual("Ис. 40:5-6", decision.reference)
+        self.assertEqual("relaxed_continuation_after_shown_range", decision.reason)
 
     def test_expanded_range_never_auto_narrows_to_a_verse_from_older_range(self) -> None:
         verse = hit(

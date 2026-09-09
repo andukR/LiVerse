@@ -10,9 +10,11 @@ from bible_parser_core.live_pipeline import LiveReferencePipeline, build_grammar
 from bible_parser_core.parser import normalize_text
 from bible_parser_core.risk_model import load_risk_model, score_payload_with_model
 from tools.holyrics import (
+    capture_holyrics_current_appearance,
     cross_chapter_quick_presentation_slides,
     format_missing_holyrics_permissions,
     handle_scripture_range_reading_match,
+    prepare_sermon_plan_custom_theme,
     post_holyrics_api,
     post_holyrics_url,
     restore_holyrics_presentation,
@@ -20,6 +22,7 @@ from tools.holyrics import (
     scripture_range_quick_presentation_slides,
     scripture_range_reading_active,
     scripture_range_reading_state,
+    slide_payload_to_holyrics_body,
     sync_scripture_range_reading,
     temporary_verse_display_active,
 )
@@ -109,11 +112,13 @@ class LiveReferencePipelineTest(unittest.TestCase):
             self.assertEqual("", consume_stop_request(path))
 
     def test_session_summary_fits_small_windows_desktop(self):
-        from tools.vosk_grammar_probe import session_summary_dimensions
+        from tools.vosk_grammar_probe import approval_popup_dimensions, session_summary_dimensions
 
         self.assertEqual((760, 560), session_summary_dimensions(1920, 1080))
         self.assertEqual((720, 520), session_summary_dimensions(800, 600))
         self.assertEqual((500, 400), session_summary_dimensions(500, 400))
+        self.assertEqual((760, 620), approval_popup_dimensions(1920, 1080, 620))
+        self.assertEqual((720, 540), approval_popup_dimensions(800, 600, 900))
 
     def test_popup_windows_reuse_one_tk_interpreter_and_close_it_once(self):
         import tools.vosk_grammar_probe as probe
@@ -1218,6 +1223,7 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         with (
             patch("tools.holyrics.get_holyrics_current_presentation", return_value=None),
+            patch("tools.holyrics.prepare_sermon_plan_custom_theme", return_value=None),
             patch("tools.holyrics.post_holyrics_api", return_value=(True, "", "")) as api,
         ):
             ok, reason = post_holyrics_url(args, "http://127.0.0.1:8091", payload)
@@ -1236,6 +1242,62 @@ class LiveReferencePipelineTest(unittest.TestCase):
                     }
                 ]
             },
+        )
+
+    def test_failed_quick_show_records_current_theme_and_background(self):
+        args = SimpleNamespace(holyrics_token="secret")
+        with patch(
+            "tools.holyrics.post_holyrics_api",
+            side_effect=[
+                (True, "", '{"status":"ok","data":{"id":"theme-1","type":"theme"}}'),
+                (True, "", '{"status":"ok","data":{"id":"image-1","type":"my_image"}}'),
+                (True, "", '{"status":"ok","data":[{"id":"theme-1","font":{"name":"Arial"}},{"id":"theme-2"}]}'),
+                (True, "", '{"status":"ok","data":[{"id":"image-1","type":"my_image"},{"id":"image-2"}]}'),
+            ],
+        ) as api:
+            appearance = capture_holyrics_current_appearance(args, "http://127.0.0.1:8091")
+
+        self.assertEqual(
+            {
+                "theme": {"ok": True, "reason": "", "data": {"id": "theme-1", "type": "theme"}},
+                "background": {"ok": True, "reason": "", "data": {"id": "image-1", "type": "my_image"}},
+                "theme_records": {"ok": True, "reason": "", "data": [{"id": "theme-1", "font": {"name": "Arial"}}]},
+                "background_records": {"ok": True, "reason": "", "data": [{"id": "image-1", "type": "my_image"}]},
+            },
+            appearance,
+        )
+        self.assertEqual(
+            [
+                call(args, "http://127.0.0.1:8091", "GetCurrentTheme", {}),
+                call(args, "http://127.0.0.1:8091", "GetCurrentBackground", {}),
+                call(args, "http://127.0.0.1:8091", "GetThemes", {}),
+                call(args, "http://127.0.0.1:8091", "GetBackgrounds", {}),
+            ],
+            api.call_args_list,
+        )
+
+    def test_dragged_background_uses_saved_theme_and_background_ids(self):
+        args = SimpleNamespace(holyrics_token="secret", _holyrics_sermon_plan_theme_id="transient-id")
+        with patch(
+            "tools.holyrics.post_holyrics_api",
+            side_effect=[
+                (True, "", '{"status":"ok","data":{"id":"transient-id","type":"theme","name":"Тема 8"}}'),
+                (True, "", '{"status":"ok","data":{"id":"transient-id","type":"my_image","name":"IMG"}}'),
+                (True, "", '{"status":"ok","data":[{"id":"saved-theme","name":"Тема 8","font":{"name":"Arial"},"background":{"type":"image","id":"-4","adjust_type":"fill"}}]}'),
+                (True, "", '{"status":"ok","data":[{"id":"saved-image","type":"my_image","name":"IMG"}]}'),
+            ],
+        ):
+            custom_theme = prepare_sermon_plan_custom_theme(args, "http://127.0.0.1:8091")
+
+        self.assertEqual(
+            {"font": {"name": "Arial"}, "background": {"type": "my_image", "id": "saved-image", "adjust_type": "fill"}},
+            custom_theme,
+        )
+        self.assertEqual(
+            {
+                "slides": [{"text": "Иоанн 3:16", "custom_theme": custom_theme}],
+            },
+            slide_payload_to_holyrics_body(args, {"ref": "Иоанн 3:16"}),
         )
 
     def test_sermon_plan_verse_restores_actual_current_slide_and_theme(self):
@@ -1274,6 +1336,7 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         with (
             patch("tools.holyrics.get_holyrics_current_presentation", return_value=current),
+            patch("tools.holyrics.prepare_sermon_plan_custom_theme", return_value=None),
             patch("tools.holyrics.post_holyrics_api", return_value=(True, "", "")) as api,
             patch("tools.holyrics.restore_holyrics_presentation_later") as restore_later,
         ):
@@ -1328,6 +1391,9 @@ class LiveReferencePipelineTest(unittest.TestCase):
                 ],
                 "name": "Проповедь",
             },
+        ), patch(
+            "tools.holyrics.prepare_sermon_plan_custom_theme",
+            return_value=None,
         ), patch(
             "tools.holyrics.post_holyrics_api",
             return_value=(True, "", ""),
@@ -2301,9 +2367,32 @@ class LiveReferencePipelineTest(unittest.TestCase):
         )
 
         self.assertFalse(result.get("matched"))
-        self.assertEqual("descriptive_verse_mention", result.get("blocked_weak_context"))
+        self.assertEqual("ordinary_one_expression", result.get("blocked_weak_context"))
 
-    def test_descriptive_good_verse_phrase_does_not_become_one_one_reference(self):
+    def test_ordinary_one_expressions_do_not_supply_reference_numbers(self):
+        samples = (
+            "послание евреям первая глава по одной простой причине",
+            "послание евреям первая глава с одной стороны",
+            "послание евреям первая глава одна хорошая книга",
+            "послание евреям первая глава один хороший стих",
+            "послание евреям первая глава одно дело",
+            "послание евреям первая глава одна мысль",
+            "послание евреям первая глава одна простая идея",
+            "послание евреям первая глава одну простую вещь",
+            "послание евреям с одной стороны вторая мысль",
+        )
+
+        for text in samples:
+            with self.subTest(text=text):
+                result = LiveReferencePipeline().process_text(text)
+
+                self.assertFalse(result.get("matched"))
+                self.assertEqual(
+                    "ordinary_one_expression",
+                    result.get("blocked_weak_context"),
+                )
+
+    def test_descriptive_good_verse_phrase_uses_general_one_expression_guard(self):
         reason = should_block_matched_payload(
             {
                 "text": (
@@ -2320,7 +2409,24 @@ class LiveReferencePipelineTest(unittest.TestCase):
             }
         )
 
-        self.assertEqual("descriptive_verse_mention", reason)
+        self.assertEqual("ordinary_one_expression", reason)
+
+    def test_explicit_references_with_one_survive_ordinary_one_filter(self):
+        samples = (
+            ("иеремия один один", "Иеремия 1:1"),
+            ("послание иакова вторая глава первый стих", "Иаков 2:1"),
+            (
+                "иоанна первая глава шестнадцатый стих с одной стороны это важно",
+                "Иоанн 1:16",
+            ),
+            ("псалом первый", "Псалтирь 1:1"),
+        )
+
+        for text, expected in samples:
+            with self.subTest(text=text):
+                result = LiveReferencePipeline().process_text(text)
+
+                self.assertEqual(expected, result.get("parsed", {}).get("ref"))
 
     def test_confident_book_without_chapter_marker_still_parses(self):
         pipeline = LiveReferencePipeline()
@@ -3041,6 +3147,7 @@ class LiveReferencePipelineTest(unittest.TestCase):
                 "tools.holyrics.get_holyrics_current_presentation",
                 return_value=current,
             ),
+            patch("tools.holyrics.prepare_sermon_plan_custom_theme", return_value=None),
             patch(
                 "tools.holyrics.post_holyrics_api",
                 side_effect=[
@@ -4080,6 +4187,15 @@ class LiveReferencePipelineTest(unittest.TestCase):
         )
 
         self.assertEqual("Ефесянам 4:5", result.get("parsed", {}).get("ref"))
+
+    def test_discussion_of_psalms_does_not_turn_unrelated_one_into_psalm_one(self):
+        result = LiveReferencePipeline().process_text(
+            "и когда мы читаем салмы там многие псаумы начинаются песни восхождение "
+            "почему они так называется песн восхождения а не назвать так письма "
+            "скажи мне по одной простой причине потому"
+        )
+
+        self.assertFalse(result.get("matched"))
 
     def test_kofessionam_distortion_selects_ephesians_not_first_john(self):
         result = LiveReferencePipeline().process_text(

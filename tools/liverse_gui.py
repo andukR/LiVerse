@@ -864,6 +864,9 @@ class LiVerseGui:
             self.logs_listbox.insert("end", f"{session.name}   ({', '.join(files)})")
 
     def _select_latest_log(self) -> None:
+        # A session directory is created by the engine at startup.  Refresh here
+        # so this command also sees a session that ended after the tab opened.
+        self._refresh_log_sessions()
         self.logs_listbox.selection_clear(0, "end")
         if self.log_sessions:
             self.logs_listbox.selection_set(0)
@@ -1283,6 +1286,9 @@ class LiVerseGui:
             self.state_var.set("Требуется внимание")
             self.activity_var.set(f"LiVerse остановился с кодом {code}. Подробности на вкладке «Диагностика».")
             self.show_window()
+        # The engine has closed all log files by this point.  Make its session
+        # immediately available for archiving without a LiVerse restart.
+        self._select_latest_log()
         if self.tray_icon is not None:
             try:
                 self.tray_icon.update_menu()

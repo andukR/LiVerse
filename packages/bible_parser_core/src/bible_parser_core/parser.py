@@ -1498,7 +1498,17 @@ def infer_chapter_and_verses(normalized: str, book: str, bible: dict[str, dict[i
     numbers = [value for value, _start, _end in reference_numbers(normalized, book)]
     if chapter is None and book == "Псалтирь" and len(numbers) == 1:
         chapters = bible.get(book, {})
-        if numbers[0] in chapters and 1 in chapters[numbers[0]]:
+        # Не подставляем «псалом N:1», если N встретилось в обычной речи.
+        # Например, «по одной простой причине» рядом с разговором о псалмах
+        # раньше превращалось в несуществующую ссылку «Псалтирь 1:1».
+        # Запасной вариант допустим только когда номер стоит возле названия
+        # самого псалма.
+        psalm_number_pattern = rf"\b(?:псал\w*|салм\w*)\s+{numbers[0]}\b|\b{numbers[0]}\s+(?:псал\w*|салм\w*)\b"
+        if (
+            re.search(psalm_number_pattern, normalized)
+            and numbers[0] in chapters
+            and 1 in chapters[numbers[0]]
+        ):
             return numbers[0], [1]
     if (
         chapter is None

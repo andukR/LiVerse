@@ -998,34 +998,62 @@ def should_block_matched_payload(payload: dict) -> str | None:
     ref = str(parsed.get("ref") or "")
     source = str(payload.get("source") or "")
 
-    # Do not turn ordinary speech such as "одну ... один простой стих,
-    # пророк ..." into a 1:1 reference solely because a garbled word happens
-    # to resemble a book title.  A confident book name still works without an
-    # explicit chapter marker; this guard is only for weak fuzzy matches.
+    # Do not borrow «один» from an ordinary grammatical construction merely
+    # because a Bible book was mentioned nearby.  We look at the original
+    # word forms: «одна мысль», «с одной стороны», «один хороший стих» and
+    # similar phrases are not parts of a Scripture address.  An explicit
+    # verse marker or a compact address next to the book remains valid.
+    raw_words = re.findall(r"[а-яa-z0-9]+", raw_text)
+    ordinary_one_forms = {
+        "один", "одна", "одно", "одну", "одной",
+        "одного", "одному", "одном", "одним",
+    }
+    ordinary_one_non_content_followers = {
+        "а", "и", "или", "но", "о", "об", "в", "во", "на",
+        "к", "ко", "из", "от", "до", "по", "с", "со", "за", "для",
+    }
+    ordinary_one_expression = False
+    for index, word in enumerate(raw_words):
+        if word not in ordinary_one_forms:
+            continue
+        next_word = raw_words[index + 1] if index + 1 < len(raw_words) else ""
+        next_is_reference_word = bool(re.match(r"^(?:глав|стих|псал)", next_word))
+        if next_is_reference_word:
+            continue
+        if next_word and next_word not in ordinary_one_non_content_followers:
+            ordinary_one_expression = True
+            break
+
+    parsed_numbers = {
+        value
+        for field in ("chapter", "start_verse", "end_verse")
+        if str(parsed.get(field) or "").isdigit()
+        for value in (int(parsed[field]),)
+    }
+    explicit_parsed_verse = any(
+        re.search(rf"\b{verse}\s+стих\w*\b|\bстих\w*\s+{verse}\b", normalized)
+        for verse in {
+            int(parsed[field])
+            for field in ("start_verse", "end_verse")
+            if str(parsed.get(field) or "").isdigit()
+        }
+    )
+    if (
+        ordinary_one_expression
+        and 1 in parsed_numbers
+        and not explicit_parsed_verse
+        and not compact_numbers_follow_book(text, str(parsed.get("book") or ""))
+    ):
+        return "ordinary_one_expression"
+
+    # A confident book name still works without an explicit chapter marker;
+    # this remaining guard is only for weak fuzzy matches.
     matching_books = [
         candidate
         for candidate in book_candidates(normalized)
         if candidate.book == parsed.get("book")
     ]
     strongest_book_score = max((candidate.score for candidate in matching_books), default=0.0)
-    # A preacher can introduce a quotation conversationally: "один очень
-    # хороший стих".  This is not an address "глава 1, стих 1", even if a
-    # preceding fragment happened to contain a book name.  In particular, do
-    # not let the rolling ASR buffer suppress Bible-text recognition here.
-    descriptive_verse_mention = re.search(
-        r"\b(?:один|одна|одну|одним|перв\w*)\s+"
-        r"(?:(?:очень|такой|какой(?:-то)?|ещ[её])\s+){0,3}"
-        r"(?:хорош\w*|прост\w*|понят\w*|важн\w*|интересн\w*|"
-        r"замечательн\w*|сильн\w*)\s+стих\w*\b",
-        raw_text,
-    )
-    if (
-        descriptive_verse_mention
-        and parsed.get("start_verse") == 1
-        and parsed.get("end_verse") == 1
-        and not re.search(r"\bглав\w*\b", raw_text)
-    ):
-        return "descriptive_verse_mention"
     if (
         strongest_book_score < 0.85
         and parsed.get("start_verse") == 1

@@ -657,9 +657,12 @@ def slide_payload_to_holyrics_text(payload: dict) -> str:
 
 def slide_payload_to_holyrics_body(args: Any, payload: dict) -> dict:
     slide = {"text": slide_payload_to_holyrics_text(payload)}
+    sermon_plan_custom_theme = getattr(args, "_holyrics_sermon_plan_custom_theme", None)
     sermon_plan_theme_id = str(getattr(args, "_holyrics_sermon_plan_theme_id", "") or "").strip()
     theme_name = str(getattr(args, "holyrics_theme", "") or "").strip()
-    if sermon_plan_theme_id:
+    if isinstance(sermon_plan_custom_theme, dict):
+        slide["custom_theme"] = sermon_plan_custom_theme
+    elif sermon_plan_theme_id:
         slide["theme"] = {"id": sermon_plan_theme_id}
     elif theme_name:
         slide["theme"] = {"name": theme_name}
@@ -1054,6 +1057,159 @@ def sermon_plan_slide_theme_id(slides: list[dict[str, Any]], slide_index: int) -
     )
 
 
+def capture_holyrics_current_appearance(
+    args: Any,
+    base_url: str,
+    *,
+    include_records: bool = True,
+) -> dict[str, Any]:
+    """Record the active theme and background after a quick-show failure.
+
+    Holyrics exposes a slide's saved ID without telling whether it is a Theme
+    or a standalone Background.  This probe is diagnostic only: a missing
+    optional permission must never affect the normal presentation flow.
+    """
+    appearance: dict[str, Any] = {}
+    for endpoint, key in (
+        ("GetCurrentTheme", "theme"),
+        ("GetCurrentBackground", "background"),
+    ):
+        try:
+            ok, reason, body = post_holyrics_api(args, base_url, endpoint, {})
+        except Exception as exc:
+            appearance[key] = {"ok": False, "reason": f"{type(exc).__name__}:{exc}"}
+            continue
+        try:
+            parsed = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            parsed = {}
+        appearance[key] = {
+            "ok": ok,
+            "reason": reason,
+            "data": parsed.get("data") if isinstance(parsed, dict) else None,
+        }
+
+    if not include_records:
+        return appearance
+
+    # GetCurrent* returns only a compact description.  When a saved slide ID
+    # is ambiguous, retain the complete matching records so that a later
+    # repair can reproduce the font/layout and explicitly select its image.
+    ids = {
+        str((appearance.get(key, {}).get("data") or {}).get("id") or "").strip()
+        for key in ("theme", "background")
+    }
+    ids.discard("")
+    for endpoint, key in (("GetThemes", "theme_records"), ("GetBackgrounds", "background_records")):
+        try:
+            ok, reason, body = post_holyrics_api(args, base_url, endpoint, {})
+        except Exception as exc:
+            appearance[key] = {"ok": False, "reason": f"{type(exc).__name__}:{exc}", "data": []}
+            continue
+        try:
+            parsed = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            parsed = {}
+        data = parsed.get("data") if isinstance(parsed, dict) else []
+        records = data if isinstance(data, list) else []
+        appearance[key] = {
+            "ok": ok,
+            "reason": reason,
+            "data": [record for record in records if str(record.get("id") or "").strip() in ids],
+        }
+    holyrics_diagnostic_event(args, "holyrics_current_appearance", appearance)
+    return appearance
+
+
+def prepare_sermon_plan_custom_theme(args: Any, base_url: str) -> dict[str, Any] | None:
+    """Build a display-only copy of the active plan theme and its real background.
+
+    A text slide created by dragging an image can expose a transient ID that
+    does not exist in GetThemes/GetBackgrounds.  HoLyrics does expose stable
+    names, so resolve those names to their saved records and avoid passing the
+    transient ID back as a ThemeFilter.
+    """
+    setattr(args, "_holyrics_sermon_plan_custom_theme", None)
+    appearance = capture_holyrics_current_appearance(args, base_url, include_records=False)
+    theme_info = appearance.get("theme", {}).get("data") or {}
+    background_info = appearance.get("background", {}).get("data") or {}
+    theme_name = str(theme_info.get("name") or "").strip()
+    background_name = str(background_info.get("name") or "").strip()
+    background_type = str(background_info.get("type") or "").strip()
+    if not theme_name or not background_name or not background_type:
+        return None
+
+    # The current issue uses transient IDs, so resolve the complete lists by
+    # stable names instead.
+    try:
+        themes_ok, themes_reason, themes_body = post_holyrics_api(args, base_url, "GetThemes", {})
+        backgrounds_ok, backgrounds_reason, backgrounds_body = post_holyrics_api(
+            args, base_url, "GetBackgrounds", {}
+        )
+    except Exception as exc:
+        holyrics_diagnostic_event(
+            args, "holyrics_sermon_plan_custom_theme", {"ok": False, "reason": f"{type(exc).__name__}:{exc}"}
+        )
+        return None
+    if not themes_ok or not backgrounds_ok:
+        holyrics_diagnostic_event(
+            args,
+            "holyrics_sermon_plan_custom_theme",
+            {"ok": False, "reason": themes_reason or backgrounds_reason or "catalog_unavailable"},
+        )
+        return None
+
+    theme_records = extract_holyrics_data_list(themes_body)
+    background_records = extract_holyrics_data_list(backgrounds_body)
+
+    matching_themes = [item for item in theme_records if str(item.get("name") or "").strip() == theme_name]
+    matching_backgrounds = [
+        item
+        for item in background_records
+        if str(item.get("name") or "").strip() == background_name
+        and str(item.get("type") or "").strip() == background_type
+    ]
+    if len(matching_themes) != 1 or len(matching_backgrounds) != 1:
+        holyrics_diagnostic_event(
+            args,
+            "holyrics_sermon_plan_custom_theme",
+            {
+                "ok": False,
+                "reason": "saved_theme_or_background_not_unique",
+                "theme_matches": len(matching_themes),
+                "background_matches": len(matching_backgrounds),
+            },
+        )
+        return None
+
+    custom_theme = {
+        key: value
+        for key, value in matching_themes[0].items()
+        if key not in {"id", "name", "metadata"}
+    }
+    background = dict(custom_theme.get("background") or {})
+    background.update(
+        {
+            "type": background_type,
+            "id": str(matching_backgrounds[0].get("id") or "").strip(),
+        }
+    )
+    custom_theme["background"] = background
+    setattr(args, "_holyrics_sermon_plan_custom_theme", custom_theme)
+    holyrics_diagnostic_event(
+        args,
+        "holyrics_sermon_plan_custom_theme",
+        {
+            "ok": True,
+            "theme_name": theme_name,
+            "background_name": background_name,
+            "background_type": background_type,
+            "background_id": background["id"],
+        },
+    )
+    return custom_theme
+
+
 def refresh_sermon_plan_restore_snapshot(
     args: Any,
     base_url: str,
@@ -1366,7 +1522,10 @@ def resolve_holyrics_theme_id(args: Any, base_url: str, theme_name: str) -> tupl
     return None, f"holyrics_theme_not_found:{requested}"
 
 
-def current_bible_theme_filter(args: Any, base_url: str) -> dict[str, str]:
+def current_bible_theme_filter(args: Any, base_url: str) -> dict[str, Any]:
+    sermon_plan_custom_theme = getattr(args, "_holyrics_sermon_plan_custom_theme", None)
+    if isinstance(sermon_plan_custom_theme, dict):
+        return {"custom_theme": sermon_plan_custom_theme}
     sermon_plan_theme_id = str(getattr(args, "_holyrics_sermon_plan_theme_id", "") or "").strip()
     if sermon_plan_theme_id:
         return {"id": sermon_plan_theme_id}
@@ -1412,7 +1571,9 @@ def cross_chapter_quick_presentation_body(args: Any, base_url: str, payload: dic
         return None
     body: dict[str, Any] = {"slides": slides}
     theme = current_bible_theme_filter(args, base_url)
-    if theme:
+    if "custom_theme" in theme:
+        body["custom_theme"] = theme["custom_theme"]
+    elif theme:
         body["theme"] = theme
     return body
 
@@ -1429,7 +1590,9 @@ def scripture_range_quick_presentation_body(args: Any, base_url: str, payload: d
         return None
     body: dict[str, Any] = {"slides": slides}
     theme = current_bible_theme_filter(args, base_url)
-    if theme:
+    if "custom_theme" in theme:
+        body["custom_theme"] = theme["custom_theme"]
+    elif theme:
         body["theme"] = theme
     return body
 
@@ -1666,6 +1829,7 @@ def handle_scripture_range_reading_match(args: Any, candidate: Any) -> dict:
 
 def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, str]:
     clear_scripture_range_reading(args)
+    setattr(args, "_holyrics_sermon_plan_custom_theme", None)
     if str(payload.get("slide_type") or "").strip() == "reference_list":
         text = slide_payload_to_holyrics_text(payload)
         if not text:
@@ -1703,6 +1867,8 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
                     restore_presentation["current_index"] = 0
         if not isinstance(restore_presentation, dict):
             restore_presentation = getattr(args, "_holyrics_last_sermon_plan_presentation", None)
+        if isinstance(restore_presentation, dict):
+            prepare_sermon_plan_custom_theme(args, base_url)
         quick_body = scripture_range_quick_presentation_body(args, base_url, payload)
         if not quick_body:
             return False, "holyrics_scripture_range_empty"
@@ -1729,6 +1895,7 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
             base_url,
             sermon_plan_presentation,
         )
+        prepare_sermon_plan_custom_theme(args, base_url)
         quick_body = slide_payload_to_holyrics_body(args, payload)
         if not str((quick_body.get("slides") or [{}])[0].get("text") or "").strip():
             return False, "holyrics_quick_presentation_empty"
@@ -1741,6 +1908,7 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
         )
         holyrics_log(f"ShowQuickPresentation sermon verse response={show_body or show_reason or 'ok'}")
         if not show_ok:
+            capture_holyrics_current_appearance(args, base_url)
             return False, show_reason
         clear_scripture_range_reading(args)
         quick_minutes = holyrics_quick_minutes(args)
