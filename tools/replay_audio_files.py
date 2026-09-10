@@ -27,15 +27,23 @@ from vosk import KaldiRecognizer, Model, SetLogLevel
 from bible_parser_core.bible_text_search import BibleTextSearcher
 from bible_parser_core.live_pipeline import LiveReferencePipeline, build_grammar, grammar_diagnostics
 from bible_parser_core.parser import DEFAULT_BIBLE, parse_live_reference
+from bible_parser_core.sequence_advancer import decide_sequence_advance_from_text
 from bible_parser_core.sherpa_streaming import (
     DEFAULT_SHERPA_THREADS,
     SherpaReplayRecognizer,
     load_sherpa_recognizer,
     sherpa_result_to_vosk_result,
 )
-from bible_parser_core.text_citation_detector import ScriptureTextDetector
+from bible_parser_core.text_citation_detector import (
+    ScriptureTextDetector,
+)
 from bible_parser_core.verse_text_search import CANONICAL_BOOK_NAMES_BY_ID
-from tools.holyrics import scripture_range
+from tools.holyrics import (
+    DEFAULT_LONG_RANGE_SLIDE_MAX_VERSES,
+    scripture_range,
+    scripture_range_quick_presentation_slides,
+    scripture_range_reading_state,
+)
 from tools.vosk_grammar_probe import (
     DEFAULT_LOG_DIR,
     DEFAULT_MODEL_PATH,
@@ -94,6 +102,11 @@ DEFAULT_CONTROL_WINDOWS_PER_PLAN = 3
 CONTROL_WINDOW_SECONDS = 45.0
 MAX_REPLAY_WINDOW_SECONDS = 120.0
 REPLAY_WINDOW_OVERLAP_SECONDS = 5.0
+MARKER_PADDING_BEFORE_SECONDS = 15.0
+MARKER_PADDING_AFTER_SECONDS = 45.0
+TEXT_PADDING_BEFORE_SECONDS = 12.0
+TEXT_PADDING_AFTER_SECONDS = 15.0
+CANDIDATE_MERGE_GAP_SECONDS = 30.0
 ADDRESS_MARKER_RE = re.compile(
     r"\b(?:стих\w*|глав\w*|послани\w*|евангели\w*|пророк\w*|книг\w*|"
     r"прочита\w*|откро\w*|псал\w*|пса\s+лом\w*|"
@@ -101,6 +114,19 @@ ADDRESS_MARKER_RE = re.compile(
     r"шест\w*|седьм\w*|восьм\w*|девят\w*|десят\w*|двадцат\w*|тридцат\w*|"
     r"сорок\w*|пятидесят\w*|шестидесят\w*|семидесят\w*|восьмидесят\w*|"
     r"девяност\w*|сот\w*)))\b",
+    re.IGNORECASE,
+)
+REFERENCE_NUMBER_RE = re.compile(
+    r"\b(?:\d{1,3}|одн\w*|два|две|три|четыре|перв\w*|втор\w*|трет\w*|четв[её]рт\w*|пят\w*|"
+    r"шест\w*|седьм\w*|восьм\w*|девят\w*|десят\w*|одиннадцат\w*|"
+    r"двенадцат\w*|тринадцат\w*|четырнадцат\w*|пятнадцат\w*|"
+    r"шестнадцат\w*|семнадцат\w*|восемнадцат\w*|девятнадцат\w*|"
+    r"двадцат\w*|тридцат\w*|сорок\w*|пятидесят\w*|шестидесят\w*|"
+    r"семидесят\w*|восьмидесят\w*|девяност\w*|сот\w*)\b",
+    re.IGNORECASE,
+)
+REFERENCE_STRUCTURE_RE = re.compile(
+    r"\b(?:стих\w*|глав(?:а|ы|е|у|ой|ою|ам|ами|ах)?|псал\w*|пса\s+лом\w*)\b",
     re.IGNORECASE,
 )
 DEFAULT_SHERPA_MODEL_PATH = (
@@ -133,6 +159,36 @@ def replay_long_passage(payload: dict) -> dict | None:
         "end_verse": end_verse,
         "ref": str((payload.get("parsed") or {}).get("ref") or ""),
     }
+
+
+def replay_smart_slide_state(payload: dict, slide_mode: str) -> dict | None:
+    """Build the same ordered slide bounds as a live Holyrics presentation."""
+    range_payload = payload.get("slide") or payload.get("parsed") or payload
+    max_verses = 1 if slide_mode == "one_verse" else DEFAULT_LONG_RANGE_SLIDE_MAX_VERSES
+    slides = scripture_range_quick_presentation_slides(range_payload, max_verses=max_verses)
+    state = scripture_range_reading_state(range_payload, slides)
+    if state is not None:
+        state["slide_mode"] = slide_mode
+    return state
+
+
+def apply_replay_smart_slide_decision(state: dict, decision: dict) -> bool:
+    """Update only replay's virtual slide; return False when the range is complete."""
+    if decision.get("action") == "complete":
+        return False
+    target_index = decision.get("target_index")
+    if isinstance(target_index, int):
+        state["current_index"] = target_index
+    return True
+
+
+def replay_smart_slide_decision(
+    state: dict,
+    global_decision: object | None,
+    sequence_decision: object | None,
+) -> dict:
+    """Prefer nearby sequence evidence, retaining strong global catch-up."""
+    return dict(decide_sequence_advance_from_text(state, global_decision, sequence_decision))
 
 
 def replay_long_passage_match(decision: object, passage: dict) -> dict:
@@ -176,7 +232,14 @@ def restore_replay_session_context(
     long_passage = session_state.get("long_passage")
     if isinstance(long_passage, dict):
         replay_state["long_passage"] = dict(long_passage)
-    return pipeline.context_range is not None or replay_state.get("long_passage") is not None
+    smart_slide_shadow = session_state.get("smart_slide_shadow")
+    if isinstance(smart_slide_shadow, dict):
+        replay_state["smart_slide_shadow"] = dict(smart_slide_shadow)
+    return bool(
+        pipeline.context_range is not None
+        or replay_state.get("long_passage") is not None
+        or replay_state.get("smart_slide_shadow") is not None
+    )
 
 
 def save_replay_session_context(
@@ -193,6 +256,10 @@ def save_replay_session_context(
     session_state["context_current_chapter"] = pipeline.context_current_chapter
     long_passage = replay_state.get("long_passage")
     session_state["long_passage"] = dict(long_passage) if isinstance(long_passage, dict) else None
+    smart_slide_shadow = replay_state.get("smart_slide_shadow")
+    session_state["smart_slide_shadow"] = (
+        dict(smart_slide_shadow) if isinstance(smart_slide_shadow, dict) else None
+    )
 
 
 def audio_duration(path: Path) -> float | None:
@@ -311,21 +378,39 @@ def read_timed_subtitle_cues(path: Path) -> list[dict[str, object]]:
 
 
 def subtitle_marker_candidates(
-    cues: list[dict[str, object]], *, padding_seconds: float = 45.0,
+    cues: list[dict[str, object]],
+    *,
+    padding_before_seconds: float = MARKER_PADDING_BEFORE_SECONDS,
+    padding_after_seconds: float = MARKER_PADDING_AFTER_SECONDS,
 ) -> list[dict[str, object]]:
     """Return context candidates around explicit Bible-reference markers."""
     candidates: list[dict[str, object]] = []
-    for cue in cues:
+    for index, cue in enumerate(cues):
         text = str(cue["text"])
         markers = sorted({match.group(0).lower() for match in ADDRESS_MARKER_RE.finditer(text)})
         if not markers:
             continue
+        context = cues[max(0, index - 1) : min(len(cues), index + 2)]
+        context_text = " ".join(str(item["text"]) for item in context)
+        parsed = parse_live_reference(context_text)
+        if parsed is None and not (
+            REFERENCE_NUMBER_RE.search(context_text)
+            and REFERENCE_STRUCTURE_RE.search(context_text)
+        ):
+            continue
+        core_start = float(cue["start_seconds"])
+        core_end = float(cue["end_seconds"])
         candidates.append(
             {
-                "start_seconds": max(0.0, float(cue["start_seconds"]) - padding_seconds),
-                "end_seconds": float(cue["end_seconds"]) + padding_seconds,
+                "start_seconds": core_start,
+                "end_seconds": core_end,
+                "core_start_seconds": core_start,
+                "core_end_seconds": core_end,
+                "padding_before_seconds": padding_before_seconds,
+                "padding_after_seconds": padding_after_seconds,
                 "sources": ["explicit_address_marker"],
                 "markers": markers,
+                "references": [parsed.ref] if parsed is not None else [],
                 "cue_text": text,
             }
         )
@@ -336,7 +421,8 @@ def subtitle_text_candidates(
     cues: list[dict[str, object]],
     searcher: BibleTextSearcher,
     *,
-    padding_seconds: float = 45.0,
+    padding_before_seconds: float = TEXT_PADDING_BEFORE_SECONDS,
+    padding_after_seconds: float = TEXT_PADDING_AFTER_SECONDS,
 ) -> list[dict[str, object]]:
     """Find high-confidence Bible-text matches in three consecutive subtitle cues."""
     candidates: list[dict[str, object]] = []
@@ -356,8 +442,12 @@ def subtitle_text_candidates(
             continue
         candidates.append(
             {
-                "start_seconds": max(0.0, float(fragment[0]["start_seconds"]) - padding_seconds),
-                "end_seconds": float(fragment[-1]["end_seconds"]) + padding_seconds,
+                "start_seconds": float(fragment[0]["start_seconds"]),
+                "end_seconds": float(fragment[-1]["end_seconds"]),
+                "core_start_seconds": float(fragment[0]["start_seconds"]),
+                "core_end_seconds": float(fragment[-1]["end_seconds"]),
+                "padding_before_seconds": padding_before_seconds,
+                "padding_after_seconds": padding_after_seconds,
                 "sources": ["bible_text_similarity"],
                 "matches": [{
                     "reference": top.reference,
@@ -370,18 +460,42 @@ def subtitle_text_candidates(
     return candidates
 
 
-def merge_subtitle_window_candidates(candidates: list[dict[str, object]]) -> list[dict[str, object]]:
-    """Merge overlapping candidates while retaining why each window was selected."""
-    candidates.sort(key=lambda item: float(item["start_seconds"]))
+def merge_subtitle_window_candidates(
+    candidates: list[dict[str, object]],
+    *,
+    max_core_gap_seconds: float = CANDIDATE_MERGE_GAP_SECONDS,
+) -> list[dict[str, object]]:
+    """Merge nearby subtitle evidence, then add its audio context once."""
+    ordered = sorted(
+        (dict(item) for item in candidates),
+        key=lambda item: float(item.get("core_start_seconds", item["start_seconds"])),
+    )
     merged: list[dict[str, object]] = []
-    for candidate in candidates:
+    for candidate in ordered:
+        candidate_core_start = float(candidate.get("core_start_seconds", candidate["start_seconds"]))
+        candidate_core_end = float(candidate.get("core_end_seconds", candidate["end_seconds"]))
+        candidate["core_start_seconds"] = candidate_core_start
+        candidate["core_end_seconds"] = candidate_core_end
+        candidate["padding_before_seconds"] = float(candidate.get("padding_before_seconds", 0.0))
+        candidate["padding_after_seconds"] = float(candidate.get("padding_after_seconds", 0.0))
         candidate_texts = list(candidate.get("cue_texts") or [candidate.get("cue_text") or ""])
-        if merged and float(candidate["start_seconds"]) <= float(merged[-1]["end_seconds"]):
+        if merged and candidate_core_start <= float(merged[-1]["core_end_seconds"]) + max_core_gap_seconds:
             previous = merged[-1]
-            previous["end_seconds"] = max(float(previous["end_seconds"]), float(candidate["end_seconds"]))
+            previous["core_end_seconds"] = max(float(previous["core_end_seconds"]), candidate_core_end)
+            previous["padding_before_seconds"] = max(
+                float(previous["padding_before_seconds"]),
+                float(candidate["padding_before_seconds"]),
+            )
+            previous["padding_after_seconds"] = max(
+                float(previous["padding_after_seconds"]),
+                float(candidate["padding_after_seconds"]),
+            )
             previous["sources"] = sorted(set(previous["sources"]) | set(candidate["sources"]))
             previous["markers"] = sorted(set(previous["markers"]) | set(candidate.get("markers") or []))
             previous["matches"].extend(candidate.get("matches") or [])
+            previous["references"] = sorted(
+                set(previous.get("references") or []) | set(candidate.get("references") or [])
+            )
             previous["cue_texts"].extend(candidate_texts)
             continue
         merged.append(
@@ -391,15 +505,32 @@ def merge_subtitle_window_candidates(candidates: list[dict[str, object]]) -> lis
                 "sources": candidate["sources"],
                 "markers": candidate.get("markers") or [],
                 "matches": candidate.get("matches") or [],
+                "references": candidate.get("references") or [],
                 "cue_texts": candidate_texts,
+                "core_start_seconds": candidate_core_start,
+                "core_end_seconds": candidate_core_end,
+                "padding_before_seconds": candidate["padding_before_seconds"],
+                "padding_after_seconds": candidate["padding_after_seconds"],
             }
+        )
+    for window in merged:
+        window["start_seconds"] = max(
+            0.0,
+            float(window["core_start_seconds"]) - float(window["padding_before_seconds"]),
+        )
+        window["end_seconds"] = (
+            float(window["core_end_seconds"]) + float(window["padding_after_seconds"])
         )
     return merged
 
 
 def subtitle_marker_windows(cues: list[dict[str, object]], *, padding_seconds: float = 45.0) -> list[dict[str, object]]:
     return merge_subtitle_window_candidates(
-        subtitle_marker_candidates(cues, padding_seconds=padding_seconds)
+        subtitle_marker_candidates(
+            cues,
+            padding_before_seconds=padding_seconds,
+            padding_after_seconds=padding_seconds,
+        )
     )
 
 
@@ -459,6 +590,7 @@ def write_subtitle_window_plan(
     output_dir: Path,
     text_detection_db: Path = DEFAULT_TEXT_DETECTION_DB,
     control_windows: int = DEFAULT_CONTROL_WINDOWS_PER_PLAN,
+    control_only: bool = False,
 ) -> list[Path]:
     """Write marker-based candidate windows; this never reads or changes audio."""
     subtitles = collect_subtitle_youtube_ids(subtitle_roots)
@@ -488,7 +620,10 @@ def write_subtitle_window_plan(
                 citation_windows,
                 limit=control_windows,
             )
-            windows = merge_subtitle_window_candidates([*citation_windows, *control_candidates])
+            windows = control_candidates if control_only else sorted(
+                [*citation_windows, *control_candidates],
+                key=lambda item: float(item["start_seconds"]),
+            )
             plan_path = output_dir / f"{video_id}.json"
             plan_path.write_text(
                 json.dumps(
@@ -496,8 +631,13 @@ def write_subtitle_window_plan(
                         "video_id": video_id,
                         "audio": str(audio_path),
                         "subtitle": str(subtitle_path),
-                        "selection": "explicit_address_markers_and_bible_text_similarity",
-                        "padding_seconds": 45,
+                        "selection": (
+                            "plain_speech_control"
+                            if control_only
+                            else "structured_address_markers_and_bible_text_similarity"
+                        ),
+                        "padding_before_seconds": MARKER_PADDING_BEFORE_SECONDS,
+                        "padding_after_seconds": MARKER_PADDING_AFTER_SECONDS,
                         "windows": windows,
                     },
                     ensure_ascii=False,
@@ -524,7 +664,13 @@ def window_audio_jobs(
     *,
     max_window_seconds: float = MAX_REPLAY_WINDOW_SECONDS,
 ) -> list[dict[str, object]]:
-    """Read saved plans and describe the WAV copies that would be produced."""
+    """Read saved plans and describe the WAV copies that would be produced.
+
+    Neighbouring planned windows may overlap because each has its own context
+    padding.  Replay every moment only once: an overlap at the beginning of a
+    new parent window would otherwise restart LiVerse and create a duplicate
+    citation from speech that was already replayed in the previous WAV.
+    """
     jobs: list[dict[str, object]] = []
     for plan_path in plan_paths:
         try:
@@ -535,16 +681,23 @@ def window_audio_jobs(
         source_audio = Path(str(plan.get("audio") or "")).expanduser()
         if not source_audio.exists():
             raise ValueError(f"Исходное аудио из плана не найдено: {source_audio}")
-        if not video_id or not plan.get("windows"):
-            raise ValueError(f"В плане нет video_id или окон: {plan_path}")
+        if not video_id:
+            raise ValueError(f"В плане нет video_id: {plan_path}")
+        if not plan.get("windows"):
+            continue
+        previous_end_seconds: float | None = None
         for index, window in enumerate(plan["windows"], start=1):
             try:
-                start_seconds = float(window["start_seconds"])
+                requested_start_seconds = float(window["start_seconds"])
                 end_seconds = float(window["end_seconds"])
             except (KeyError, TypeError, ValueError) as error:
                 raise ValueError(f"Некорректные границы окна {index} в {plan_path}") from error
-            if start_seconds < 0 or end_seconds <= start_seconds:
+            if requested_start_seconds < 0 or end_seconds <= requested_start_seconds:
                 raise ValueError(f"Некорректная длительность окна {index} в {plan_path}")
+            start_seconds = max(requested_start_seconds, previous_end_seconds or 0.0)
+            previous_end_seconds = max(previous_end_seconds or 0.0, end_seconds)
+            if start_seconds >= end_seconds:
+                continue
             sources = [str(source) for source in window.get("sources") or []]
             kind = "control" if sources == ["plain_speech_control"] else "citation"
             if max_window_seconds <= REPLAY_WINDOW_OVERLAP_SECONDS:
@@ -563,11 +716,19 @@ def window_audio_jobs(
                         "plan": str(plan_path),
                         "source_audio": str(source_audio),
                         "parent_window_index": index,
+                        "planned_start_seconds": requested_start_seconds,
                         "start_seconds": part_start,
                         "end_seconds": part_end,
                         "duration_seconds": part_end - part_start,
                         "sources": sources,
-                        "references": [str(match.get("reference")) for match in window.get("matches") or []],
+                        "references": sorted({
+                            *[str(reference) for reference in window.get("references") or [] if reference],
+                            *[
+                                str(match.get("reference"))
+                                for match in window.get("matches") or []
+                                if match.get("reference")
+                            ],
+                        }),
                         "output_audio": str(output_path),
                     }
                 )
@@ -1365,7 +1526,10 @@ def replay_audio_file(
         if text_searcher is not None
         else None
     )
-    replay_state: dict[str, dict | None] = {"long_passage": None}
+    replay_state: dict[str, dict | None] = {
+        "long_passage": None,
+        "smart_slide_shadow": None,
+    }
     context_restored = restore_replay_session_context(pipeline, replay_state, session_state)
     if args.asr_engine == "sherpa-0.54":
         recognizer = SherpaReplayRecognizer(model, args.samplerate)
@@ -1404,6 +1568,7 @@ def replay_audio_file(
             "chunk_bytes": args.chunk_bytes,
             "open_vocabulary": args.open_vocabulary,
             "citation_detection_mode": args.citation_detection_mode,
+            "long_range_slide_mode": args.long_range_slide_mode,
             "text_detection_db": str(args.text_detection_db) if text_searcher is not None else None,
             "vosk_buffer_parts": args.vosk_buffer_parts,
             "audio": "audio.wav" if audio_path else "",
@@ -1505,6 +1670,14 @@ def handle_result(
             "source": "text_only",
         }
 
+    incomplete_reference = pipeline_payload.get("incomplete_reference")
+    if incomplete_reference:
+        replay_state["incomplete_reference"] = incomplete_reference
+        logger.write(
+            "INCOMPLETE_REFERENCE",
+            {"reference": incomplete_reference, "replay_seconds": replay_seconds},
+        )
+
     text_detection_for_high_risk_address = False
     if text_detector is not None and pipeline_payload.get("matched"):
         explicit_ref = str((pipeline_payload.get("parsed") or {}).get("ref") or "")
@@ -1521,7 +1694,27 @@ def handle_result(
     if text_detector is not None and (
         not pipeline_payload.get("matched") or text_detection_for_high_risk_address
     ):
-        text_decision = text_detector.process_fragment(text, replay_seconds)
+        text_decision = text_detector.process_fragment(
+            text,
+            replay_seconds,
+            incomplete_address_correction=(
+                replay_state.get("incomplete_reference") is not None
+            ),
+        )
+        if replay_state.get("incomplete_reference") is not None:
+            if text_decision.reason == "text_corrected_incomplete_address":
+                logger.write(
+                    "INCOMPLETE_REFERENCE_TEXT_CORRECTED",
+                    {
+                        "incomplete_reference": replay_state["incomplete_reference"],
+                        "reference": text_decision.reference,
+                        "score": round(text_decision.score, 3),
+                        "margin": round(text_decision.margin, 3),
+                        "matched_words": text_decision.matched_words,
+                    },
+                )
+            if text_decision.accepted:
+                replay_state["incomplete_reference"] = None
 
     if long_passage is not None:
         range_action = replay_long_passage_match(text_decision, long_passage)
@@ -1543,6 +1736,38 @@ def handle_result(
     else:
         payload = add_slide_payload(pipeline_payload)
 
+    smart_slide_shadow = replay_state.get("smart_slide_shadow")
+    if (
+        smart_slide_shadow is not None
+        and text_detector is not None
+        and text_decision is not None
+    ):
+        sequence_decision = text_detector.evaluate_known_sequence(
+            smart_slide_shadow,
+            replay_seconds,
+        )
+        shadow_decision = replay_smart_slide_decision(
+            smart_slide_shadow,
+            text_decision,
+            sequence_decision,
+        )
+        logger.write(
+            "SMART_SLIDE_SHADOW",
+            {
+                **shadow_decision,
+                "passage": str(smart_slide_shadow.get("ref") or ""),
+                "slide_mode": str(smart_slide_shadow.get("slide_mode") or ""),
+                "window": (
+                    sequence_decision.window_text
+                    if shadow_decision.get("evidence_source") == "sequence_scoped"
+                    else str(getattr(text_decision, "window_text", "") or "")
+                ),
+                "replay_seconds": replay_seconds,
+            },
+        )
+        if not apply_replay_smart_slide_decision(smart_slide_shadow, shadow_decision):
+            replay_state["smart_slide_shadow"] = None
+
     accepted_passage = replay_long_passage(payload)
     if (
         text_detector is not None
@@ -1551,6 +1776,10 @@ def handle_result(
     ):
         if pipeline.set_context_range(payload.get("slide")):
             replay_state["long_passage"] = accepted_passage
+            replay_state["smart_slide_shadow"] = replay_smart_slide_state(
+                payload,
+                args.long_range_slide_mode,
+            )
             logger.write(
                 "REPLAY_CONTEXT_RANGE_SELECTED",
                 {"passage": accepted_passage, "replay_seconds": replay_seconds},
@@ -1627,6 +1856,11 @@ def parse_args() -> argparse.Namespace:
         help="Number of ordinary-speech control windows per subtitle plan (default: 3).",
     )
     parser.add_argument(
+        "--control-only",
+        action="store_true",
+        help="Write only ordinary-speech control windows for a separate false-positive audit.",
+    )
+    parser.add_argument(
         "--extract-window-plan",
         action="append",
         type=Path,
@@ -1691,6 +1925,12 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_TEXT_DETECTION_DB,
         help="SQLite Bible text index used outside address_only mode.",
     )
+    parser.add_argument(
+        "--long-range-slide-mode",
+        choices=("compact", "one_verse"),
+        default="compact",
+        help="Slide layout whose automatic transitions SMART_SLIDE_SHADOW evaluates.",
+    )
     parser.add_argument("--vosk-buffer-parts", type=int, default=3)
     parser.add_argument("--vosk-log-level", type=int, default=-1)
     parser.add_argument("--show-candidates", action="store_true")
@@ -1739,6 +1979,7 @@ def main() -> int:
                 args.window_plan_dir,
                 text_detection_db=args.text_detection_db,
                 control_windows=max(0, args.control_windows),
+                control_only=args.control_only,
             )
         except (OSError, ValueError) as error:
             raise SystemExit(str(error)) from error
@@ -1779,6 +2020,9 @@ def main() -> int:
                 "--extract-window-plan ... --run:\n" + missing_list
             )
         print(f"Фрагментов из плана для replay: {len(planned_audio)}", flush=True)
+        if not planned_audio:
+            print("В выбранных планах нет фрагментов для replay.", flush=True)
+            return 0
     download_urls = list(args.download_url)
     download_video_ids: list[str] = []
     if args.download_from_subtitles:

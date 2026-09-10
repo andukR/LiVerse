@@ -33,6 +33,22 @@ CATEGORIES = {
 }
 CATEGORY_LABELS = {category: label for category, label in CATEGORIES.values()}
 CATEGORY_LABELS["wrong_reference"] = "ссылка была названа, но Vosk/LiVerse разобрал её неверно"
+SMART_SLIDE_CATEGORIES = {
+    "1": ("correct_transition", "предложенный переход верный"),
+    "2": ("correct_hold", "правильно было оставить текущий слайд"),
+    "3": ("wrong_transition", "переход неверный или выбран не тот слайд"),
+    "4": ("missed_transition", "нужно было перейти, но алгоритм не предложил переход"),
+    "5": ("unclear", "непонятно, фрагмента недостаточно"),
+}
+SMART_SLIDE_ACTION_LABELS = {
+    "ignore": "не менять слайд",
+    "keep": "оставить текущий слайд",
+    "advance": "перейти на следующий слайд",
+    "assisted_advance": "перейти на следующий слайд по последовательному чтению",
+    "synchronize_forward": "перейти к найденному более позднему слайду",
+    "assisted_synchronize_forward": "перейти к ближайшему ожидаемому слайду",
+    "complete": "завершить диапазон",
+}
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -160,6 +176,10 @@ def play_case(case: dict[str, Any], cases_path: Path, *, long: bool = False) -> 
         start = max(0.0, start - 10.0)
         duration += 20.0
 
+    play_audio_window(audio_path, start, duration)
+
+
+def play_audio_window(audio_path: Path, start: float, duration: float) -> None:
     if shutil.which("mpv"):
         subprocess.Popen(
             ["mpv", "--no-video", f"--start={start:.3f}", f"--length={duration:.3f}", "--quiet", str(audio_path)],
@@ -287,6 +307,278 @@ class CaseEntry:
         return self.cases[self.case_index]
 
 
+@dataclass
+class SmartSlideEntry:
+    events_path: Path
+    event_id: str
+    event: dict[str, Any]
+    review: dict[str, Any]
+    sequence_id: int
+    sequence_position: int = 0
+    sequence_total: int = 0
+
+    @property
+    def reviews_path(self) -> Path:
+        return self.events_path.with_name("smart_slide_reviews.jsonl")
+
+
+def smart_slide_event_paths(runs_dir: Path, *, latest_batch: bool) -> list[Path]:
+    if not latest_batch:
+        return sorted(path.resolve() for path in runs_dir.glob("*/events.jsonl"))
+    batch_path = runs_dir / LATEST_REPLAY_BATCH
+    if not batch_path.exists():
+        raise RuntimeError(f"Не найден файл последней пачки: {batch_path}")
+    try:
+        batch = json.loads(batch_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Повреждён файл последней пачки: {batch_path}: {exc}") from exc
+    paths: list[Path] = []
+    for run_dir in batch.get("runs") or []:
+        path = Path(str(run_dir))
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        events_path = path / "events.jsonl"
+        if events_path.exists():
+            paths.append(events_path.resolve())
+    return paths
+
+
+def collect_smart_slide_entries(events_paths: list[Path]) -> list[SmartSlideEntry]:
+    entries: list[SmartSlideEntry] = []
+    sequence_id = -1
+    previous_passage = ""
+    previous_completed = True
+    for events_path in events_paths:
+        reviews = {
+            str(row.get("event_id") or ""): row
+            for row in load_jsonl(events_path.with_name("smart_slide_reviews.jsonl"))
+        }
+        continued = bool(session_metadata(events_path).get("continued_window_context"))
+        first_shadow_in_run = True
+        for line_number, event in enumerate(load_jsonl(events_path), start=1):
+            if event.get("event") != "SMART_SLIDE_SHADOW":
+                continue
+            passage = str(event.get("passage") or "").strip()
+            starts_sequence = bool(
+                sequence_id < 0
+                or previous_completed
+                or passage != previous_passage
+                or (first_shadow_in_run and not continued)
+            )
+            if starts_sequence:
+                sequence_id += 1
+            event_id = f"{events_path.parent.name}:smart_slide:{line_number}"
+            entries.append(SmartSlideEntry(
+                events_path=events_path,
+                event_id=event_id,
+                event=event,
+                review=dict(reviews.get(event_id) or {}),
+                sequence_id=sequence_id,
+            ))
+            previous_passage = passage
+            previous_completed = str(event.get("action") or "") == "complete"
+            first_shadow_in_run = False
+    counts: dict[int, int] = {}
+    positions: dict[int, int] = {}
+    for entry in entries:
+        counts[entry.sequence_id] = counts.get(entry.sequence_id, 0) + 1
+    for entry in entries:
+        positions[entry.sequence_id] = positions.get(entry.sequence_id, 0) + 1
+        entry.sequence_position = positions[entry.sequence_id]
+        entry.sequence_total = counts[entry.sequence_id]
+    return entries
+
+
+def smart_slide_is_unreviewed(entry: SmartSlideEntry) -> bool:
+    return not str(entry.review.get("review_category") or "").strip()
+
+
+def smart_slide_audio_path(entry: SmartSlideEntry) -> Path:
+    session = session_metadata(entry.events_path)
+    local_audio = str(session.get("audio") or "").strip()
+    if local_audio:
+        candidate = Path(local_audio)
+        candidate = candidate if candidate.is_absolute() else entry.events_path.parent / candidate
+        if candidate.exists():
+            return candidate
+    source_audio = str(session.get("source_audio") or "").strip()
+    candidate = Path(source_audio)
+    return candidate if candidate.is_absolute() else Path.cwd() / candidate
+
+
+def play_smart_slide_entry(entry: SmartSlideEntry, *, long: bool = False) -> None:
+    audio_path = smart_slide_audio_path(entry)
+    if not audio_path.exists():
+        print(f"Аудиофайл не найден: {audio_path}")
+        return
+    moment = float_value(entry.event.get("replay_seconds"))
+    before, after = (22.0, 10.0) if long else (12.0, 5.0)
+    start = max(0.0, moment - before)
+    play_audio_window(audio_path, start, before + after)
+
+
+def smart_slide_element_label(element: object, index: object) -> str:
+    number = int(index) + 1 if isinstance(index, int) else "?"
+    if not isinstance(element, dict):
+        return f"слайд {number}"
+    start_chapter = int(element.get("start_chapter", element.get("chapter")) or 0)
+    start_verse = int(element.get("start_verse", element.get("verse")) or 0)
+    end_chapter = int(element.get("chapter") or start_chapter)
+    end_verse = int(element.get("verse") or start_verse)
+    bounds = f"{start_chapter}:{start_verse}"
+    if (end_chapter, end_verse) != (start_chapter, start_verse):
+        bounds += f"–{end_chapter}:{end_verse}" if end_chapter != start_chapter else f"–{end_verse}"
+    return f"слайд {number} ({bounds})"
+
+
+def print_smart_slide_entry(
+    entries: list[SmartSlideEntry],
+    position: int,
+) -> None:
+    entry = entries[position]
+    event = entry.event
+    action = str(event.get("action") or "ignore")
+    print("\n" + "=" * 80)
+    print(
+        f"Решение {position + 1}/{len(entries)}; "
+        f"диапазон {entry.sequence_id + 1}, "
+        f"шаг {entry.sequence_position}/{entry.sequence_total}"
+    )
+    print(f"log={entry.events_path.parent}")
+    print(f"audio={smart_slide_audio_path(entry)}")
+    print(f"time={float_value(event.get('replay_seconds')):.3f}s passage={event.get('passage')}")
+    print(
+        "текущий: "
+        + smart_slide_element_label(event.get("current_element"), event.get("current_index"))
+    )
+    target_index = event.get("target_index")
+    if isinstance(target_index, int):
+        print(
+            "предложен: "
+            + smart_slide_element_label(event.get("target_element"), target_index)
+        )
+    print(f"решение: {action} — {SMART_SLIDE_ACTION_LABELS.get(action, action)}")
+    print(
+        f"кандидат: {event.get('candidate')} score={event.get('score')} "
+        f"margin={event.get('margin')} words={event.get('matched_words')}"
+    )
+    print(f"основание: {event.get('reason')} source={event.get('evidence_source')}")
+    print(f"речь: {event.get('window')}")
+    neighbours: list[str] = []
+    for neighbour_index in (position - 1, position + 1):
+        if 0 <= neighbour_index < len(entries):
+            neighbour = entries[neighbour_index]
+            if neighbour.sequence_id == entry.sequence_id:
+                neighbour_action = str(neighbour.event.get("action") or "ignore")
+                neighbours.append(
+                    f"шаг {neighbour.sequence_position}: "
+                    f"{neighbour.event.get('candidate')} -> {neighbour_action}"
+                )
+    if neighbours:
+        print("соседние решения: " + " | ".join(neighbours))
+    if entry.review:
+        category = str(entry.review.get("review_category") or "")
+        labels = {value: label for value, label in SMART_SLIDE_CATEGORIES.values()}
+        print(f"разметка: {category} ({labels.get(category, '')})")
+        if entry.review.get("note"):
+            print(f"заметка: {entry.review['note']}")
+    print("\nКатегории перелистывания:")
+    for key, (_category, label) in SMART_SLIDE_CATEGORIES.items():
+        print(f"  {key}. {label}")
+    print(
+        "\nКоманды: Enter/зв - прослушать | зв+ - длиннее | 1-5 - выбрать | "
+        "к N/исправить N - перейти | н заметка | п пропустить | вых выход"
+    )
+
+
+def save_smart_slide_review(entry: SmartSlideEntry) -> None:
+    rows = load_jsonl(entry.reviews_path)
+    replacement = dict(entry.review)
+    replacement["event_id"] = entry.event_id
+    for index, row in enumerate(rows):
+        if str(row.get("event_id") or "") == entry.event_id:
+            rows[index] = replacement
+            break
+    else:
+        rows.append(replacement)
+    save_jsonl(entry.reviews_path, rows)
+
+
+def next_unreviewed_smart_slide(entries: list[SmartSlideEntry], start: int) -> int:
+    for index in range(start, len(entries)):
+        if smart_slide_is_unreviewed(entries[index]):
+            return index
+    for index in range(0, min(start, len(entries))):
+        if smart_slide_is_unreviewed(entries[index]):
+            return index
+    return len(entries)
+
+
+def review_smart_slides(args: argparse.Namespace) -> None:
+    runs_dir = Path(args.runs_dir)
+    events_paths = smart_slide_event_paths(runs_dir, latest_batch=args.latest_batch)
+    entries = collect_smart_slide_entries(events_paths)
+    if not entries:
+        print(f"События SMART_SLIDE_SHADOW не найдены: {runs_dir}")
+        return
+    unreviewed = sum(1 for entry in entries if smart_slide_is_unreviewed(entry))
+    if not unreviewed and not args.no_resume:
+        print(f"Все решения перелистывания уже размечены: {len(entries)}")
+        print("Для просмотра с начала добавьте --no-resume.")
+        return
+    position = 0 if args.no_resume else next_unreviewed_smart_slide(entries, 0)
+    reviewed = 0
+    print(f"Последовательностей: {len({entry.sequence_id for entry in entries})}")
+    print(f"Решений: {len(entries)}; неразмеченных: {unreviewed}")
+    print("Разметка сохраняется отдельно и не используется для обучения НБА.")
+    while 0 <= position < len(entries):
+        entry = entries[position]
+        print_smart_slide_entry(entries, position)
+        command = input("> ").strip().lower()
+        if command in {"", "зв", "p", "play"}:
+            play_smart_slide_entry(entry)
+            continue
+        if command in {"зв+", "p+", "play+"}:
+            play_smart_slide_entry(entry, long=True)
+            continue
+        if command in {"п", "skip", "s"}:
+            position += 1
+            continue
+        if command in {"н", "note"}:
+            entry.review["note"] = input("Заметка: ").strip()
+            save_smart_slide_review(entry)
+            continue
+        if command in {"вых", "выход", "q", "quit"}:
+            break
+        next_position = parse_case_number_command(command, len(entries))
+        if next_position is not None:
+            position = next_position
+            continue
+        if command in SMART_SLIDE_CATEGORIES:
+            category, _label = SMART_SLIDE_CATEGORIES[command]
+            was_unreviewed = smart_slide_is_unreviewed(entry)
+            entry.review.update({
+                "event_id": entry.event_id,
+                "status": "reviewed",
+                "review_category": category,
+                "reviewed_at": datetime.now().isoformat(timespec="seconds"),
+                "passage": str(entry.event.get("passage") or ""),
+                "replay_seconds": float_value(entry.event.get("replay_seconds")),
+                "action": str(entry.event.get("action") or ""),
+                "current_index": entry.event.get("current_index"),
+                "target_index": entry.event.get("target_index"),
+            })
+            entry.review.setdefault("note", "")
+            save_smart_slide_review(entry)
+            if was_unreviewed:
+                reviewed += 1
+            position = next_unreviewed_smart_slide(entries, position + 1)
+            continue
+        print("Неизвестная команда.")
+    remaining = sum(1 for entry in entries if smart_slide_is_unreviewed(entry))
+    print(f"Готово. Размечено за этот запуск: {reviewed}. Осталось: {remaining}")
+
+
 def session_source_audio(cases_path: Path) -> str:
     session = session_metadata(cases_path)
     return str(session.get("source_audio") or "")
@@ -373,6 +665,9 @@ def latest_live_cases_file(runs_dir: Path) -> Path:
 
 
 def review(args: argparse.Namespace) -> None:
+    if args.smart_slides:
+        review_smart_slides(args)
+        return
     if args.latest_batch:
         review_latest_batch(args)
         return
@@ -591,6 +886,11 @@ def main() -> int:
         help="Review only one newest trigger_cases.jsonl file. For the newest replay batch, omit --latest.",
     )
     parser.add_argument("--latest-batch", action="store_true", help="Review only the latest replay batch.")
+    parser.add_argument(
+        "--smart-slides",
+        action="store_true",
+        help="Review SMART_SLIDE_SHADOW decisions separately from citation labels.",
+    )
     parser.add_argument("--latest-live", action="store_true", help="Review only the newest live LiVerse run with unreviewed cases.")
     parser.add_argument("--all-unreviewed", action="store_true", help="Review all unreviewed cases from all runs.")
     parser.add_argument(

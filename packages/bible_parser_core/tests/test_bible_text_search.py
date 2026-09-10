@@ -91,6 +91,10 @@ class BibleTextSearcherTest(unittest.TestCase):
                         "завершение общий мысль",
                         max_range_verses=3,
                     )
+                    _scoped_lemmas, scoped_results = searcher.search_within_ranges(
+                        "сказать важный мысль продолжение этот мысль услышать человек",
+                        [(43, 11, 36, 11, 37)],
+                    )
 
             self.assertEqual(["ибо", "так", "возлюбил", "бог", "мир"], lemmas)
             self.assertEqual("Ин. 3:16", results[0].reference)
@@ -112,6 +116,11 @@ class BibleTextSearcherTest(unittest.TestCase):
                 three_range_results[0].start_verse,
                 three_range_results[0].end_verse,
             ))
+            self.assertEqual("Ин. 11:36", scoped_results[0].reference)
+            self.assertEqual(
+                {"Ин. 11:36", "Ин. 11:37"},
+                {item.reference for item in scoped_results},
+            )
 
             with BibleTextSearcher(db_path, use_database_lemmas=True) as searcher:
                 database_lemmas, database_results = searcher.search(

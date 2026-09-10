@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, replace
 from time import perf_counter
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 from bible_parser_core.bible_text_search import (
     BibleTextSearcher,
@@ -108,6 +108,29 @@ class TextDetectionConfig:
     max_range_verses: int = 3
 
 
+def promote_incomplete_address_text_match(
+    decision: TextCitationDecision,
+) -> TextCitationDecision:
+    """Accept unusually rich text evidence after an incomplete spoken address."""
+    candidate = decision.top_candidate
+    if decision.accepted or candidate is None:
+        return decision
+    if not (
+        decision.score >= 60.0
+        and decision.margin >= 8.0
+        and decision.matched_words >= 6
+        and candidate.bigram_overlap >= 40.0
+        and candidate.ordered_similarity >= 65.0
+    ):
+        return decision
+    return replace(
+        decision,
+        accepted=True,
+        reason="text_corrected_incomplete_address",
+        confirmations=1,
+    )
+
+
 class SlidingSpeechBuffer:
     """Keep recent recognized words and expose configured suffix windows."""
 
@@ -183,6 +206,7 @@ class ScriptureTextDetector:
         self._confirmations = 0
         self._shown_at: dict[tuple[str, int, int, int, int] | str, float] = {}
         self._search_cache: dict[str, tuple[list[str], list[BibleTextSearchResult]]] = {}
+        self._last_windows: list[SpeechWindow] = []
 
     def clear(self) -> None:
         self.buffer.clear()
@@ -202,7 +226,13 @@ class ScriptureTextDetector:
         if reference:
             self._shown_at[_reference_key(reference)] = now
 
-    def process_fragment(self, text: str, now: float) -> TextCitationDecision:
+    def process_fragment(
+        self,
+        text: str,
+        now: float,
+        *,
+        incomplete_address_correction: bool = False,
+    ) -> TextCitationDecision:
         fragment_tokens = normalize_bible_text(text)
         windows = self.buffer.add(text)
         if 2 <= len(fragment_tokens) < self.config.min_words:
@@ -213,6 +243,7 @@ class ScriptureTextDetector:
                     tokens=tuple(fragment_tokens),
                 ),
             )
+        self._last_windows = windows
         if not windows:
             return self._decision(reason="not_enough_words")
         if now < self._suppressed_until:
@@ -242,16 +273,33 @@ class ScriptureTextDetector:
                 self._event_payload(decision),
             )
 
-        best = max(
-            evaluated,
-            key=lambda item: (
-                item.accepted,
-                item.score,
-                item.margin,
-                item.matched_words,
-                len(item.window_text.split()),
-            ),
+        corrected_candidates = (
+            [promote_incomplete_address_text_match(item) for item in evaluated]
+            if incomplete_address_correction
+            else []
         )
+        accepted_corrections = [item for item in corrected_candidates if item.accepted]
+        if accepted_corrections:
+            best = max(
+                accepted_corrections,
+                key=lambda item: (
+                    item.matched_words,
+                    item.margin,
+                    item.score,
+                    len(item.window_text.split()),
+                ),
+            )
+        else:
+            best = max(
+                evaluated,
+                key=lambda item: (
+                    item.accepted,
+                    item.score,
+                    item.margin,
+                    item.matched_words,
+                    len(item.window_text.split()),
+                ),
+            )
         if best.accepted and best.top_candidate is not None:
             broader = [
                 item
@@ -325,6 +373,56 @@ class ScriptureTextDetector:
             return best
         return self._confirm(best, now)
 
+    def evaluate_known_sequence(
+        self,
+        state: Mapping[str, object] | None,
+        now: float,
+    ) -> TextCitationDecision:
+        """Evaluate recent speech only against the current and next sequence elements."""
+        if not isinstance(state, Mapping) or not self._last_windows:
+            return self._decision(reason="sequence_inactive")
+        targets = [item for item in state.get("targets") or [] if isinstance(item, Mapping)]
+        if not targets:
+            return self._decision(reason="sequence_inactive")
+        current_index = max(0, min(int(state.get("current_index") or 0), len(targets) - 1))
+        book_id = int(state.get("book_id") or 0)
+        ranges: list[tuple[int, int, int, int, int]] = []
+        for target in targets[current_index : current_index + 2]:
+            ranges.append((
+                book_id,
+                int(target.get("start_chapter", target.get("chapter")) or 0),
+                int(target.get("start_verse", target.get("verse")) or 0),
+                int(target.get("chapter") or 0),
+                int(target.get("verse") or 0),
+            ))
+        evaluated: list[TextCitationDecision] = []
+        for window in self._last_windows:
+            lemmas, results = self.searcher.search_within_ranges(
+                window.text,
+                ranges,
+                limit=self.config.result_limit,
+            )
+            decision = self._evaluate(
+                window.text,
+                lemmas,
+                results,
+                now,
+                ignore_recently_shown=True,
+            )
+            evaluated.append(decision)
+        best = max(
+            evaluated,
+            key=lambda item: (
+                item.accepted,
+                item.score,
+                item.margin,
+                item.matched_words,
+                len(item.window_text.split()),
+            ),
+        )
+        self._emit("SEQUENCE_TEXT_CANDIDATE", self._event_payload(best))
+        return best
+
     def _search(self, window_text: str) -> tuple[list[str], list[BibleTextSearchResult]]:
         cached = self._search_cache.get(window_text)
         if cached is not None:
@@ -346,6 +444,8 @@ class ScriptureTextDetector:
         lemmas: list[str],
         results: list[BibleTextSearchResult],
         now: float,
+        *,
+        ignore_recently_shown: bool = False,
     ) -> TextCitationDecision:
         if not results:
             return self._decision(window_text=window_text, reason="no_candidates")
@@ -365,7 +465,7 @@ class ScriptureTextDetector:
             for lemma in top.matched_lemmas
             if lemma in content_lemmas and lemma not in COMMON_SPEECH_LEMMAS
         )
-        shown_relation = self._recent_shown_relation(top, now)
+        shown_relation = None if ignore_recently_shown else self._recent_shown_relation(top, now)
         if shown_relation == "contained":
             return self._decision(
                 reference=top.reference, score=top.score, margin=margin,

@@ -340,7 +340,10 @@ ASR_REPLACEMENTS = (
     (r"\bбытья\b", "бытия"),
     (r"\bизход\b", "исход"),
     (r"\b([1234])\s+мега\s+царств\b", r"\1 книга царств"),
-    (r"\b2\s+законе\b", "второзаконие"),
+    # Sherpa: «Второзаконие» -> «второй законе».  This replacement restores
+    # only the book name; a missing chapter must still be supplied by text
+    # recognition or by the operator.
+    (r"\b(?:2|второй)\s+законе\b", "второзаконие"),
     (r"\bтаразакон[а-я]*\s+1\s+глава\s+22\s+стих\b", "второзаконие 11 глава 22 стих"),
     (r"\bтаразакон[а-я]*\b", "второзаконие"),
     (r"\bвторозакон[а-я]*\s+ста[ея]\s+глава\b", "второзаконие 6 глава"),
@@ -516,6 +519,41 @@ TRUNCATED_ORDINAL_VERSES = {
     "трид": 30,
 }
 
+# Sherpa may cut off the genitive ending of the first verse in a range:
+# «с четвёр[того] по двенадцатый стих».  These are deliberately used only
+# between «с» and «по … стих», never as global word substitutions.
+TRUNCATED_GENITIVE_RANGE_STARTS = {
+    "перв": 1,
+    "втор": 2,
+    "треть": 3,
+    "четверт": 4,
+    "четвер": 4,
+    "пят": 5,
+    "шест": 6,
+    "седьм": 7,
+    "седь": 7,
+    "восьм": 8,
+    "вось": 8,
+    "девят": 9,
+    "десят": 10,
+    "одиннадцат": 11,
+    "двенадцат": 12,
+    "тринадцат": 13,
+    "четырнадцат": 14,
+    "пятнадцат": 15,
+    "шестнадцат": 16,
+    "семнадцат": 17,
+    "восемнадцат": 18,
+    "девятнадцат": 19,
+    "двадцат": 20,
+    "тридцат": 30,
+}
+TRUNCATED_GENITIVE_RANGE_START_RE = re.compile(
+    r"\bс\s+("
+    + "|".join(sorted(TRUNCATED_GENITIVE_RANGE_STARTS, key=len, reverse=True))
+    + r")\s+по\s+(?=(?:\d+|[а-я]+)(?:\s+(?:\d+|[а-я]+)){0,2}\s+стих\b)"
+)
+
 
 def replace_truncated_twenty_ordinal(match: re.Match[str]) -> str:
     """Restore a Sherpa-truncated ordinal immediately before ``стих``."""
@@ -525,6 +563,11 @@ def replace_truncated_twenty_ordinal(match: re.Match[str]) -> str:
 def replace_truncated_ordinal_verse(match: re.Match[str]) -> str:
     """Restore an observed Sherpa-truncated verse ordinal."""
     return f"{TRUNCATED_ORDINAL_VERSES[match.group(1)]} стих"
+
+
+def replace_truncated_genitive_range_start(match: re.Match[str]) -> str:
+    """Restore a truncated first verse only in ``с … по … стих``."""
+    return f"с {TRUNCATED_GENITIVE_RANGE_STARTS[match.group(1)]} по "
 
 
 def normalize_text(text: str) -> str:
@@ -558,6 +601,10 @@ def normalize_text(text: str) -> str:
     normalized = re.sub(
         r"\b(одиннад|двенад|тринад|четырнад|пятнад|шестнад|семнад|восемнад|девятнад|двад|трид)\w*\s+стих\b",
         replace_truncated_ordinal_verse,
+        normalized,
+    )
+    normalized = TRUNCATED_GENITIVE_RANGE_START_RE.sub(
+        replace_truncated_genitive_range_start,
         normalized,
     )
     normalized = replace_number_phrases(normalized)

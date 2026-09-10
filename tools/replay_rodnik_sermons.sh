@@ -10,6 +10,8 @@ AUDIO_ROOT="$PROJECT_ROOT/.cache/liverse/replay_audio"
 ASR_ENGINE="sherpa-0.54"
 CITATION_DETECTION_MODE="hybrid_confirm"
 RUN_REPLAY=false
+CONTROL_WINDOWS=0
+CONTROL_ONLY=false
 PYTHON="$PROJECT_ROOT/.venv/bin/python"
 BATCH_ROOT="$PROJECT_ROOT/.cache/liverse/rodnik_replay_batches"
 LATEST_BATCH_FILE="$BATCH_ROOT/latest_logs_dir"
@@ -23,7 +25,9 @@ usage() {
 Использование:
   tools/replay_rodnik_sermons.sh next
   tools/replay_rodnik_sermons.sh batch AUDIO_1 [AUDIO_2] [AUDIO_3]
+  tools/replay_rodnik_sermons.sh audit AUDIO_1 [AUDIO_2] [AUDIO_3]
   tools/replay_rodnik_sermons.sh review
+  tools/replay_rodnik_sermons.sh review-slides
   tools/replay_rodnik_sermons.sh [--run] [--engine sherpa-0.54|vosk-0.22]
 
 next                  Автоматически выбрать до трёх ещё не обработанных
@@ -32,13 +36,17 @@ batch AUDIO_1 [AUDIO_2] [AUDIO_3]
                       Для одной-трёх выбранных записей: подобрать окна по субтитрам,
                       нарезать WAV и запустить Sherpa 0.54 в hybrid_confirm.
                       Исходные записи не изменяются.
+audit AUDIO_1 [AUDIO_2] [AUDIO_3]
+                      Отдельно проверить обычную речь на ложные срабатывания.
 review                Открыть аннотатор только для последней успешной пачки.
+review-slides         Разметить решения умного перелистывателя из этой пачки.
 
 Без --run скрипт только покажет найденные записи и их длительность.
 --run                 Запустить эмуляцию живой проповеди.
 --engine NAME         Движок распознавания; по умолчанию sherpa-0.54.
 
-Все сохранённые записи включаются всегда: это постоянный контрольный набор.
+Обычная команда next не добавляет контрольные окна. Для отдельной проверки
+ложных срабатываний используйте audit с путями к одной-трём записям.
 EOF
 }
 
@@ -69,7 +77,15 @@ run_batch() {
     logs_dir="$batch_dir/logs"
     mkdir -p "$plans_dir"
 
-    local plan_command=("$PYTHON" tools/replay_audio_files.py --plan-subtitle-windows --window-plan-dir "$plans_dir")
+    local plan_command=(
+        "$PYTHON" tools/replay_audio_files.py
+        --plan-subtitle-windows
+        --window-plan-dir "$plans_dir"
+        --control-windows "$CONTROL_WINDOWS"
+    )
+    if [[ "$CONTROL_ONLY" == true ]]; then
+        plan_command+=(--control-only)
+    fi
     for audio_file in "$@"; do
         plan_command+=(--audio "$audio_file")
     done
@@ -101,14 +117,17 @@ run_batch() {
         --log-dir "$logs_dir" \
         --asr-engine "$ASR_ENGINE" \
         --citation-detection-mode "$CITATION_DETECTION_MODE" \
+        --long-range-slide-mode one_verse \
         --include-processed \
         --run
 
-    local processed_file="$batch_dir/processed_audio.txt"
-    : > "$processed_file"
-    for audio_file in "$@"; do
-        realpath -e "$audio_file" >> "$processed_file"
-    done
+    if [[ "$CONTROL_ONLY" != true ]]; then
+        local processed_file="$batch_dir/processed_audio.txt"
+        : > "$processed_file"
+        for audio_file in "$@"; do
+            realpath -e "$audio_file" >> "$processed_file"
+        done
+    fi
     printf '%s\n' "$logs_dir" > "$LATEST_BATCH_FILE"
     echo ""
     echo "Эмуляция завершена. Для разметки этой пачки выполните:"
@@ -205,6 +224,20 @@ review_latest_batch() {
     exec "$PYTHON" tools/review_trigger_cases.py --runs-dir "$logs_dir" --all-unreviewed
 }
 
+review_latest_smart_slides() {
+    if [[ ! -s "$LATEST_BATCH_FILE" ]]; then
+        echo "Нет последней успешной пачки. Сначала выполните next или batch." >&2
+        return 1
+    fi
+    local logs_dir
+    logs_dir="$(<"$LATEST_BATCH_FILE")"
+    if [[ ! -d "$logs_dir" ]]; then
+        echo "Папка логов последней пачки не найдена: $logs_dir" >&2
+        return 1
+    fi
+    exec "$PYTHON" tools/review_trigger_cases.py --smart-slides --runs-dir "$logs_dir"
+}
+
 case "${1:-}" in
     next)
         if (($# != 1)); then
@@ -221,6 +254,14 @@ case "${1:-}" in
         run_batch "$@"
         exit $?
         ;;
+    audit)
+        shift
+        CONTROL_WINDOWS=3
+        CONTROL_ONLY=true
+        cd "$PROJECT_ROOT"
+        run_batch "$@"
+        exit $?
+        ;;
     review)
         if (($# != 1)); then
             echo "У review нет дополнительных параметров." >&2
@@ -228,6 +269,14 @@ case "${1:-}" in
         fi
         cd "$PROJECT_ROOT"
         review_latest_batch
+        ;;
+    review-slides)
+        if (($# != 1)); then
+            echo "У review-slides нет дополнительных параметров." >&2
+            exit 2
+        fi
+        cd "$PROJECT_ROOT"
+        review_latest_smart_slides
         ;;
 esac
 

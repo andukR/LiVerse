@@ -6,7 +6,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import call, patch
 
-from bible_parser_core.live_pipeline import LiveReferencePipeline, build_grammar, should_block_matched_payload
+from bible_parser_core.live_pipeline import (
+    LiveReferencePipeline,
+    build_grammar,
+    should_block_matched_payload,
+)
 from bible_parser_core.parser import normalize_text
 from bible_parser_core.risk_model import load_risk_model, score_payload_with_model
 from tools.holyrics import (
@@ -98,6 +102,38 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertLess(audio_level_percent(300), audio_level_percent(3000))
         self.assertLess(audio_level_percent(3000), audio_level_percent(30000))
         self.assertEqual(100, audio_level_percent(32767))
+
+    def test_missing_chapter_is_not_invented_from_distorted_deuteronomy(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text(
+            "есть ещё последовательность чем важнее истина тем она проще "
+            "сказано слове божье почему второй законе считаю была "
+            "четвёртый стих слушая израиля"
+        )
+
+        self.assertFalse(result.get("matched"))
+        self.assertIsNone(result.get("parsed"))
+        self.assertEqual(
+            {
+                "book": "Второзаконие",
+                "start_verse": 4,
+                "end_verse": 4,
+                "source_text": result["text"],
+            },
+            result.get("incomplete_reference"),
+        )
+
+    def test_operator_can_complete_missing_chapter_with_validated_number(self):
+        from tools.vosk_grammar_probe import complete_incomplete_reference
+
+        hint = {"book": "Второзаконие", "start_verse": 4, "end_verse": 4}
+
+        payload = complete_incomplete_reference(hint, 6)
+
+        self.assertEqual("Второзаконие 6:4", payload.get("parsed", {}).get("ref"))
+        self.assertEqual("operator_completed_reference", payload.get("source"))
+        self.assertIsNone(complete_incomplete_reference(hint, 99))
 
     def test_stop_file_is_consumed_once(self):
         import tempfile
@@ -3895,11 +3931,32 @@ class LiveReferencePipelineTest(unittest.TestCase):
                 "с четвёртого по двенадцатый стих семьдесят второго салма",
                 "Псалтирь 72:4-12",
             ),
+            (
+                "давайте сейчас пришла с четвёр по двенадцатый стих семьдесят второго салман",
+                "Псалтирь 72:4-12",
+            ),
         ):
             with self.subTest(text=text):
                 result = LiveReferencePipeline().process_text(text)
 
                 self.assertEqual(expected, result.get("parsed", {}).get("ref"))
+
+    def test_truncated_genitive_range_starts_are_restored_only_in_verse_ranges(self):
+        from bible_parser_core.parser import normalize_text
+
+        for token, value in (
+            ("перв", 1), ("втор", 2), ("треть", 3), ("четвер", 4),
+            ("пят", 5), ("шест", 6), ("седьм", 7), ("седь", 7),
+            ("восьм", 8), ("вось", 8), ("девят", 9), ("десят", 10),
+            ("одиннадцат", 11), ("двенадцат", 12), ("девятнадцат", 19),
+        ):
+            with self.subTest(token=token):
+                self.assertIn(
+                    f"с {value} по 12 стих",
+                    normalize_text(f"с {token} по двенадцатый стих"),
+                )
+
+        self.assertEqual("с перв по делам", normalize_text("с перв по делам"))
 
     def test_unconnected_verse_range_reuses_last_book_and_chapter(self):
         pipeline = LiveReferencePipeline()

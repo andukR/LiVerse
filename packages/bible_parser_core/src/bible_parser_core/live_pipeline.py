@@ -11,7 +11,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 from bible_parser_core.book_aliases import book_synonyms
-from bible_parser_core.parser import DEFAULT_BIBLE, NUMBER_WORDS, ORDINALS, ParsedReference, book_candidates, normalize_text, parse_live_reference
+from bible_parser_core.parser import (
+    DEFAULT_BIBLE,
+    NUMBER_WORDS,
+    ONE_CHAPTER_BOOKS,
+    ORDINALS,
+    ParsedReference,
+    book_candidates,
+    normalize_text,
+    parse_live_reference,
+)
 from bible_parser_core.parser import diagnose_invalid_reference
 from bible_parser_core.reference_resolver import (
     resolve_best_reference_candidate,
@@ -657,6 +666,7 @@ def compact_reference_list(text: str, bible_path: Path = DEFAULT_BIBLE) -> list[
 
 
 def resolve_reference_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, show_candidates: bool = False) -> dict:
+    incomplete_reference = incomplete_reference_without_chapter(text)
     reference_list = compact_reference_list(text, bible_path=bible_path)
     if reference_list:
         return {
@@ -671,7 +681,7 @@ def resolve_reference_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, sh
             "bible_path": str(bible_path),
         }
 
-    parsed = parse_live_reference(text, bible_path=bible_path)
+    parsed = None if incomplete_reference else parse_live_reference(text, bible_path=bible_path)
     source = "parser"
     suffix_parsed = command_suffix_reference(text, bible_path=bible_path) if parsed else None
     if suffix_parsed and suffix_parsed.ref != parsed.ref:
@@ -707,7 +717,7 @@ def resolve_reference_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, sh
         ):
             invalid_reference = parsed_invalid_reference
             parsed = None
-    if parsed is None:
+    if parsed is None and incomplete_reference is None:
         if invalid_reference is None:
             resolved = resolve_best_reference_candidate(text, bible_path=bible_path)
             if resolved:
@@ -736,6 +746,7 @@ def resolve_reference_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, sh
         "message": invalid_reference.message if invalid_reference else None,
         "matched": parsed is not None,
         "bible_path": str(bible_path),
+        "incomplete_reference": incomplete_reference,
     }
     if blocked_weak_context:
         payload["blocked_weak_context"] = blocked_weak_context
@@ -752,6 +763,34 @@ def resolve_reference_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, sh
             for candidate in resolve_reference_candidates(text, bible_path=bible_path)
         ]
     return payload
+
+
+def incomplete_reference_without_chapter(text: str) -> dict | None:
+    """Keep a reliable book and verse when the spoken chapter disappeared."""
+    normalized = normalize_text(text)
+    if re.search(r"\bглав\w*\b", normalized):
+        return None
+    books = [candidate for candidate in book_candidates(normalized) if candidate.score >= 0.999]
+    if not books:
+        return None
+    book_candidate = books[0]
+    if book_candidate.book in ONE_CHAPTER_BOOKS:
+        return None
+    suffix = normalized[book_candidate.end :]
+    verse_matches = list(re.finditer(r"\b(\d{1,3})\s+стих\w*\b", suffix))
+    if len(verse_matches) != 1:
+        return None
+    # A compact address such as «Иоанн 3 16 стих» already contains a chapter.
+    before_verse = suffix[: verse_matches[0].start()]
+    if re.search(r"\b\d{1,3}\b", before_verse):
+        return None
+    verse = int(verse_matches[0].group(1))
+    return {
+        "book": book_candidate.book,
+        "start_verse": verse,
+        "end_verse": verse,
+        "source_text": text,
+    }
 
 
 def resolver_book_conflict_reason(text: str, ref: str) -> str | None:

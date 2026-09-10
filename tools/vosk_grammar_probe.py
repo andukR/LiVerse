@@ -54,10 +54,12 @@ from bible_parser_core.live_pipeline import (
     grammar_diagnostics,
     match_sermon_plan_slide,
     parsed_payload_from_candidates as core_parsed_payload_from_candidates,
+    resolve_reference_payload as core_resolve_reference_payload,
     sermon_plan_grammar_phrases,
 )
 from bible_parser_core.parser import DEFAULT_BIBLE
 from bible_parser_core.risk_model import load_risk_model, score_payload_with_model
+from bible_parser_core.sequence_advancer import decide_sequence_advance_from_text
 from bible_parser_core.sherpa_streaming import (
     DEFAULT_SHERPA_THREADS,
     SherpaStreamingRecognizer,
@@ -1707,6 +1709,7 @@ def payload_summary(payload: dict) -> dict:
         "context_reference": bool(payload.get("context_reference")),
         "context_range": payload.get("context_range") or {},
         "invalid_reference": invalid_reference,
+        "incomplete_reference": payload.get("incomplete_reference") or {},
         "message": payload.get("message"),
         "attempts": payload.get("attempts") or [],
         "reference_list": payload.get("reference_list") or [],
@@ -2058,6 +2061,153 @@ def show_popup_message(title: str, message: str) -> None:
     root.after(100, root.focus_force)
     root.after(150, root.lift)
     root.wait_variable(closed)
+
+
+def complete_incomplete_reference(
+    hint: dict,
+    chapter: int,
+    bible_path: Path = DEFAULT_BIBLE,
+) -> dict | None:
+    """Build a normal slide after the operator supplies the missing chapter."""
+    book = str(hint.get("book") or "").strip()
+    try:
+        start_verse = int(hint.get("start_verse") or 0)
+        end_verse = int(hint.get("end_verse") or start_verse)
+        chapter = int(chapter)
+    except (TypeError, ValueError):
+        return None
+    if not book or chapter <= 0 or start_verse <= 0 or end_verse < start_verse:
+        return None
+    verse_part = str(start_verse)
+    if end_verse > start_verse:
+        verse_part += f"-{end_verse}"
+    payload = core_resolve_reference_payload(
+        f"{book} {chapter} глава {verse_part} стих",
+        bible_path=bible_path,
+    )
+    parsed = payload.get("parsed") or {}
+    if (
+        not payload.get("matched")
+        or parsed.get("book") != book
+        or int(parsed.get("chapter") or 0) != chapter
+        or int(parsed.get("start_verse") or 0) != start_verse
+        or int(parsed.get("end_verse") or 0) != end_verse
+    ):
+        return None
+    payload["source"] = "operator_completed_reference"
+    payload["incomplete_reference"] = hint
+    return add_slide_payload(payload)
+
+
+def popup_missing_chapter(hint: dict, bible_path: Path = DEFAULT_BIBLE) -> dict | None:
+    """Ask for one missing chapter without inventing a complete reference."""
+    try:
+        import tkinter as tk
+        from tkinter import font as tkfont
+    except Exception as exc:
+        raise RuntimeError(f"popup_unavailable:{exc}") from exc
+
+    root = popup_tk_window(tk, "LiVerse")
+    root.attributes("-topmost", True)
+    root.configure(bg="#101820")
+    root.resizable(False, False)
+    center_tk_window(root, 720, 390)
+
+    book = str(hint.get("book") or "неизвестная книга")
+    verse = int(hint.get("start_verse") or 0)
+    result: dict[str, object] = {"payload": None}
+    closed = tk.BooleanVar(master=root, value=False)
+    chapter_var = tk.StringVar(master=root, value="")
+    error_var = tk.StringVar(master=root, value="")
+
+    title_font = tkfont.Font(family="Segoe UI", size=28, weight="bold")
+    body_font = tkfont.Font(family="Segoe UI", size=18, weight="bold")
+    entry_font = tkfont.Font(family="Segoe UI", size=26, weight="bold")
+
+    tk.Label(
+        root,
+        text=f"Возможно: {book}, стих {verse}",
+        bg="#101820",
+        fg="#ffd166",
+        font=title_font,
+        wraplength=650,
+    ).pack(fill="x", padx=30, pady=(28, 12))
+    tk.Label(
+        root,
+        text="Номер главы не распознан. Введите номер главы:",
+        bg="#101820",
+        fg="#f5f7fa",
+        font=body_font,
+        wraplength=650,
+    ).pack(fill="x", padx=30, pady=(0, 12))
+    entry = tk.Entry(root, textvariable=chapter_var, justify="center", font=entry_font)
+    entry.pack(fill="x", padx=120, pady=(0, 8))
+    tk.Label(
+        root,
+        textvariable=error_var,
+        bg="#101820",
+        fg="#ff7b7b",
+        font=body_font,
+    ).pack(fill="x", padx=30)
+
+    def close(payload: dict | None = None) -> None:
+        result["payload"] = payload
+        root.unbind_all("<Return>")
+        root.unbind_all("<Escape>")
+        root.withdraw()
+        closed.set(True)
+
+    def submit() -> None:
+        value = chapter_var.get().strip()
+        if not value.isdigit():
+            error_var.set("Введите номер главы цифрами")
+            return
+        payload = complete_incomplete_reference(hint, int(value), bible_path=bible_path)
+        if payload is None:
+            error_var.set("В этой книге нет такой главы или стиха")
+            return
+        close(payload)
+
+    tk.Button(
+        root,
+        text="Enter — показать",
+        command=submit,
+        bg="#148447",
+        fg="white",
+        activebackground="#1aa158",
+        activeforeground="white",
+        font=body_font,
+        relief="flat",
+        pady=10,
+    ).pack(fill="x", padx=60, pady=(10, 7))
+    tk.Button(
+        root,
+        text="Esc — отменить",
+        command=close,
+        bg="#4d5964",
+        fg="white",
+        activebackground="#63717e",
+        activeforeground="white",
+        font=body_font,
+        relief="flat",
+        pady=8,
+    ).pack(fill="x", padx=60)
+    root.bind_all("<Return>", lambda _event: (submit(), "break")[1])
+    root.bind_all("<Escape>", lambda _event: (close(), "break")[1])
+    root.protocol("WM_DELETE_WINDOW", close)
+
+    def claim_focus() -> None:
+        if not root.winfo_exists() or bool(closed.get()):
+            return
+        root.lift()
+        root.focus_force()
+        entry.focus_set()
+        entry.focus_force()
+
+    root.after_idle(claim_focus)
+    root.after(100, claim_focus)
+    root.wait_variable(closed)
+    return result["payload"] if isinstance(result["payload"], dict) else None
 
 
 def notify_operator_message(args: argparse.Namespace, payload: dict) -> None:
@@ -2595,6 +2745,8 @@ def run_microphone(args: argparse.Namespace) -> int:
     audio_stats = {"chunks": 0, "peak": 0, "current_peak": 0}
     empty_final_count = 0
     trigger_case_count = 0
+    pending_incomplete_reference = None
+    pending_incomplete_fragments = 0
 
     def sample_rate_candidates() -> list[int]:
         values = [args.samplerate, 16000, 48000, 44100]
@@ -2847,6 +2999,16 @@ def run_microphone(args: argparse.Namespace) -> int:
                                     "parsed": None,
                                     "source": "text_only",
                                 }
+                            incomplete_reference = pipeline_payload.get("incomplete_reference")
+                            if incomplete_reference:
+                                pending_incomplete_reference = incomplete_reference
+                                pending_incomplete_fragments = 0
+                                logger.write(
+                                    "INCOMPLETE_REFERENCE",
+                                    {"reference": incomplete_reference},
+                                )
+                            elif pending_incomplete_reference is not None:
+                                pending_incomplete_fragments += 1
                             text_detection_for_high_risk_address = False
                             if text_detector is not None and pipeline_payload.get("matched"):
                                 explicit_ref = str(
@@ -2986,7 +3148,61 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 )
                                 and plan_match is None
                             ):
-                                text_decision = text_detector.process_fragment(text, recognition_time)
+                                text_decision = text_detector.process_fragment(
+                                    text,
+                                    recognition_time,
+                                    incomplete_address_correction=(
+                                        pending_incomplete_reference is not None
+                                    ),
+                                )
+                                if pending_incomplete_reference is not None:
+                                    if text_decision.reason == "text_corrected_incomplete_address":
+                                        logger.write(
+                                            "INCOMPLETE_REFERENCE_TEXT_CORRECTED",
+                                            {
+                                                "incomplete_reference": pending_incomplete_reference,
+                                                "reference": text_decision.reference,
+                                                "score": round(text_decision.score, 3),
+                                                "margin": round(text_decision.margin, 3),
+                                                "matched_words": text_decision.matched_words,
+                                            },
+                                        )
+                                    if text_decision.accepted:
+                                        pending_incomplete_reference = None
+                                        pending_incomplete_fragments = 0
+                            if (
+                                long_passage_reading
+                                and text_detector is not None
+                                and text_decision is not None
+                            ):
+                                sequence_state = getattr(
+                                    args,
+                                    "_holyrics_scripture_range_reading",
+                                    None,
+                                )
+                                sequence_decision = text_detector.evaluate_known_sequence(
+                                    sequence_state,
+                                    recognition_time,
+                                )
+                                shadow_decision = decide_sequence_advance_from_text(
+                                    sequence_state,
+                                    text_decision,
+                                    sequence_decision,
+                                )
+                                logger.write(
+                                    "SMART_SLIDE_SHADOW",
+                                    {
+                                        **shadow_decision,
+                                        "window": (
+                                            sequence_decision.window_text
+                                            if shadow_decision.get("evidence_source")
+                                            == "sequence_scoped"
+                                            else str(
+                                                getattr(text_decision, "window_text", "") or ""
+                                            )
+                                        ),
+                                    },
+                                )
                             range_reading_action = None
                             if (
                                 long_passage_reading
@@ -3027,7 +3243,33 @@ def run_microphone(args: argparse.Namespace) -> int:
                                         "не удалось закрыть длинный отрывок; LiVerse повторит попытку: "
                                         f"{range_reading_action.get('reason')}"
                                     )
-                            if long_passage_reading:
+                            operator_completed_payload = None
+                            if (
+                                pending_incomplete_reference is not None
+                                and pending_incomplete_fragments >= 2
+                                and not long_passage_reading
+                                and not (text_decision is not None and text_decision.accepted)
+                            ):
+                                operator_completed_payload = popup_missing_chapter(
+                                    pending_incomplete_reference,
+                                    bible_path=args.bible,
+                                )
+                                logger.write(
+                                    "INCOMPLETE_REFERENCE_OPERATOR_RESULT",
+                                    {
+                                        "incomplete_reference": pending_incomplete_reference,
+                                        "completed_ref": (
+                                            (operator_completed_payload or {}).get("parsed") or {}
+                                        ).get("ref"),
+                                    },
+                                )
+                                pending_incomplete_reference = None
+                                pending_incomplete_fragments = 0
+                                if text_detector is not None:
+                                    text_detector.clear()
+                            if operator_completed_payload is not None:
+                                payload = operator_completed_payload
+                            elif long_passage_reading:
                                 payload = add_slide_payload(pipeline_payload)
                             elif text_decision is not None and text_decision.accepted:
                                 payload = text_citation_payload(text_decision, text)
@@ -3036,7 +3278,10 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 payload = add_slide_payload(pipeline_payload)
                             payload["asr"] = result
                             apply_ml_risk(output_args, payload, asr_result=result)
-                            payload["output"] = publish_payload(output_args, payload)
+                            if operator_completed_payload is not None:
+                                payload["output"] = publish_after_approval(output_args, payload)
+                            else:
+                                payload["output"] = publish_payload(output_args, payload)
                             if payload.get("slide"):
                                 action = approval_action(payload["output"])
                                 feedback = operator_feedback(payload["output"])

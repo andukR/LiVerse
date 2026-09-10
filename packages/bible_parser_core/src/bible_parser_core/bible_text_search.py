@@ -141,11 +141,7 @@ class BibleTextSearcher:
         if not unique:
             return [], {}
         placeholders = ",".join("?" for _ in unique)
-        rows = self._connection.execute(
-            f"SELECT lemma, COUNT(*) FROM lemma_index WHERE lemma IN ({placeholders}) GROUP BY lemma",
-            unique,
-        ).fetchall()
-        frequencies = {str(row[0]): int(row[1]) for row in rows}
+        frequencies = self._lemma_frequencies(unique)
         weights = {
             lemma: math.log((self._total_documents + 1) / (frequencies.get(lemma, 0) + 1)) + 1.0
             for lemma in unique
@@ -165,6 +161,52 @@ class BibleTextSearcher:
             reverse=True,
         )[:limit]
         return ids, frequencies
+
+    def _lemma_frequencies(self, lemmas: list[str]) -> dict[str, int]:
+        unique = list(dict.fromkeys(lemmas))
+        if not unique:
+            return {}
+        placeholders = ",".join("?" for _ in unique)
+        rows = self._connection.execute(
+            f"SELECT lemma, COUNT(*) FROM lemma_index WHERE lemma IN ({placeholders}) GROUP BY lemma",
+            unique,
+        ).fetchall()
+        return {str(row[0]): int(row[1]) for row in rows}
+
+    def search_within_ranges(
+        self,
+        text: str,
+        ranges: Sequence[tuple[int, int, int, int, int]],
+        *,
+        limit: int = 5,
+        min_score: float = 0.0,
+    ) -> tuple[list[str], list[BibleTextSearchResult]]:
+        """Rank only verses inside known book/chapter/verse bounds."""
+        tokens = normalize_bible_text(text)
+        lemmas = [self._lemma(token) for token in tokens]
+        if not lemmas or not ranges:
+            return lemmas, []
+        clauses: list[str] = []
+        parameters: list[int] = []
+        for book_id, start_chapter, start_verse, end_chapter, end_verse in ranges:
+            clauses.append(
+                "(book_id=? AND (chapter>? OR (chapter=? AND verse>=?)) "
+                "AND (chapter<? OR (chapter=? AND verse<=?)))"
+            )
+            parameters.extend([
+                int(book_id), int(start_chapter), int(start_chapter), int(start_verse),
+                int(end_chapter), int(end_chapter), int(end_verse),
+            ])
+        rows = self._connection.execute(
+            "SELECT id, reference, text, lemma_text, book_id, chapter, verse "
+            f"FROM verses WHERE {' OR '.join(clauses)}",
+            parameters,
+        ).fetchall()
+        frequencies = self._lemma_frequencies(lemmas)
+        results = [self._score_candidate(lemmas, row, frequencies) for row in rows]
+        results = [item for item in results if item.score >= min_score]
+        results.sort(key=lambda item: item.score, reverse=True)
+        return lemmas, results[:limit]
 
     def search(
         self,
