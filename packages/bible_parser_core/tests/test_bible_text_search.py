@@ -83,6 +83,7 @@ class BibleTextSearcherTest(unittest.TestCase):
 
                 with BibleTextSearcher(db_path) as searcher:
                     lemmas, results = searcher.search("ибо так возлюбил бог мир")
+                    _partial_lemmas, partial_results = searcher.search("ибо так возлюбил")
                     _range_lemmas, range_results = searcher.search(
                         "сказать важный мысль продолжение этот мысль"
                     )
@@ -100,6 +101,8 @@ class BibleTextSearcherTest(unittest.TestCase):
             self.assertEqual("Ин. 3:16", results[0].reference)
             self.assertGreater(results[0].score, results[1].score)
             self.assertEqual(("ибо", "так", "возлюбил", "бог", "мир"), results[0].matched_lemmas)
+            self.assertEqual(3, results[0].ending_overlap_words)
+            self.assertEqual(0, partial_results[0].ending_overlap_words)
             self.assertEqual((43, 3, 16, 16), (
                 results[0].book_id,
                 results[0].chapter,

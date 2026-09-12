@@ -5,6 +5,8 @@ main { width: min(100%, 720px); margin: 0 auto; padding: 18px; }
 header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
 header img { width: 72px; height: 72px; padding: 5px; background: white; border-radius: 8px; }
 .header-actions { display: flex; align-items: center; gap: 10px; }
+.audio-prompt-button { min-height: 44px; padding: 8px 12px; background: #675019; font-size: 15px; }
+.audio-prompt-button.enabled { background: #148447; }
 .screen-mode-button { min-height: 44px; padding: 8px 12px; background: #315e9b; font-size: 15px; }
 .screen-mode-status { max-width: 420px; margin-top: 3px; color: #91a0af; font-size: 12px; }
 .mode-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
@@ -15,6 +17,7 @@ body.song-mode .song-control { display: block; }
 body.song-mode #pipeline,
 body.song-mode #waiting,
 body.song-mode #candidate,
+body.song-mode #rangeHint,
 body.song-mode #manualCard { display: none !important; }
 .song-control h1 { margin-bottom: 8px; }
 .song-control p { color: #c8d2dc; }
@@ -45,6 +48,8 @@ button { min-height: 68px; border: 0; border-radius: 14px; font-size: 21px; font
 .reject { background: #9b3030; }
 button:disabled { opacity: .5; }
 #status { min-height: 24px; margin-top: 14px; text-align: center; color: #c8d2dc; }
+#rangeHintStatus { min-height: 24px; margin-top: 14px; text-align: center; color: #c8d2dc; }
+.range-hint { border-color: #d9a83d; }
 .manual label { display: block; margin: 12px 0 7px; color: #c5d0da; }
 .manual.attention { border-color: #d9a83d; box-shadow: 0 0 0 2px #d9a83d55, 0 14px 40px #0005; }
 .manual input { width: 100%; min-height: 58px; border: 1px solid #4a5c6e; border-radius: 12px; padding: 0 15px; background: #0e151d; color: white; font-size: 20px; }
@@ -107,6 +112,7 @@ button:disabled { opacity: .5; }
   header { flex: 0 0 auto; margin-bottom: 8px; }
   header img { display: none; }
   .header-actions { margin-left: 8px; }
+  .audio-prompt-button { min-height: 34px; padding: 5px 9px; font-size: 12px; }
   .screen-mode-button { min-height: 34px; padding: 5px 9px; font-size: 12px; }
   .screen-mode-status { max-width: 230px; font-size: 10px; }
   .mode-tabs { flex: 0 0 auto; gap: 5px; margin-bottom: 6px; }

@@ -57,9 +57,11 @@ from bible_parser_core.live_pipeline import (
     resolve_reference_payload as core_resolve_reference_payload,
     sermon_plan_grammar_phrases,
 )
-from bible_parser_core.parser import DEFAULT_BIBLE
+from bible_parser_core.parser import DEFAULT_BIBLE, normalize_text, parse_live_reference
 from bible_parser_core.risk_model import load_risk_model, score_payload_with_model
-from bible_parser_core.sequence_advancer import decide_sequence_advance_from_text
+from bible_parser_core.sequence_advancer import (
+    decide_sequence_progress_from_text,
+)
 from bible_parser_core.sherpa_streaming import (
     DEFAULT_SHERPA_THREADS,
     SherpaStreamingRecognizer,
@@ -88,6 +90,7 @@ from tools.holyrics import (
     get_holyrics_current_presentation,
     get_holyrics_theme_options,
     handle_scripture_range_reading_match,
+    apply_scripture_range_operator_hint,
     liverse_config_dir,
     show_holyrics_text_slide,
     scripture_range,
@@ -261,6 +264,7 @@ def save_startup_settings(args: argparse.Namespace) -> None:
         "holyrics_theme": str(getattr(args, "holyrics_theme", "") or ""),
         "holyrics_quick_minutes": float(getattr(args, "holyrics_quick_minutes", 0.0) or 0.0),
         "long_range_slide_mode": str(getattr(args, "long_range_slide_mode", "compact") or "compact"),
+        "long_range_operator_hints": bool(getattr(args, "long_range_operator_hints", False)),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1433,6 +1437,8 @@ def apply_saved_startup_settings(args: argparse.Namespace, settings: dict) -> No
         slide_mode = str(settings.get("long_range_slide_mode") or "").strip()
         if slide_mode in {"compact", "one_verse"}:
             args.long_range_slide_mode = slide_mode
+    if not setting_was_explicit("--long-range-operator-hints"):
+        args.long_range_operator_hints = bool(settings.get("long_range_operator_hints", False))
 
 
 def configure_interactive_approval_mode(args: argparse.Namespace) -> None:
@@ -1559,6 +1565,38 @@ def add_slide_payload(payload: dict) -> dict:
     return payload
 
 
+def accumulate_reading_list(payload: dict, accumulated: list[dict]) -> dict:
+    """Extend one visible reading-list slide across adjacent ASR finals.
+
+    A spoken list is commonly split into several final recognition results.
+    Ordinary speech or a normal Bible address closes the accumulated list.
+    """
+    reference_list = payload.get("reference_list")
+    if not isinstance(reference_list, list) or not reference_list:
+        accumulated.clear()
+        return payload
+
+    known = {
+        str(item.get("ref") or "").strip()
+        for item in accumulated
+        if isinstance(item, dict) and str(item.get("ref") or "").strip()
+    }
+    for item in reference_list:
+        if not isinstance(item, dict):
+            continue
+        ref = str(item.get("ref") or "").strip()
+        if ref and ref not in known:
+            accumulated.append(dict(item))
+            known.add(ref)
+    payload["reference_list"] = [dict(item) for item in accumulated]
+    slide = payload.get("slide") if isinstance(payload.get("slide"), dict) else None
+    if slide and str(slide.get("slide_type") or "") == "reference_list":
+        refs = [str(item.get("ref") or "").strip() for item in payload["reference_list"]]
+        slide["verse"] = "\n".join(ref for ref in refs if ref)
+        slide["references"] = payload["reference_list"]
+    return payload
+
+
 def text_citation_payload(decision: TextCitationDecision, recognized_text: str) -> dict:
     """Build the ordinary LiVerse slide payload without reparsing DB abbreviations."""
     candidate = decision.top_candidate
@@ -1567,9 +1605,27 @@ def text_citation_payload(decision: TextCitationDecision, recognized_text: str) 
     book = CANONICAL_BOOK_NAMES_BY_ID.get(candidate.book_id)
     if not book or candidate.chapter <= 0 or candidate.start_verse <= 0:
         return {"text": recognized_text, "source": "text_citation", "parsed": None, "slide": None}
-    end_verse = candidate.end_verse or candidate.start_verse
-    verse_part = str(candidate.start_verse)
-    if end_verse > candidate.start_verse:
+    start_verse = candidate.start_verse
+    end_verse = candidate.end_verse or start_verse
+    announced_range = re.match(r"(\d+)\s+(\d+)\s+стих\b", normalize_text(recognized_text))
+    if announced_range:
+        announced_start, announced_end = (int(value) for value in announced_range.groups())
+        if announced_start == start_verse and announced_end > announced_start:
+            expanded = parse_live_reference(
+                f"{book} {candidate.chapter} глава {announced_start} по {announced_end} стих"
+            )
+            if expanded is not None:
+                start_verse = expanded.start_verse
+                end_verse = expanded.end_verse
+                verse_text = expanded.verse_text
+            else:
+                verse_text = candidate.text
+        else:
+            verse_text = candidate.text
+    else:
+        verse_text = candidate.text
+    verse_part = str(start_verse)
+    if end_verse > start_verse:
         verse_part += f"-{end_verse}"
     reference = f"{book} {candidate.chapter}:{verse_part}"
     payload = {
@@ -1579,11 +1635,11 @@ def text_citation_payload(decision: TextCitationDecision, recognized_text: str) 
         "parsed": {
             "book": book,
             "chapter": candidate.chapter,
-            "start_verse": candidate.start_verse,
+            "start_verse": start_verse,
             "end_verse": end_verse,
             "end_chapter": candidate.chapter,
             "ref": reference,
-            "verse_text": candidate.text,
+            "verse_text": verse_text,
         },
         "text_citation": {
             "index_reference": candidate.reference,
@@ -1595,7 +1651,35 @@ def text_citation_payload(decision: TextCitationDecision, recognized_text: str) 
             "reason": decision.reason,
         },
     }
+    if end_verse > candidate.start_verse:
+        payload["text_citation"]["announced_range_expanded"] = True
     return add_slide_payload(payload)
+
+
+def text_operator_hint_payload(
+    decision: TextCitationDecision,
+    recognized_text: str,
+) -> dict | None:
+    """Return only a sufficiently useful weak text match for the web operator."""
+    if decision.accepted or decision.top_candidate is None:
+        return None
+    if decision.reason != "score_below_threshold":
+        return None
+    if not (
+        decision.score >= 60.0
+        and decision.margin >= 12.0
+        and decision.matched_words >= 4
+    ):
+        return None
+    payload = text_citation_payload(decision, recognized_text)
+    slide = payload.get("slide")
+    if not isinstance(slide, dict):
+        return None
+    slide["source"] = "text_operator_hint"
+    slide["label"] = "weak_text_match"
+    slide["score"] = round(decision.score, 3)
+    slide["asr"] = recognized_text
+    return payload
 
 
 def text_citation_output_args(args: argparse.Namespace) -> argparse.Namespace:
@@ -1644,6 +1728,59 @@ def text_decision_ready_for_scripture_range(
         and decision.top_candidate is not None
         and (decision.accepted or decision.reason == "pending_confirmation")
     )
+
+
+def long_range_operator_hint_payload(
+    state: dict | None,
+    decision: dict | None,
+    asr_text: str,
+) -> dict | None:
+    """Turn bounded UPS evidence into an operator proposal, never an action."""
+    if not isinstance(state, dict) or not isinstance(decision, dict):
+        return None
+    targets = list(state.get("targets") or [])
+    try:
+        current_index = int(state.get("current_index") or 0)
+        candidate_index = decision.get("target_index", decision.get("candidate_index"))
+        evidence_index = int(candidate_index)
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= current_index < evidence_index < len(targets)):
+        return None
+    # A weak distant match is not worth interrupting the operator.  Nearby
+    # evidence is still useful as a question, even when it is not sufficient
+    # for automatic paging.
+    action = str(decision.get("action") or "")
+    nearby_evidence = (
+        evidence_index == current_index + 1
+        and float(decision.get("score") or 0.0) >= 35.0
+        and int(decision.get("matched_words") or 0) >= 2
+    )
+    if action not in {
+        "advance", "assisted_advance", "synchronize_forward", "assisted_synchronize_forward",
+    } and not nearby_evidence:
+        return None
+    # A later verse is evidence that reading moved on, not permission to hide
+    # intervening slides.  The operator always gets the immediate next slide.
+    target_index = current_index + 1
+    current = targets[current_index]
+    target = targets[target_index]
+    book = str(state.get("book") or "").strip()
+
+    def reference(item: dict) -> str:
+        chapter = item.get("chapter")
+        verse = item.get("verse")
+        return f"{book} {chapter}:{verse}".strip()
+
+    return {
+        "passage": str(state.get("ref") or "").strip(),
+        "current_index": current_index,
+        "current_ref": reference(current),
+        "target_index": target_index,
+        "target_ref": reference(target),
+        "reason": str(decision.get("reason") or ""),
+        "asr": asr_text,
+    }
 
 
 def address_recognition_allowed(address_detection_enabled: bool, long_passage_reading: bool) -> bool:
@@ -2369,7 +2506,11 @@ def start_slide_server_if_needed(args: argparse.Namespace, pipeline: LiveReferen
     web_approval = (
         args.require_approval or args.semi_auto_approval or text_confirmation
     ) and args.approval_ui == "web"
-    needs_server = args.start_slide_server or web_approval or args.slide_output in {"web", "both"}
+    operator_hints = bool(getattr(args, "long_range_operator_hints", False))
+    text_operator_hints = bool(
+        getattr(args, "text_operator_hints", False) and args.approval_ui == "web"
+    )
+    needs_server = args.start_slide_server or web_approval or operator_hints or text_operator_hints or args.slide_output in {"web", "both"}
     if not needs_server:
         return None
 
@@ -2416,11 +2557,15 @@ def start_slide_server_if_needed(args: argparse.Namespace, pipeline: LiveReferen
     def presentation_action_callback(action: str) -> tuple[bool, str]:
         return control_holyrics_presentation(args, action)
 
+    def range_hint_callback(action: str, hint: dict) -> tuple[bool, str]:
+        return apply_scripture_range_operator_hint(args, action, hint)
+
     return start_server_thread(
         args.slide_host,
         args.slide_port,
-        decision_callback=decision_callback if web_approval else None,
+        decision_callback=decision_callback if web_approval or text_operator_hints else None,
         presentation_action_callback=presentation_action_callback,
+        range_hint_callback=range_hint_callback if operator_hints else None,
         open_qr=bool(args.open_operator_qr),
         open_browser=False,
         print_qr=args.print_operator_qr,
@@ -2747,6 +2892,7 @@ def run_microphone(args: argparse.Namespace) -> int:
     trigger_case_count = 0
     pending_incomplete_reference = None
     pending_incomplete_fragments = 0
+    reading_list: list[dict] = []
 
     def sample_rate_candidates() -> list[int]:
         values = [args.samplerate, 16000, 48000, 44100]
@@ -3180,14 +3326,13 @@ def run_microphone(args: argparse.Namespace) -> int:
                                     "_holyrics_scripture_range_reading",
                                     None,
                                 )
-                                sequence_decision = text_detector.evaluate_known_sequence(
-                                    sequence_state,
-                                    recognition_time,
-                                )
-                                shadow_decision = decide_sequence_advance_from_text(
+                                shadow_decision, sequence_decision = decide_sequence_progress_from_text(
                                     sequence_state,
                                     text_decision,
-                                    sequence_decision,
+                                    lambda state: text_detector.evaluate_known_sequence(
+                                        state,
+                                        recognition_time,
+                                    ),
                                 )
                                 logger.write(
                                     "SMART_SLIDE_SHADOW",
@@ -3203,9 +3348,64 @@ def run_microphone(args: argparse.Namespace) -> int:
                                         ),
                                     },
                                 )
+                            if (
+                                not long_passage_reading
+                                and getattr(args, "text_operator_hints", False)
+                                and args.approval_ui == "web"
+                                and text_decision is not None
+                            ):
+                                text_hint_payload = text_operator_hint_payload(text_decision, text)
+                                if text_hint_payload is not None:
+                                    hint_slide = text_hint_payload["slide"]
+                                    hint_ref = str(hint_slide.get("ref") or "")
+                                    hint_times = getattr(args, "_text_operator_hint_times", {})
+                                    previous_hint = float(hint_times.get(hint_ref, -999.0))
+                                    if recognition_time - previous_hint >= 30.0:
+                                        from tools.slide_server import submit_candidate
+
+                                        submit_candidate(hint_slide)
+                                        hint_times[hint_ref] = recognition_time
+                                        setattr(args, "_text_operator_hint_times", hint_times)
+                                        logger.write(
+                                            "TEXT_OPERATOR_HINT",
+                                            {
+                                                "reference": hint_ref,
+                                                "score": round(text_decision.score, 3),
+                                                "margin": round(text_decision.margin, 3),
+                                                "matched_words": text_decision.matched_words,
+                                                "window": text_decision.window_text,
+                                            },
+                                        )
+                                        console.status(
+                                            f"слабое совпадение {hint_ref}: ждём оператора"
+                                        )
+                            operator_hint = None
+                            if long_passage_reading and getattr(args, "long_range_operator_hints", False):
+                                operator_hint = long_range_operator_hint_payload(
+                                    sequence_state,
+                                    shadow_decision,
+                                    str(getattr(text_decision, "window_text", "") or ""),
+                                )
+                                if operator_hint is not None:
+                                    signature = (
+                                        operator_hint["current_index"],
+                                        operator_hint["target_index"],
+                                        operator_hint["reason"],
+                                    )
+                                    if signature != getattr(args, "_long_range_operator_hint_signature", None):
+                                        from tools.slide_server import submit_range_hint
+
+                                        submit_range_hint(operator_hint)
+                                        setattr(args, "_long_range_operator_hint_signature", signature)
+                                        logger.write("SMART_SLIDE_OPERATOR_HINT", operator_hint)
+                                        console.status(
+                                            "длинный отрывок: оператору предложен "
+                                            f"слайд {operator_hint['target_index'] + 1}"
+                                        )
                             range_reading_action = None
                             if (
                                 long_passage_reading
+                                and not getattr(args, "long_range_operator_hints", False)
                                 and text_decision_ready_for_scripture_range(text_decision)
                             ):
                                 range_reading_action = handle_scripture_range_reading_match(
@@ -3276,6 +3476,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 output_args = text_citation_output_args(args)
                             else:
                                 payload = add_slide_payload(pipeline_payload)
+                            accumulate_reading_list(payload, reading_list)
                             payload["asr"] = result
                             apply_ml_risk(output_args, payload, asr_result=result)
                             if operator_completed_payload is not None:
@@ -3624,6 +3825,22 @@ def main() -> int:
         choices=("compact", "one_verse"),
         default="compact",
         help="Split long Bible ranges compactly or show one verse per slide.",
+    )
+    parser.add_argument(
+        "--long-range-operator-hints",
+        action="store_true",
+        help=(
+            "For an active long Bible range, show bounded slide proposals on the web operator "
+            "panel; only the operator can move the slide."
+        ),
+    )
+    parser.add_argument(
+        "--text-operator-hints",
+        action="store_true",
+        help=(
+            "For useful but not yet safe text matches, ask through the web operator panel; "
+            "the match is never shown automatically."
+        ),
     )
     parser.set_defaults(session_summary_popup=True, log_audio=True)
     args = parser.parse_args()

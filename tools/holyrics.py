@@ -1630,6 +1630,7 @@ def scripture_range_reading_state(payload: dict, slides: list[dict]) -> dict | N
         "book": book,
         "book_id": book_id,
         "current_index": 0,
+        "current_slide_visible": False,
         "targets": targets,
     }
 
@@ -1829,6 +1830,55 @@ def handle_scripture_range_reading_match(args: Any, candidate: Any) -> dict:
         "next_index": next_index,
         "target": target,
     }
+
+
+def apply_scripture_range_operator_hint(
+    args: Any,
+    action: str,
+    hint: dict,
+) -> tuple[bool, str]:
+    """Let the operator, rather than ASR, move an active long-range slide.
+
+    A hint is tied to the slide which was current when it was shown.  We first
+    synchronize with Holyrics, so a physical/manual slide change makes an old
+    phone hint harmless instead of moving the presentation unexpectedly.
+    """
+    if action not in {"apply", "keep"}:
+        return False, "unknown_range_hint_action"
+    state = getattr(args, "_holyrics_scripture_range_reading", None)
+    if not isinstance(state, dict):
+        return False, "long_passage_inactive"
+    try:
+        hint_current = int(hint.get("current_index"))
+        target_index = int(hint.get("target_index"))
+        current_index = int(state.get("current_index") or 0)
+    except (TypeError, ValueError):
+        return False, "invalid_range_hint"
+    targets = list(state.get("targets") or [])
+    if current_index != hint_current:
+        return False, "range_hint_stale"
+    if action == "keep":
+        return True, "operator_kept_current_slide"
+    if not current_index < target_index < len(targets):
+        return False, "invalid_range_hint_target"
+
+    sync = sync_scripture_range_reading(args)
+    state = getattr(args, "_holyrics_scripture_range_reading", None)
+    if not isinstance(state, dict) or not sync.get("active", True):
+        return False, "long_passage_inactive"
+    if int(state.get("current_index") or 0) != hint_current:
+        return False, "range_hint_stale"
+    base_url = str(getattr(args, "holyrics_url", "")).rstrip("/")
+    ok, reason, _body = post_holyrics_api(
+        args,
+        base_url,
+        "ActionGoToIndex",
+        {"index": target_index},
+    )
+    if not ok:
+        return False, reason or "long_passage_operator_move_failed"
+    state["current_index"] = target_index
+    return True, "operator_moved_long_passage"
 
 
 def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, str]:

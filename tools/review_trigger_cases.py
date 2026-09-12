@@ -5,17 +5,26 @@ from __future__ import annotations
 
 import argparse
 import json
+import mimetypes
 import re
 import shutil
 import subprocess
+import threading
+import webbrowser
 from dataclasses import dataclass
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
+
+from bible_parser_core.parser import parse_live_reference
+from tools.holyrics import scripture_range
 
 
 DEFAULT_RUNS_DIR = Path(".cache") / "liverse" / "vosk_probe"
 LATEST_REPLAY_BATCH = "latest_replay_batch.json"
+SLIDE_DISPLAY_DIR = Path(__file__).resolve().parent.parent / "slide_display"
 CATEGORIES = {
     "1": ("true_reference", "верная ссылка"),
     "2": ("vosk_distortion", "Vosk исказил произнесённую ссылку"),
@@ -43,12 +52,17 @@ SMART_SLIDE_CATEGORIES = {
 SMART_SLIDE_ACTION_LABELS = {
     "ignore": "не менять слайд",
     "keep": "оставить текущий слайд",
+    "activate": "показать первый стих диапазона",
     "advance": "перейти на следующий слайд",
     "assisted_advance": "перейти на следующий слайд по последовательному чтению",
     "synchronize_forward": "перейти к найденному более позднему слайду",
     "assisted_synchronize_forward": "перейти к ближайшему ожидаемому слайду",
     "complete": "завершить диапазон",
 }
+SMART_SLIDE_TRANSITION_ACTIONS = {
+    "advance", "assisted_advance", "synchronize_forward", "assisted_synchronize_forward",
+}
+SMART_SLIDE_DISPLAY_ACTIONS = SMART_SLIDE_TRANSITION_ACTIONS | {"activate"}
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -399,9 +413,11 @@ def smart_slide_audio_path(entry: SmartSlideEntry) -> Path:
     if local_audio:
         candidate = Path(local_audio)
         candidate = candidate if candidate.is_absolute() else entry.events_path.parent / candidate
-        if candidate.exists():
+        if candidate.is_file():
             return candidate
     source_audio = str(session.get("source_audio") or "").strip()
+    if not source_audio:
+        return entry.events_path.with_name("audio.wav")
     candidate = Path(source_audio)
     return candidate if candidate.is_absolute() else Path.cwd() / candidate
 
@@ -504,6 +520,51 @@ def save_smart_slide_review(entry: SmartSlideEntry) -> None:
     save_jsonl(entry.reviews_path, rows)
 
 
+def update_smart_slide_review(entry: SmartSlideEntry, category: str, note: str = "") -> None:
+    """Persist the same review record used by the terminal annotator."""
+    entry.review.update({
+        "event_id": entry.event_id,
+        "status": "reviewed",
+        "review_category": category,
+        "reviewed_at": datetime.now().isoformat(timespec="seconds"),
+        "passage": str(entry.event.get("passage") or ""),
+        "replay_seconds": float_value(entry.event.get("replay_seconds")),
+        "action": str(entry.event.get("action") or ""),
+        "current_index": entry.event.get("current_index"),
+        "target_index": entry.event.get("target_index"),
+        "note": note,
+    })
+    save_smart_slide_review(entry)
+
+
+def smart_slide_browser_payload(entry: SmartSlideEntry, position: int, total: int) -> dict[str, Any]:
+    event = entry.event
+    current = event.get("current_element") if isinstance(event.get("current_element"), dict) else {}
+    target = event.get("target_element") if isinstance(event.get("target_element"), dict) else {}
+    audio_path = smart_slide_audio_path(entry)
+    return {
+        "position": position + 1,
+        "total": total,
+        "event_id": entry.event_id,
+        "passage": str(event.get("passage") or ""),
+        "replay_seconds": float_value(event.get("replay_seconds")),
+        "action": str(event.get("action") or ""),
+        "action_label": SMART_SLIDE_ACTION_LABELS.get(str(event.get("action") or ""), ""),
+        "reason": str(event.get("reason") or ""),
+        "score": event.get("score"),
+        "margin": event.get("margin"),
+        "matched_words": event.get("matched_words"),
+        "window": str(event.get("window") or ""),
+        "current": dict(current),
+        "target": dict(target),
+        "will_transition": str(event.get("action") or "") in SMART_SLIDE_TRANSITION_ACTIONS,
+        "will_display": str(event.get("action") or "") in SMART_SLIDE_DISPLAY_ACTIONS,
+        "audio_available": audio_path.exists(),
+        "review_category": str(entry.review.get("review_category") or ""),
+        "note": str(entry.review.get("note") or ""),
+    }
+
+
 def next_unreviewed_smart_slide(entries: list[SmartSlideEntry], start: int) -> int:
     for index in range(start, len(entries)):
         if smart_slide_is_unreviewed(entries[index]):
@@ -514,12 +575,559 @@ def next_unreviewed_smart_slide(entries: list[SmartSlideEntry], start: int) -> i
     return len(entries)
 
 
+def normal_slide_updates(events_path: Path) -> list[dict[str, Any]]:
+    """Recreate ordinary LiVerse slide changes omitted by SMART_SLIDE_SHADOW."""
+    updates: list[dict[str, Any]] = []
+    replay_seconds = 0.0
+    accumulated_list_refs: list[str] = []
+    for line_number, event in enumerate(load_jsonl(events_path), start=1):
+        if event.get("replay_seconds") is not None:
+            replay_seconds = float_value(event.get("replay_seconds"))
+        if event.get("event") != "parsed":
+            continue
+        output = event.get("output") if isinstance(event.get("output"), dict) else {}
+        replay = output.get("replay") if isinstance(output.get("replay"), dict) else {}
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        reference_list = payload.get("reference_list") if isinstance(payload.get("reference_list"), list) else []
+        if replay.get("sent") and reference_list:
+            new_refs = [
+                str(item.get("ref") or "").strip()
+                for item in reference_list
+                if isinstance(item, dict) and str(item.get("ref") or "").strip()
+            ]
+            for ref in new_refs:
+                if ref not in accumulated_list_refs:
+                    accumulated_list_refs.append(ref)
+            refs = accumulated_list_refs
+            if refs:
+                updates.append({
+                    "event_id": f"{events_path.parent.name}:display:{line_number}",
+                    "replay_seconds": replay_seconds,
+                    "ref": "Ссылки для чтения",
+                    "element": {"text": "\n".join(refs)},
+                    "kind": "reference_list",
+                    "vosk_text": str(event.get("vosk_text") or ""),
+                    "source": str(payload.get("source") or ""),
+                })
+            continue
+        accumulated_list_refs.clear()
+        reference = str(payload.get("ref") or "").strip()
+        if not replay.get("sent") or not reference:
+            continue
+        parsed = parse_live_reference(reference)
+        if parsed is None:
+            continue
+        parsed_payload = {
+            "book": parsed.book,
+            "chapter": parsed.chapter,
+            "start_verse": parsed.start_verse,
+            "end_chapter": parsed.end_chapter,
+            "end_verse": parsed.end_verse,
+        }
+        inferred_sequential_reading = (
+            str(payload.get("source") or "") == "replay_inferred_sequential_text_reading"
+        )
+        long_range = scripture_range(parsed_payload) is not None
+        if inferred_sequential_reading:
+            # This is not an announced range.  By now text matching has proved
+            # that the reader reached the final observed verse, so show that
+            # one verse immediately; the UPS will advance from it afterwards.
+            current = parse_live_reference(f"{parsed.book} {parsed.end_chapter or parsed.chapter}:{parsed.end_verse}")
+            if current is None:
+                continue
+            element = {
+                "start_chapter": current.chapter,
+                "start_verse": current.start_verse,
+                "chapter": int(current.end_chapter or current.chapter),
+                "verse": current.end_verse,
+                "text": current.verse_text,
+            }
+            kind = "sequential_reading"
+        else:
+            element = {
+                "start_chapter": parsed.chapter,
+                "start_verse": parsed.start_verse,
+                "chapter": int(parsed.end_chapter or parsed.chapter),
+                "verse": parsed.end_verse,
+                # An announced long range gets a title-only slide; its verses
+                # are subsequently controlled one at a time by the UPS.
+                "text": "" if long_range else parsed.verse_text,
+            }
+            kind = "range_announcement" if long_range else "ordinary_reference"
+        updates.append({
+            "event_id": f"{events_path.parent.name}:display:{line_number}",
+            "replay_seconds": replay_seconds,
+            "ref": parsed.ref,
+            "element": element,
+            "kind": kind,
+            "vosk_text": str(event.get("vosk_text") or ""),
+            "source": str(payload.get("source") or ""),
+        })
+    return updates
+
+
+def diagnostic_events(events_path: Path, stop_seconds: float, radius: float = 12.0) -> list[dict[str, Any]]:
+    """Return a compact, time-scoped snapshot useful for investigating a stopped replay."""
+    result: list[dict[str, Any]] = []
+    replay_seconds = 0.0
+    useful_events = {
+        "final_raw", "partial_raw", "parsed", "TEXT_CANDIDATE", "TEXT_ACCEPTED",
+        "TEXT_REJECTED", "TEXT_SUPPRESSED", "SMART_SLIDE_SHADOW",
+    }
+    for event in load_jsonl(events_path):
+        if event.get("replay_seconds") is not None:
+            replay_seconds = float_value(event.get("replay_seconds"))
+        event_name = str(event.get("event") or "")
+        if event_name not in useful_events or abs(replay_seconds - stop_seconds) > radius:
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        result.append({
+            "time": round(replay_seconds, 3),
+            "event": event_name,
+            "text": str(event.get("text") or event.get("vosk_text") or event.get("window") or ""),
+            "ref": str(event.get("reference") or payload.get("ref") or ""),
+            "action": str(event.get("action") or ""),
+            "reason": str(event.get("reason") or ""),
+        })
+    return result
+
+
+class SmartSlideBrowserReview:
+    def __init__(
+        self,
+        entries: list[SmartSlideEntry],
+        *,
+        no_resume: bool,
+        report_dir: Path | None = None,
+    ) -> None:
+        self.entries = entries
+        self.position = 0 if no_resume else next_unreviewed_smart_slide(entries, 0)
+        if self.position >= len(entries):
+            self.position = 0
+        self.lock = threading.Lock()
+        self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        self.report_dir = report_dir or entries[0].events_path.parent.parent
+        self.session_incidents: list[dict[str, Any]] = []
+        self.session_incident_paths: dict[str, Path] = {}
+
+    def state(self) -> dict[str, Any]:
+        with self.lock:
+            payload = smart_slide_browser_payload(self.entries[self.position], self.position, len(self.entries))
+            payload["remaining"] = sum(1 for item in self.entries if smart_slide_is_unreviewed(item))
+            return payload
+
+    def move(self, delta: int) -> dict[str, Any]:
+        with self.lock:
+            self.position = max(0, min(len(self.entries) - 1, self.position + delta))
+        return self.state()
+
+    def save_review(self, category: str, note: str) -> dict[str, Any]:
+        categories = {value[0] for value in SMART_SLIDE_CATEGORIES.values()}
+        if category not in categories:
+            raise ValueError("Неизвестная категория разметки УПС.")
+        with self.lock:
+            update_smart_slide_review(self.entries[self.position], category, note)
+            next_position = next_unreviewed_smart_slide(self.entries, self.position + 1)
+            if next_position < len(self.entries):
+                self.position = next_position
+        return self.state()
+
+    def audio_path(self) -> Path | None:
+        with self.lock:
+            path = smart_slide_audio_path(self.entries[self.position])
+        return path if path.exists() else None
+
+    def entry_by_id(self, event_id: str) -> SmartSlideEntry | None:
+        return next((entry for entry in self.entries if entry.event_id == event_id), None)
+
+    def audio_path_for_event(self, event_id: str) -> Path | None:
+        with self.lock:
+            entry = self.entry_by_id(event_id)
+            path = smart_slide_audio_path(entry) if entry is not None else None
+        return path if path is not None and path.is_file() else None
+
+    def timeline(self) -> dict[str, Any]:
+        with self.lock:
+            sequence_id = self.entries[self.position].sequence_id
+            sequence = [entry for entry in self.entries if entry.sequence_id == sequence_id]
+            tracks: list[dict[str, Any]] = []
+            for entry in sequence:
+                audio_path = smart_slide_audio_path(entry)
+                track_key = str(audio_path.resolve()) if audio_path.is_file() else ""
+                if not tracks or tracks[-1]["audio_key"] != track_key:
+                    tracks.append({
+                        "audio_key": track_key,
+                        "audio_available": bool(track_key),
+                        "audio_event_id": entry.event_id,
+                        "decisions": [],
+                        "events_paths": [],
+                    })
+                events_path_text = str(entry.events_path.resolve())
+                if events_path_text not in tracks[-1]["events_paths"]:
+                    tracks[-1]["events_paths"].append(events_path_text)
+                tracks[-1]["decisions"].append(
+                    smart_slide_browser_payload(entry, self.entries.index(entry), len(self.entries))
+                )
+            for track in tracks:
+                updates: list[dict[str, Any]] = []
+                for events_path_text in track.pop("events_paths"):
+                    updates.extend(normal_slide_updates(Path(events_path_text)))
+                track["display_updates"] = sorted(updates, key=lambda item: float_value(item.get("replay_seconds")))
+            return {
+                "sequence_id": sequence_id,
+                "sequence_number": sequence_id + 1,
+                "sequence_total": len({entry.sequence_id for entry in self.entries}),
+                "passage": str(sequence[0].event.get("passage") or "") if sequence else "",
+                "tracks": tracks,
+                "remaining": sum(1 for entry in self.entries if smart_slide_is_unreviewed(entry)),
+            }
+
+    def mark_error(
+        self,
+        event_id: str,
+        category: str,
+        note: str,
+        operator_stop_seconds: object = None,
+    ) -> dict[str, Any]:
+        if category not in {"wrong_transition", "missed_transition"}:
+            raise ValueError("Ошибка УПС должна быть отмечена как неверный или пропущенный переход.")
+        with self.lock:
+            entry = self.entry_by_id(event_id)
+            if entry is None:
+                raise ValueError("Решение УПС не найдено.")
+            update_smart_slide_review(entry, category, note)
+            if operator_stop_seconds is not None:
+                entry.review["operator_stop_seconds"] = float_value(operator_stop_seconds)
+                save_smart_slide_review(entry)
+        return {"ok": True, "event_id": event_id, "category": category}
+
+    def record_incident(
+        self,
+        event_id: str,
+        operator_stop_seconds: object,
+        displayed_ref: str,
+        note: str,
+    ) -> dict[str, Any]:
+        """Keep stop-time evidence separate from labels used to train transition safety."""
+        stop_seconds = float_value(operator_stop_seconds)
+        with self.lock:
+            entry = self.entry_by_id(event_id)
+            if entry is None:
+                raise ValueError("Решение УПС рядом с остановкой не найдено.")
+            incident_path = entry.events_path.with_name("smart_slide_incidents.jsonl")
+            evidence = diagnostic_events(entry.events_path, stop_seconds)
+            incident_id = f"{entry.events_path.parent.name}:incident:{stop_seconds:.3f}"
+            incident = {
+                "incident_id": incident_id,
+                "status": "unreviewed",
+                "recorded_at": datetime.now().isoformat(timespec="seconds"),
+                "log": str(entry.events_path.parent.resolve()),
+                "audio": str(smart_slide_audio_path(entry).resolve()),
+                "operator_stop_seconds": round(stop_seconds, 3),
+                "displayed_ref": displayed_ref,
+                "active_passage": str(entry.event.get("passage") or ""),
+                "nearest_smart_slide_event_id": entry.event_id,
+                "nearest_smart_slide_seconds": float_value(entry.event.get("replay_seconds")),
+                "nearest_smart_slide_action": str(entry.event.get("action") or ""),
+                "nearest_smart_slide_reason": str(entry.event.get("reason") or ""),
+                "browser_session_id": self.session_id,
+                "note": note,
+                "evidence": evidence,
+            }
+            rows = load_jsonl(incident_path)
+            rows.append(incident)
+            save_jsonl(incident_path, rows)
+            self.session_incidents.append(incident)
+            self.session_incident_paths[incident_id] = incident_path
+        minutes, seconds = divmod(stop_seconds, 60)
+        evidence_lines = [
+            f"  {item['time']:.3f}s {item['event']}: "
+            f"{item['ref'] or item['text'] or item['action'] or item['reason']}"
+            for item in evidence
+        ]
+        report = "\n".join([
+            "Ошибка браузерной эмуляции УПС",
+            f"log={incident['log']}",
+            f"audio={incident['audio']}",
+            f"timecode={int(minutes):02d}:{seconds:06.3f}",
+            f"displayed_ref={displayed_ref or 'не указан'}",
+            f"active_passage={incident['active_passage']}",
+            (
+                f"nearest_decision={incident['nearest_smart_slide_action']} "
+                f"at {incident['nearest_smart_slide_seconds']:.3f}s"
+                if stop_seconds >= incident["nearest_smart_slide_seconds"]
+                else f"first_decision_after_stop={incident['nearest_smart_slide_action']} "
+                f"at {incident['nearest_smart_slide_seconds']:.3f}s"
+            ),
+            *(evidence_lines or ["  В ближайшем окне полезных событий нет."]),
+        ])
+        return {"ok": True, "incident_id": incident_id, "report": report}
+
+    def update_incident_note(self, incident_id: str, note: str) -> None:
+        """Save an operator observation without inferring a training label."""
+        with self.lock:
+            incident_path = self.session_incident_paths.get(incident_id)
+            if incident_path is None:
+                raise ValueError("Наблюдение относится к другой браузерной сессии.")
+            rows = load_jsonl(incident_path)
+            for row in rows:
+                if str(row.get("incident_id") or "") == incident_id:
+                    row["note"] = note
+                    break
+            else:
+                raise ValueError("Наблюдение не найдено.")
+            save_jsonl(incident_path, rows)
+            for incident in self.session_incidents:
+                if incident["incident_id"] == incident_id:
+                    incident["note"] = note
+                    break
+
+    def write_error_report(self) -> Path:
+        """Write one concise, session-scoped report containing only operator stops."""
+        with self.lock:
+            incidents = list(self.session_incidents)
+        report_path = self.report_dir / "smart_slide_error_reports" / f"{self.session_id}.md"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [
+            "# Ошибки браузерной эмуляции УПС",
+            "",
+            f"Сессия: `{self.session_id}`",
+            f"Зафиксировано остановок Enter: {len(incidents)}",
+        ]
+        for number, incident in enumerate(incidents, start=1):
+            stop_seconds = float_value(incident["operator_stop_seconds"])
+            minutes, seconds = divmod(stop_seconds, 60)
+            decision_seconds = float_value(incident["nearest_smart_slide_seconds"])
+            decision_relation = (
+                f"первое решение после остановки: {incident['nearest_smart_slide_action']} в {decision_seconds:.3f} с"
+                if stop_seconds < decision_seconds
+                else f"ближайшее решение: {incident['nearest_smart_slide_action']} в {decision_seconds:.3f} с"
+            )
+            lines.extend([
+                "",
+                f"## {number}. {int(minutes):02d}:{seconds:06.3f}",
+                f"- Экран: {incident['displayed_ref'] or 'не указан'}",
+                f"- Активный диапазон: {incident['active_passage'] or 'не указан'}",
+                f"- {decision_relation}",
+                f"- Основание: {incident['nearest_smart_slide_reason'] or 'не указано'}",
+                f"- Журнал: `{incident['log']}`",
+            ])
+            if incident["note"]:
+                lines.append(f"- Примечание оператора: {incident['note']}")
+        if not incidents:
+            lines.extend(["", "Ошибок оператор не отметил."])
+        report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return report_path
+
+    def complete_sequence(self, observed_event_ids: list[str]) -> dict[str, Any]:
+        observed = {str(value) for value in observed_event_ids}
+        with self.lock:
+            current_sequence = self.entries[self.position].sequence_id
+            for entry in self.entries:
+                if entry.sequence_id != current_sequence or entry.event_id not in observed:
+                    continue
+                if not smart_slide_is_unreviewed(entry):
+                    continue
+                action = str(entry.event.get("action") or "")
+                category = "correct_transition" if action in SMART_SLIDE_DISPLAY_ACTIONS else "correct_hold"
+                update_smart_slide_review(entry, category)
+            next_position = next_unreviewed_smart_slide(self.entries, self.position + 1)
+            if next_position < len(self.entries):
+                self.position = next_position
+                finished = False
+            else:
+                finished = True
+        return {
+            "finished": finished,
+            "remaining": sum(1 for entry in self.entries if smart_slide_is_unreviewed(entry)),
+            "timeline": None if finished else self.timeline(),
+        }
+
+
+def start_smart_slide_browser_review(entries: list[SmartSlideEntry], args: argparse.Namespace) -> None:
+    controller = SmartSlideBrowserReview(entries, no_resume=args.no_resume, report_dir=Path(args.runs_dir))
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+        def send_json(self, payload: dict, status: int = 200) -> None:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def read_json(self) -> dict | None:
+            try:
+                raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                payload = json.loads(raw.decode("utf-8"))
+            except (ValueError, json.JSONDecodeError):
+                self.send_json({"ok": False, "error": "Нужен JSON-объект."}, status=400)
+                return None
+            if not isinstance(payload, dict):
+                self.send_json({"ok": False, "error": "Нужен JSON-объект."}, status=400)
+                return None
+            return payload
+
+        def serve_file(self, path: Path) -> None:
+            try:
+                path.resolve().relative_to(SLIDE_DISPLAY_DIR.resolve())
+            except ValueError:
+                self.send_error(403)
+                return
+            if not path.is_file():
+                self.send_error(404)
+                return
+            data = path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def serve_audio(self, path: Path) -> None:
+            size = path.stat().st_size
+            start, end = 0, size - 1
+            range_header = self.headers.get("Range", "")
+            match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip()) if range_header else None
+            if match:
+                start, end = int(match.group(1) or 0), int(match.group(2) or end)
+                if start >= size or end < start:
+                    self.send_error(416)
+                    return
+                end = min(end, size - 1)
+            length = end - start + 1
+            self.send_response(206 if match else 200)
+            self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "audio/wav")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(length))
+            if match:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            with path.open("rb") as stream:
+                stream.seek(start)
+                remaining = length
+                while remaining:
+                    block = stream.read(min(64 * 1024, remaining))
+                    if not block:
+                        break
+                    self.wfile.write(block)
+                    remaining -= len(block)
+
+        def do_GET(self) -> None:
+            parsed_url = urlparse(self.path)
+            path = parsed_url.path
+            if path == "/api/state":
+                self.send_json(controller.state())
+                return
+            if path == "/api/timeline":
+                self.send_json(controller.timeline())
+                return
+            if path == "/api/audio":
+                event_id = str((parse_qs(parsed_url.query).get("event") or [""])[0])
+                audio_path = controller.audio_path_for_event(event_id) if event_id else controller.audio_path()
+                if audio_path is None:
+                    self.send_json({"ok": False, "error": "WAV-файл для этого решения не найден."}, status=404)
+                    return
+                self.serve_audio(audio_path)
+                return
+            requested = "smart_slide_review.html" if path == "/" else unquote(path.lstrip("/"))
+            self.serve_file(SLIDE_DISPLAY_DIR / requested)
+
+        def do_POST(self) -> None:
+            payload = self.read_json()
+            if payload is None:
+                return
+            if self.path == "/api/review":
+                try:
+                    state = controller.save_review(str(payload.get("category") or ""), str(payload.get("note") or ""))
+                except ValueError as exc:
+                    self.send_json({"ok": False, "error": str(exc)}, status=422)
+                    return
+                self.send_json({"ok": True, "state": state})
+                return
+            if self.path == "/api/error":
+                try:
+                    result = controller.mark_error(
+                        str(payload.get("event_id") or ""),
+                        str(payload.get("category") or ""),
+                        str(payload.get("note") or ""),
+                        payload.get("operator_stop_seconds"),
+                    )
+                except ValueError as exc:
+                    self.send_json({"ok": False, "error": str(exc)}, status=422)
+                    return
+                self.send_json(result)
+                return
+            if self.path == "/api/incident":
+                try:
+                    result = controller.record_incident(
+                        str(payload.get("event_id") or ""),
+                        payload.get("operator_stop_seconds"),
+                        str(payload.get("displayed_ref") or ""),
+                        str(payload.get("note") or ""),
+                    )
+                except ValueError as exc:
+                    self.send_json({"ok": False, "error": str(exc)}, status=422)
+                    return
+                self.send_json(result)
+                return
+            if self.path == "/api/incident-note":
+                try:
+                    controller.update_incident_note(
+                        str(payload.get("incident_id") or ""), str(payload.get("note") or "")
+                    )
+                except ValueError as exc:
+                    self.send_json({"ok": False, "error": str(exc)}, status=422)
+                    return
+                self.send_json({"ok": True})
+                return
+            if self.path == "/api/complete":
+                event_ids = payload.get("observed_event_ids")
+                if not isinstance(event_ids, list):
+                    self.send_json({"ok": False, "error": "Нужен список просмотренных решений."}, status=422)
+                    return
+                self.send_json({"ok": True, **controller.complete_sequence(event_ids)})
+                return
+            if self.path == "/api/move":
+                try:
+                    delta = int(payload.get("delta") or 0)
+                except (TypeError, ValueError):
+                    delta = 0
+                self.send_json({"ok": True, "state": controller.move(-1 if delta < 0 else 1)})
+                return
+            self.send_error(404)
+
+    server = ThreadingHTTPServer((args.review_host, args.review_port), Handler)
+    url = f"http://{args.review_host}:{server.server_port}/"
+    print(f"Визуальная разметка УПС: {url}")
+    print("Оставьте это окно терминала открытым; Ctrl+C завершит локальный просмотр.")
+    if not args.no_open_browser:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nВизуальная разметка УПС остановлена.")
+    finally:
+        server.server_close()
+        report_path = controller.write_error_report()
+        print(f"Отчёт ошибок этой браузерной сессии: {report_path}")
+
+
 def review_smart_slides(args: argparse.Namespace) -> None:
     runs_dir = Path(args.runs_dir)
     events_paths = smart_slide_event_paths(runs_dir, latest_batch=args.latest_batch)
     entries = collect_smart_slide_entries(events_paths)
     if not entries:
         print(f"События SMART_SLIDE_SHADOW не найдены: {runs_dir}")
+        return
+    if args.browser:
+        start_smart_slide_browser_review(entries, args)
         return
     unreviewed = sum(1 for entry in entries if smart_slide_is_unreviewed(entry))
     if not unreviewed and not args.no_resume:
@@ -557,19 +1165,7 @@ def review_smart_slides(args: argparse.Namespace) -> None:
         if command in SMART_SLIDE_CATEGORIES:
             category, _label = SMART_SLIDE_CATEGORIES[command]
             was_unreviewed = smart_slide_is_unreviewed(entry)
-            entry.review.update({
-                "event_id": entry.event_id,
-                "status": "reviewed",
-                "review_category": category,
-                "reviewed_at": datetime.now().isoformat(timespec="seconds"),
-                "passage": str(entry.event.get("passage") or ""),
-                "replay_seconds": float_value(entry.event.get("replay_seconds")),
-                "action": str(entry.event.get("action") or ""),
-                "current_index": entry.event.get("current_index"),
-                "target_index": entry.event.get("target_index"),
-            })
-            entry.review.setdefault("note", "")
-            save_smart_slide_review(entry)
+            update_smart_slide_review(entry, category, str(entry.review.get("note") or ""))
             if was_unreviewed:
                 reviewed += 1
             position = next_unreviewed_smart_slide(entries, position + 1)
@@ -891,6 +1487,14 @@ def main() -> int:
         action="store_true",
         help="Review SMART_SLIDE_SHADOW decisions separately from citation labels.",
     )
+    parser.add_argument(
+        "--browser",
+        action="store_true",
+        help="For --smart-slides, open local visual review with simulated slides and synchronized audio.",
+    )
+    parser.add_argument("--review-host", default="127.0.0.1", help="Host for local visual smart-slide review.")
+    parser.add_argument("--review-port", type=int, default=0, help="Port for local visual smart-slide review; 0 chooses a free port.")
+    parser.add_argument("--no-open-browser", action="store_true", help="Do not open the visual review URL automatically.")
     parser.add_argument("--latest-live", action="store_true", help="Review only the newest live LiVerse run with unreviewed cases.")
     parser.add_argument("--all-unreviewed", action="store_true", help="Review all unreviewed cases from all runs.")
     parser.add_argument(
@@ -901,6 +1505,8 @@ def main() -> int:
     parser.add_argument("--state", default="", help="Path to review state JSON.")
     parser.add_argument("--no-resume", action="store_true", help="Start from first unreviewed case.")
     args = parser.parse_args()
+    if args.browser and not args.smart_slides:
+        parser.error("--browser доступен только вместе с --smart-slides")
     review(args)
     return 0
 

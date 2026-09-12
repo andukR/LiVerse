@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 
 ASSISTED_MIN_SCORE = 45.0
 ASSISTED_MIN_MARGIN = 8.0
 ASSISTED_MIN_MATCHED_WORDS = 3
+INITIAL_SLIDE_MIN_MATCHED_WORDS = 3
 NEARBY_SHORT_MIN_SCORE = ASSISTED_MIN_SCORE
 NEARBY_SHORT_MIN_MARGIN = ASSISTED_MIN_MARGIN
 NEARBY_SHORT_MIN_MATCHED_WORDS = 2
@@ -122,10 +123,30 @@ def decide_sequence_advance(
     target_start, target_end = _target_bounds(targets[current_index])
     candidate_start, candidate_end = _candidate_bounds(candidate)
     reaches_current_boundary = candidate_start <= target_end <= candidate_end
+    ending_overlap_words = int(_value(candidate, "ending_overlap_words", 0) or 0)
 
     if candidate_index == current_index:
+        # A long range is announced first, so its first verse is not yet
+        # necessarily visible.  Do not wait for the end of that verse: a
+        # sufficiently supported match is evidence that reading has begun.
+        # The explicit False preserves the legacy behaviour for callers that
+        # do not model the visible state of the initial slide.
+        if (
+            state.get("current_slide_visible") is False
+            and int(matched_words) >= INITIAL_SLIDE_MIN_MATCHED_WORDS
+            and (strong or assisted)
+        ):
+            return {
+                **base,
+                "action": "activate",
+                "reason": (
+                    "strong_initial_element" if strong else "assisted_initial_element"
+                ),
+            }
         if not reaches_current_boundary:
             return {**base, "action": "keep", "reason": "inside_current_element"}
+        if ending_overlap_words < 2:
+            return {**base, "action": "keep", "reason": "current_end_not_heard"}
         if not (strong or assisted):
             return {**base, "action": "keep", "reason": "current_boundary_not_confident"}
         if current_index == len(targets) - 1:
@@ -134,20 +155,14 @@ def decide_sequence_advance(
                 "action": "complete",
                 "reason": "strong_final_boundary" if strong else "assisted_final_boundary",
             }
+        # Finishing verse N is not proof that verse N+1 will be read.  A
+        # preacher can stop a declared range and begin explaining the text.
+        # Keep N visible until there is direct evidence for the next element;
+        # then the next branch synchronizes forward without a premature slide.
         return {
             **base,
-            "action": "advance" if strong else "assisted_advance",
-            "target_index": current_index + 1,
-            "target_element": dict(targets[current_index + 1]),
-            "reason": (
-                "strong_current_boundary"
-                if strong
-                else (
-                    "nearby_short_current_boundary"
-                    if nearby_short
-                    else "assisted_current_boundary"
-                )
-            ),
+            "action": "keep",
+            "reason": "await_next_element_after_boundary",
         }
 
     if candidate_index == current_index + 1 and (strong or assisted):
@@ -216,3 +231,55 @@ def decide_sequence_advance_from_text(
         "reason": "no_candidate",
         "evidence_source": "none",
     }
+
+
+def decide_sequence_progress_from_text(
+    state: Mapping[str, object] | None,
+    global_decision: Any,
+    sequence_evaluator: Callable[[Mapping[str, object]], Any],
+    *,
+    max_steps: int = 3,
+) -> tuple[dict[str, object], Any]:
+    """Combine consecutive evidence from one speech window into one move."""
+    working_state = dict(state) if isinstance(state, Mapping) else {}
+    original_index = int(working_state.get("current_index") or 0)
+    steps: list[dict[str, object]] = []
+    step_evidence: list[Any] = []
+    evidence_decision = None
+    for _unused in range(max(1, int(max_steps))):
+        evidence_decision = sequence_evaluator(working_state)
+        decision = decide_sequence_advance_from_text(
+            working_state,
+            global_decision,
+            evidence_decision,
+        )
+        target_index = decision.get("target_index")
+        if decision.get("action") not in {
+            "advance", "assisted_advance", "synchronize_forward",
+            "assisted_synchronize_forward",
+        } or not isinstance(target_index, int):
+            if not steps:
+                return decision, evidence_decision
+            break
+        steps.append(decision)
+        step_evidence.append(evidence_decision)
+        working_state["current_index"] = target_index
+
+    if len(steps) == 1:
+        return steps[0], step_evidence[0]
+    final = dict(steps[-1])
+    final["current_index"] = original_index
+    targets = [item for item in working_state.get("targets") or [] if isinstance(item, Mapping)]
+    if 0 <= original_index < len(targets):
+        final["current_element"] = dict(targets[original_index])
+    final["action"] = "synchronize_forward"
+    final["reason"] = "sequential_window_catch_up"
+    final["sequence_steps"] = [
+        {
+            "candidate": step.get("candidate"),
+            "target_index": step.get("target_index"),
+            "reason": step.get("reason"),
+        }
+        for step in steps
+    ]
+    return final, step_evidence[-1]

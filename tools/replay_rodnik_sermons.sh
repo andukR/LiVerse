@@ -7,6 +7,8 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # directory contains only six converted recordings and is retained solely as
 # a source of subtitles/transcripts.
 AUDIO_ROOT="$PROJECT_ROOT/.cache/liverse/replay_audio"
+RODNIK_CHANNEL_URL="https://www.youtube.com/channel/UCqO7ojmGKRrat4TN2GQW9eQ/videos"
+AUTO_DOWNLOAD_LIMIT=3
 ASR_ENGINE="sherpa-0.54"
 CITATION_DETECTION_MODE="hybrid_confirm"
 RUN_REPLAY=false
@@ -15,9 +17,11 @@ CONTROL_ONLY=false
 PYTHON="$PROJECT_ROOT/.venv/bin/python"
 BATCH_ROOT="$PROJECT_ROOT/.cache/liverse/rodnik_replay_batches"
 LATEST_BATCH_FILE="$BATCH_ROOT/latest_logs_dir"
+AUTO_FETCH_ATTEMPTED=false
 TIMED_SUBTITLE_ROOTS=(
     "$PROJECT_ROOT/../bible_parser_cli/transcripts"
     "$PROJECT_ROOT/../bible_parser_cli/.cache/whisper_runs"
+    "$PROJECT_ROOT/.cache/liverse/replay_subtitles"
 )
 
 usage() {
@@ -26,20 +30,27 @@ usage() {
   tools/replay_rodnik_sermons.sh next
   tools/replay_rodnik_sermons.sh batch AUDIO_1 [AUDIO_2] [AUDIO_3]
   tools/replay_rodnik_sermons.sh audit AUDIO_1 [AUDIO_2] [AUDIO_3]
+  tools/replay_rodnik_sermons.sh subtitles
+  tools/replay_rodnik_sermons.sh subtitles --run
   tools/replay_rodnik_sermons.sh review
-  tools/replay_rodnik_sermons.sh review-slides
+  tools/replay_rodnik_sermons.sh review-slides [--browser]
   tools/replay_rodnik_sermons.sh [--run] [--engine sherpa-0.54|vosk-0.22]
 
 next                  Автоматически выбрать до трёх ещё не обработанных
-                      проповедей и запустить для них всю эмуляцию.
+                      проповедей и запустить для них всю эмуляцию. Когда
+                      локальная очередь закончилась, скачать до трёх новых
+                      воскресных записей с YouTube и продолжить.
 batch AUDIO_1 [AUDIO_2] [AUDIO_3]
                       Для одной-трёх выбранных записей: подобрать окна по субтитрам,
                       нарезать WAV и запустить Sherpa 0.54 в hybrid_confirm.
                       Исходные записи не изменяются.
 audit AUDIO_1 [AUDIO_2] [AUDIO_3]
                       Отдельно проверить обычную речь на ложные срабатывания.
+subtitles             Показать записи без SRT/VTT; с --run скачать только русские
+                      субтитры YouTube, без загрузки аудио и без эмуляции.
 review                Открыть аннотатор только для последней успешной пачки.
 review-slides         Разметить решения умного перелистывателя из этой пачки.
+  --browser            Показать слайд и WAV в локальном браузере.
 
 Без --run скрипт только покажет найденные записи и их длительность.
 --run                 Запустить эмуляцию живой проповеди.
@@ -188,6 +199,14 @@ run_next_batch() {
         fi
     done
 
+    if ((${#selected[@]} == 0)) && [[ "$AUTO_FETCH_ATTEMPTED" == false ]]; then
+        AUTO_FETCH_ATTEMPTED=true
+        if download_next_rodnik_sermons; then
+            run_next_batch
+            return $?
+        fi
+    fi
+
     if ((${#selected[@]} == 0)); then
         echo "Нет новых записей с субтитрами, содержащими таймкоды: обработано $completed_count, без таймкодов $unavailable_subtitles, всего ${#available[@]}."
         return 0
@@ -197,9 +216,79 @@ run_next_batch() {
     run_batch "${selected[@]}"
 }
 
+download_next_rodnik_sermons() {
+    if [[ ! -x "$PYTHON" ]]; then
+        echo "Не найдено виртуальное окружение Python: $PYTHON" >&2
+        return 1
+    fi
+
+    echo "Локальная очередь закончилась. Ищу до $AUTO_DOWNLOAD_LIMIT новых воскресных записей на YouTube..."
+    local listing
+    if ! listing="$("$PYTHON" -m yt_dlp --flat-playlist --playlist-end 500 --print '%(id)s|%(title)s' "$RODNIK_CHANNEL_URL")"; then
+        echo "Не удалось получить список роликов канала YouTube." >&2
+        return 1
+    fi
+
+    local -a download_urls=() selected_ids=() downloaded_audio=()
+    local video_id title audio_file
+    while IFS='|' read -r video_id title; do
+        [[ "$title" == *"Воскресн"* ]] || continue
+        [[ "$video_id" =~ ^[A-Za-z0-9_-]{11}$ ]] || continue
+        if find "$AUDIO_ROOT" -maxdepth 1 -type f -name "*${video_id}*" -print -quit | grep -q .; then
+            continue
+        fi
+        selected_ids+=("$video_id")
+        download_urls+=("https://www.youtube.com/watch?v=$video_id")
+        if ((${#selected_ids[@]} >= AUTO_DOWNLOAD_LIMIT)); then
+            break
+        fi
+    done <<< "$listing"
+
+    if ((${#download_urls[@]} == 0)); then
+        echo "На канале не найдено отсутствующих локально воскресных записей."
+        return 0
+    fi
+
+    echo "Скачиваю ${#download_urls[@]} новых записей:"
+    printf '  - %s\n' "${selected_ids[@]}"
+    local -a download_args=("$PYTHON" tools/replay_audio_files.py)
+    local url
+    for url in "${download_urls[@]}"; do
+        download_args+=(--download-url "$url")
+    done
+    "${download_args[@]}"
+
+    for video_id in "${selected_ids[@]}"; do
+        shopt -s nullglob
+        local matches=("$AUDIO_ROOT"/*"$video_id"*)
+        shopt -u nullglob
+        for audio_file in "${matches[@]}"; do
+            [[ -f "$audio_file" ]] || continue
+            [[ "$audio_file" == *.part ]] && continue
+            downloaded_audio+=("$audio_file")
+            break
+        done
+    done
+    if ((${#downloaded_audio[@]} == 0)); then
+        echo "Ни одна новая аудиозапись не была скачана." >&2
+        return 1
+    fi
+
+    echo "Докачиваю русские субтитры с таймкодами для новых записей..."
+    local -a subtitle_args=("$PYTHON" tools/replay_audio_files.py --download-subtitles --run)
+    for audio_file in "${downloaded_audio[@]}"; do
+        subtitle_args+=(--audio "$audio_file")
+    done
+    "${subtitle_args[@]}"
+}
+
 youtube_id_from_path() {
     local path="$1" base parent
     base="$(basename "$path")"
+    if [[ "$base" =~ ([A-Za-z0-9_-]{11})\.([A-Za-z]{2,3}(-[A-Za-z]+)?)\.(srt|vtt)$ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
     if [[ "$base" =~ ([A-Za-z0-9_-]{11})\.(webm|wav|mp3|m4a|opus|ogg|flac|srt|vtt|txt)$ ]]; then
         printf '%s\n' "${BASH_REMATCH[1]}"
         return 0
@@ -235,10 +324,32 @@ review_latest_smart_slides() {
         echo "Папка логов последней пачки не найдена: $logs_dir" >&2
         return 1
     fi
-    exec "$PYTHON" tools/review_trigger_cases.py --smart-slides --runs-dir "$logs_dir"
+    local review_args=(--smart-slides --runs-dir "$logs_dir")
+    if [[ "${1:-}" == "--browser" ]]; then
+        review_args+=(--browser)
+    fi
+    exec "$PYTHON" tools/review_trigger_cases.py "${review_args[@]}"
 }
 
 case "${1:-}" in
+    subtitles)
+        if (($# > 2)) || { (($# == 2)) && [[ "$2" != "--run" ]]; }; then
+            echo "Допустимый параметр subtitles: --run" >&2
+            exit 2
+        fi
+        cd "$PROJECT_ROOT"
+        subtitle_args=("$PYTHON" tools/replay_audio_files.py --download-subtitles)
+        if [[ "${2:-}" == "--run" ]]; then
+            subtitle_args+=(--run)
+        fi
+        shopt -s nullglob
+        subtitle_audio=("$AUDIO_ROOT"/Воскресное*.webm)
+        shopt -u nullglob
+        for audio_file in "${subtitle_audio[@]}"; do
+            subtitle_args+=(--audio "$audio_file")
+        done
+        exec "${subtitle_args[@]}"
+        ;;
     next)
         if (($# != 1)); then
             echo "У next нет дополнительных параметров." >&2
@@ -271,12 +382,12 @@ case "${1:-}" in
         review_latest_batch
         ;;
     review-slides)
-        if (($# != 1)); then
-            echo "У review-slides нет дополнительных параметров." >&2
+        if (($# > 2)) || { (($# == 2)) && [[ "$2" != "--browser" ]]; }; then
+            echo "Допустимый параметр review-slides: --browser" >&2
             exit 2
         fi
         cd "$PROJECT_ROOT"
-        review_latest_smart_slides
+        review_latest_smart_slides "${2:-}"
         ;;
 esac
 

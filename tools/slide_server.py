@@ -48,6 +48,8 @@ PENDING_CANDIDATE: dict = {}
 SESSION_QUOTES: list[dict] = []
 DECISION_CALLBACK = None
 PRESENTATION_ACTION_CALLBACK = None
+RANGE_HINT_CALLBACK = None
+RANGE_HINT: dict = {}
 PROCESSING_STATE = {
     "stage": "listening",
     "message": "LiVerse слушает речь",
@@ -78,21 +80,28 @@ def broadcast_operator(payload: dict) -> None:
 def operator_state() -> dict:
     with STATE_LOCK:
         pending = dict(PENDING_CANDIDATE)
+        range_hint = dict(RANGE_HINT)
         processing = dict(PROCESSING_STATE)
         session_quotes = [dict(item) for item in SESSION_QUOTES]
     return {
         "status": "pending" if pending else "waiting",
         "candidate": pending or None,
+        "range_hint": range_hint or None,
         "processing": processing,
         "session_quotes": session_quotes,
         "session_share": session_share_payload(session_quotes),
     }
 
 
-def reset_operator_state(decision_callback=None, presentation_action_callback=None) -> None:
-    global DECISION_CALLBACK, PRESENTATION_ACTION_CALLBACK
+def reset_operator_state(
+    decision_callback=None,
+    presentation_action_callback=None,
+    range_hint_callback=None,
+) -> None:
+    global DECISION_CALLBACK, PRESENTATION_ACTION_CALLBACK, RANGE_HINT_CALLBACK
     with STATE_LOCK:
         PENDING_CANDIDATE.clear()
+        RANGE_HINT.clear()
         SESSION_QUOTES.clear()
         PROCESSING_STATE.update(
             {
@@ -105,6 +114,7 @@ def reset_operator_state(decision_callback=None, presentation_action_callback=No
         )
     DECISION_CALLBACK = decision_callback
     PRESENTATION_ACTION_CALLBACK = presentation_action_callback
+    RANGE_HINT_CALLBACK = range_hint_callback
 
 
 def run_presentation_action(action: str) -> tuple[bool, str]:
@@ -120,6 +130,54 @@ def run_presentation_action(action: str) -> tuple[bool, str]:
     if isinstance(result, tuple):
         return bool(result[0]), str(result[1] or "")
     return (True, "") if result is not False else (False, "presentation_control_failed")
+
+
+def submit_range_hint(payload: dict) -> dict:
+    """Publish a non-automatic proposal for an active long Bible range."""
+    hint = {
+        "passage": str(payload.get("passage") or "").strip(),
+        "current_index": int(payload.get("current_index") or 0),
+        "current_ref": str(payload.get("current_ref") or "").strip(),
+        "target_index": int(payload.get("target_index") or 0),
+        "target_ref": str(payload.get("target_ref") or "").strip(),
+        "reason": str(payload.get("reason") or "").strip(),
+        "asr": str(payload.get("asr") or "").strip(),
+    }
+    if hint["target_index"] <= hint["current_index"] or not hint["target_ref"]:
+        raise ValueError("invalid_range_hint")
+    with STATE_LOCK:
+        RANGE_HINT.clear()
+        RANGE_HINT.update(hint)
+    broadcast_operator(operator_state())
+    return hint
+
+
+def decide_range_hint(action: str) -> tuple[bool, str, dict]:
+    """Apply or dismiss the current long-range hint through its owner."""
+    if action not in {"apply", "keep"}:
+        return False, "unknown_range_hint_action", {}
+    with STATE_LOCK:
+        hint = dict(RANGE_HINT)
+    if not hint:
+        return False, "no_pending_range_hint", {}
+    callback = RANGE_HINT_CALLBACK
+    if callback is None:
+        return False, "range_hint_control_unavailable", hint
+    try:
+        result = callback(action, hint)
+        if isinstance(result, tuple):
+            ok, reason = bool(result[0]), str(result[1] or "")
+        else:
+            ok, reason = result is not False, ""
+    except Exception as exc:
+        ok, reason = False, f"range_hint_callback_error:{exc}"
+    if not ok:
+        return False, reason, hint
+    with STATE_LOCK:
+        if RANGE_HINT == hint:
+            RANGE_HINT.clear()
+    broadcast_operator(operator_state())
+    return True, reason, hint
 
 
 def session_share_text(quotes: list[dict]) -> str:
@@ -489,6 +547,11 @@ class SlideHandler(BaseHTTPRequestHandler):
         self.serve_static()
 
     def do_POST(self) -> None:
+        if self.path in {"/api/range-hint/apply", "/api/range-hint/keep"}:
+            action = self.path.rsplit("/", 1)[-1]
+            ok, reason, hint = decide_range_hint(action)
+            self.send_json({"ok": ok, "reason": reason, "hint": hint}, status=200 if ok else 409)
+            return
         if self.path in {"/api/presentation-next", "/api/presentation-previous"}:
             action = self.path.rsplit("-", 1)[-1]
             ok, reason = run_presentation_action(action)
@@ -650,16 +713,17 @@ def start_server_thread(
     port: int = DEFAULT_PORT,
     decision_callback=None,
     presentation_action_callback=None,
+    range_hint_callback=None,
     open_qr: bool = False,
     open_browser: bool = False,
     print_qr: bool = False,
 ) -> ThreadingHTTPServer:
-    reset_operator_state(decision_callback, presentation_action_callback)
+    reset_operator_state(decision_callback, presentation_action_callback, range_hint_callback)
     server = ThreadingHTTPServer((host, port), SlideHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     print(f"Slide display: http://{host}:{port}", flush=True)
-    if decision_callback is not None or presentation_action_callback is not None:
+    if decision_callback is not None or presentation_action_callback is not None or range_hint_callback is not None:
         url = operator_url(port)
         desktop_url = f"http://127.0.0.1:{port}/operator"
         qr_path = save_operator_qr_png(url)

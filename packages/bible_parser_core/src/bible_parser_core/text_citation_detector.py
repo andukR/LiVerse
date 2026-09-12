@@ -381,6 +381,35 @@ class ScriptureTextDetector:
         """Evaluate recent speech only against the current and next sequence elements."""
         if not isinstance(state, Mapping) or not self._last_windows:
             return self._decision(reason="sequence_inactive")
+        return self._evaluate_known_sequence_windows(state, self._last_windows, now)
+
+    def evaluate_known_sequence_text(
+        self,
+        state: Mapping[str, object] | None,
+        text: str,
+        now: float,
+    ) -> TextCitationDecision:
+        """Evaluate evolving recognizer text without adding it to the final buffer."""
+        tokens = tuple(normalize_bible_text(text)[-self.config.buffer_words :])
+        if len(tokens) < 2:
+            return self._decision(reason="not_enough_words")
+        sizes = {size for size in self.config.window_sizes if size <= len(tokens)}
+        sizes.add(len(tokens))
+        windows = [
+            SpeechWindow(size=size, text=" ".join(tokens[-size:]), tokens=tokens[-size:])
+            for size in sorted(sizes)
+        ]
+        return self._evaluate_known_sequence_windows(state, windows, now)
+
+    def _evaluate_known_sequence_windows(
+        self,
+        state: Mapping[str, object] | None,
+        windows: list[SpeechWindow],
+        now: float,
+    ) -> TextCitationDecision:
+        """Evaluate supplied speech windows against nearby sequence elements."""
+        if not isinstance(state, Mapping) or not windows:
+            return self._decision(reason="sequence_inactive")
         targets = [item for item in state.get("targets") or [] if isinstance(item, Mapping)]
         if not targets:
             return self._decision(reason="sequence_inactive")
@@ -396,7 +425,7 @@ class ScriptureTextDetector:
                 int(target.get("verse") or 0),
             ))
         evaluated: list[TextCitationDecision] = []
-        for window in self._last_windows:
+        for window in windows:
             lemmas, results = self.searcher.search_within_ranges(
                 window.text,
                 ranges,

@@ -15,6 +15,9 @@
         <div id="screenModeStatus" class="screen-mode-status">Обычный режим экрана</div>
       </div>
       <div class="header-actions">
+        <button id="audioPromptButton" type="button" class="audio-prompt-button" aria-pressed="false">
+          Звук: выключен
+        </button>
         <button id="screenModeButton" type="button" class="screen-mode-button">
           На весь экран
         </button>
@@ -57,8 +60,24 @@
       <p>LiVerse продолжает слушать проповедь.</p>
     </section>
 
+    <section id="rangeHint" class="card range-hint hidden">
+      <div class="caption">Длинный отрывок — подсказка</div>
+      <h1 id="rangeHintPassage"></h1>
+      <p>Сейчас: <strong id="rangeHintCurrent"></strong></p>
+      <p>LiVerse предполагает, что началось чтение: <strong id="rangeHintTarget"></strong></p>
+      <details>
+        <summary>Почему появилась подсказка</summary>
+        <p id="rangeHintAsr"></p>
+      </details>
+      <div class="actions">
+        <button id="rangeHintKeep" class="reject">Оставить текущий</button>
+        <button id="rangeHintApply" class="approve">Перейти к предложенному</button>
+      </div>
+      <div id="rangeHintStatus"></div>
+    </section>
+
     <section id="candidate" class="card hidden">
-      <div class="caption">Распознана цитата</div>
+      <div id="candidateCaption" class="caption">Распознана цитата</div>
       <h1 id="ref"></h1>
       <p id="verse"></p>
       <details>

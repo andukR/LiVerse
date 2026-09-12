@@ -12,7 +12,15 @@ from collections import Counter
 from pathlib import Path
 
 from bible_parser_core.live_pipeline import score_reference_risk
-from tools.review_trigger_cases import CATEGORY_LABELS, case_signature, is_unreviewed, load_jsonl, session_metadata
+from tools.review_trigger_cases import (
+    CATEGORY_LABELS,
+    SMART_SLIDE_CATEGORIES,
+    case_signature,
+    collect_smart_slide_entries,
+    is_unreviewed,
+    load_jsonl,
+    session_metadata,
+)
 
 
 DEFAULT_LOG_DIR = Path(".cache/liverse/vosk_probe")
@@ -104,6 +112,139 @@ MODEL_NUMERIC_COLUMNS = (
     "candidate_attempts",
     "verse_count",
 )
+SMART_SLIDE_TRANSITION_ACTIONS = {
+    "advance",
+    "assisted_advance",
+    "synchronize_forward",
+    "assisted_synchronize_forward",
+}
+SMART_SLIDE_TRAINING_FIELDS = (
+    "run", "run_source", "source_audio", "event_id", "passage", "slide_mode",
+    "timecode_seconds", "operator_stop_seconds", "sequence_id", "sequence_position", "sequence_total",
+    "review_category", "reviewed_at", "review_note", "action", "reason",
+    "evidence_source", "target_confirm", "training_eligible", "score", "margin",
+    "matched_words", "current_index", "candidate_index", "target_index",
+    "target_distance", "current_verse", "candidate_verse", "target_verse",
+    "window", "window_words",
+)
+
+
+def smart_slide_event_paths(log_dir: Path) -> list[Path]:
+    """Return event logs which have separately reviewed UPS shadow decisions."""
+    if log_dir.is_file():
+        candidates = [log_dir] if log_dir.name == "events.jsonl" else []
+    elif (log_dir / "events.jsonl").is_file():
+        candidates = [log_dir / "events.jsonl"]
+    else:
+        candidates = sorted(log_dir.rglob("events.jsonl"), key=lambda path: str(path))
+    return [path.resolve() for path in candidates if path.with_name("smart_slide_reviews.jsonl").is_file()]
+
+
+def smart_slide_int(value: object) -> int | str:
+    if value is None or value == "":
+        return ""
+    return int_value(value)
+
+
+def smart_slide_element_verse(event: dict, key: str) -> int | str:
+    element = event.get(key)
+    if not isinstance(element, dict):
+        return ""
+    return smart_slide_int(element.get("verse"))
+
+
+def smart_slide_training_row(entry) -> dict:
+    event = entry.event
+    review = entry.review
+    session = session_metadata(entry.events_path)
+    run_mode = str(session.get("mode") or "").strip()
+    source_audio = str(session.get("source_audio") or "").strip()
+    run_source = "replay" if run_mode == "audio_replay" or source_audio else "live"
+    category = str(review.get("review_category") or "").strip()
+    action = str(event.get("action") or "").strip()
+    stop_seconds = float_value(review.get("operator_stop_seconds"), default=-1.0)
+    # This first UPS model is a safety gate for a transition that the rules
+    # already proposed. Holds and missed transitions are retained in the CSV,
+    # but need a later, distinct "advance or hold" model.
+    training_eligible = bool(
+        action in SMART_SLIDE_TRANSITION_ACTIONS
+        and category in {"correct_transition", "wrong_transition"}
+        # A stop before this event cannot describe its safety. It is a
+        # browser/replay diagnostic, not a human label for a future decision.
+        and (stop_seconds < 0.0 or stop_seconds >= float_value(event.get("replay_seconds")))
+    )
+    target_confirm = ""
+    if training_eligible:
+        target_confirm = bool_int(category == "wrong_transition")
+    current_index = smart_slide_int(event.get("current_index"))
+    target_index = smart_slide_int(event.get("target_index"))
+    target_distance = ""
+    if isinstance(current_index, int) and isinstance(target_index, int):
+        target_distance = target_index - current_index
+    window = str(event.get("window") or "")
+    return {
+        "run": entry.events_path.parent.name,
+        "run_source": run_source,
+        "source_audio": source_audio,
+        "event_id": entry.event_id,
+        "passage": str(event.get("passage") or review.get("passage") or ""),
+        "slide_mode": str(event.get("slide_mode") or ""),
+        "timecode_seconds": float_value(event.get("replay_seconds")),
+        "operator_stop_seconds": (
+            "" if review.get("operator_stop_seconds") is None
+            else float_value(review.get("operator_stop_seconds"))
+        ),
+        "sequence_id": entry.sequence_id,
+        "sequence_position": entry.sequence_position,
+        "sequence_total": entry.sequence_total,
+        "review_category": category,
+        "reviewed_at": str(review.get("reviewed_at") or ""),
+        "review_note": str(review.get("note") or ""),
+        "action": action,
+        "reason": str(event.get("reason") or ""),
+        "evidence_source": str(event.get("evidence_source") or ""),
+        "target_confirm": target_confirm,
+        "training_eligible": bool_int(training_eligible),
+        "score": float_value(event.get("score")),
+        "margin": float_value(event.get("margin")),
+        "matched_words": smart_slide_int(event.get("matched_words")),
+        "current_index": current_index,
+        "candidate_index": smart_slide_int(event.get("candidate_index")),
+        "target_index": target_index,
+        "target_distance": target_distance,
+        "current_verse": smart_slide_element_verse(event, "current_element"),
+        "candidate_verse": smart_slide_element_verse(event, "candidate_element"),
+        "target_verse": smart_slide_element_verse(event, "target_element"),
+        "window": window,
+        "window_words": len(re.findall(r"\w+", window, flags=re.UNICODE)),
+    }
+
+
+def export_smart_slide_training_data(log_dir: Path, output_path: Path, *, asr_engine: str = "") -> dict:
+    entries = collect_smart_slide_entries(smart_slide_event_paths(log_dir))
+    rows: list[dict] = []
+    for entry in entries:
+        if not str(entry.review.get("review_category") or "").strip():
+            continue
+        if asr_engine and str(session_metadata(entry.events_path).get("asr_engine") or "") != asr_engine:
+            continue
+        rows.append(smart_slide_training_row(entry))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=SMART_SLIDE_TRAINING_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    eligible = [row for row in rows if row["training_eligible"] == 1]
+    categories = Counter(str(row["review_category"]) for row in rows)
+    return {
+        "output": str(output_path),
+        "rows": len(rows),
+        "eligible_rows": len(eligible),
+        "target_confirm": sum(int(row["target_confirm"]) for row in eligible),
+        "target_auto": sum(1 - int(row["target_confirm"]) for row in eligible),
+        "categories": categories.most_common(),
+        "columns": len(SMART_SLIDE_TRAINING_FIELDS),
+    }
 
 
 def event_paths(log_dir: Path) -> list[Path]:
@@ -516,6 +657,117 @@ def predict_probability(model: dict, row: dict[str, str]) -> float:
     return exp1 / (exp0 + exp1)
 
 
+def smart_slide_model_features(row: dict[str, str]) -> set[str]:
+    """Stable, decision-level features for the separate UPS safety model."""
+    features: set[str] = set()
+    for column in ("action", "reason", "evidence_source", "slide_mode", "run_source"):
+        value = str(row.get(column) or "").strip()
+        if value:
+            features.add(f"{column}={value}")
+    for column, thresholds in {
+        "score": (60, 80, 90),
+        "margin": (12, 30, 60),
+        "matched_words": (2, 4, 8),
+        "target_distance": (1, 2),
+        "sequence_position": (2, 5),
+        "sequence_total": (5, 10),
+    }.items():
+        value = numeric_value(row, column)
+        for threshold in thresholds:
+            if value >= threshold:
+                features.add(f"{column}>={threshold}")
+    return features
+
+
+def train_smart_slide_naive_bayes(rows: list[dict[str, str]]) -> dict:
+    class_counts = Counter(str(row.get("target_confirm") or "") for row in rows)
+    feature_counts: dict[str, Counter[str]] = {"0": Counter(), "1": Counter()}
+    vocabulary: set[str] = set()
+    for row in rows:
+        target = str(row.get("target_confirm") or "")
+        if target not in feature_counts:
+            continue
+        features = smart_slide_model_features(row)
+        vocabulary.update(features)
+        feature_counts[target].update(features)
+    total_rows = sum(class_counts.values())
+    model = {
+        "model_type": "bernoulli_naive_bayes",
+        "scope": "smart_slide_transition_safety",
+        "target": "target_confirm",
+        "classes": ["0", "1"],
+        "class_counts": dict(class_counts),
+        "features": {},
+    }
+    for target in ("0", "1"):
+        class_count = class_counts[target]
+        model.setdefault("log_prior", {})[target] = math.log((class_count + 1) / (total_rows + 2))
+        for feature in sorted(vocabulary):
+            probability = (feature_counts[target][feature] + 1) / (class_count + 2)
+            model["features"].setdefault(feature, {})[target] = math.log(probability)
+            model["features"][feature][f"not_{target}"] = math.log(1 - probability)
+    return model
+
+
+def predict_smart_slide_confirmation_probability(model: dict, row: dict[str, str]) -> float:
+    features = smart_slide_model_features(row)
+    scores = {
+        target: float((model.get("log_prior") or {}).get(target, 0.0))
+        for target in ("0", "1")
+    }
+    for feature, values in (model.get("features") or {}).items():
+        for target in ("0", "1"):
+            scores[target] += float(values.get(target if feature in features else f"not_{target}", 0.0))
+    max_score = max(scores.values())
+    probability_0 = math.exp(scores["0"] - max_score)
+    probability_1 = math.exp(scores["1"] - max_score)
+    return probability_1 / (probability_0 + probability_1)
+
+
+def train_smart_slide_model(training_csv: Path, model_path: Path, report_path: Path) -> dict:
+    rows = [
+        row for row in load_training_rows(training_csv)
+        if str(row.get("training_eligible") or "") == "1" and str(row.get("target_confirm") or "") in {"0", "1"}
+    ]
+    if not rows:
+        raise RuntimeError("Нет размеченных переходов для обучения НБА УПС.")
+    train_rows, validation_rows = stratified_split(rows)
+    validation_model = train_smart_slide_naive_bayes(train_rows)
+    validation = []
+    for threshold in (0.2, 0.3, 0.5, 0.7):
+        counts = {"error_caught": 0, "error_missed": 0, "true_confirm": 0, "true_auto": 0}
+        for row in validation_rows:
+            predicted_confirm = predict_smart_slide_confirmation_probability(validation_model, row) >= threshold
+            target = str(row["target_confirm"])
+            if target == "1":
+                counts["error_caught" if predicted_confirm else "error_missed"] += 1
+            else:
+                counts["true_confirm" if predicted_confirm else "true_auto"] += 1
+        total = sum(counts.values())
+        validation.append({
+            "threshold": threshold,
+            "total": total,
+            "accuracy": round((counts["error_caught"] + counts["true_auto"]) / total, 3) if total else 0.0,
+            **counts,
+        })
+    model = train_smart_slide_naive_bayes(rows)
+    model.update({
+        "training_rows": len(rows), "train_rows": len(train_rows),
+        "validation_rows": len(validation_rows), "validation": validation,
+        "recommended_threshold": 0.2,
+    })
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    model_path.write_text(json.dumps(model, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    report = {
+        "training_csv": str(training_csv), "model": str(model_path), "rows": len(rows),
+        "train_rows": len(train_rows), "validation_rows": len(validation_rows),
+        "target_counts": dict(Counter(str(row["target_confirm"]) for row in rows)), "validation": validation,
+    }
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return report
+
+
 def evaluate_model(model: dict, rows: list[dict[str, str]], threshold: float) -> dict:
     true_auto = true_confirm = error_caught = error_missed = 0
     for row in rows:
@@ -715,6 +967,11 @@ def main() -> int:
         help="Write reviewed trigger cases as CSV for ML experiments.",
     )
     parser.add_argument(
+        "--export-smart-slide-training",
+        type=Path,
+        help="Write reviewed UPS shadow decisions as a separate CSV for its Naive Bayes safety model.",
+    )
+    parser.add_argument(
         "--asr-engine",
         default="",
         help="For training export, include only sessions from this ASR engine, for example sherpa-0.54.",
@@ -723,6 +980,11 @@ def main() -> int:
         "--train-risk-model",
         type=Path,
         help="Train a simple stdlib Naive Bayes risk model from training CSV.",
+    )
+    parser.add_argument(
+        "--train-smart-slide-model",
+        type=Path,
+        help="Train the separate Naive Bayes safety model for proposed UPS transitions.",
     )
     parser.add_argument(
         "--model-output",
@@ -735,6 +997,18 @@ def main() -> int:
         type=Path,
         default=Path(".cache") / "liverse" / "ml" / "risk_model_report.json",
         help="Where to write --train-risk-model validation report.",
+    )
+    parser.add_argument(
+        "--smart-slide-model-output",
+        type=Path,
+        default=Path(".cache") / "liverse" / "ml" / "smart_slide_model.json",
+        help="Where to write --train-smart-slide-model JSON model.",
+    )
+    parser.add_argument(
+        "--smart-slide-model-report",
+        type=Path,
+        default=Path(".cache") / "liverse" / "ml" / "smart_slide_model_report.json",
+        help="Where to write --train-smart-slide-model validation report.",
     )
     args = parser.parse_args()
 
@@ -754,6 +1028,25 @@ def main() -> int:
         print("Категории:")
         for category, count in export["categories"]:
             label = CATEGORY_LABELS.get(category, category or "без категории")
+            print(f"  {count:>3}  {category} ({label})")
+        return 0
+
+    if args.export_smart_slide_training:
+        export = export_smart_slide_training_data(
+            args.log_dir,
+            args.export_smart_slide_training,
+            asr_engine=args.asr_engine,
+        )
+        print(f"CSV УПС: {export['output']}")
+        print(f"Всего размеченных решений: {export['rows']}  столбцов: {export['columns']}")
+        print(
+            "Для НБА безопасности перехода: "
+            f"{export['eligible_rows']} (неверных: {export['target_confirm']}, "
+            f"верных: {export['target_auto']})"
+        )
+        print("Категории:")
+        for category, count in export["categories"]:
+            label = CATEGORY_LABELS.get(category) or dict(SMART_SLIDE_CATEGORIES.values()).get(category, category)
             print(f"  {count:>3}  {category} ({label})")
         return 0
 
@@ -787,6 +1080,23 @@ def main() -> int:
                 f"верных оператору {item['true_confirm']}, "
                 f"верных автоматически {item['true_auto']}"
             )
+        return 0
+
+    if args.train_smart_slide_model:
+        report = train_smart_slide_model(
+            args.train_smart_slide_model,
+            args.smart_slide_model_output,
+            args.smart_slide_model_report,
+        )
+        print(f"Модель УПС: {report['model']}")
+        print(f"Отчёт: {args.smart_slide_model_report}")
+        print(
+            f"Строк: {report['rows']}  train: {report['train_rows']}  "
+            f"validation: {report['validation_rows']}"
+        )
+        print("Классы: 0 — переход безопасен, 1 — переход нужно передать оператору.")
+        for target, count in sorted(report["target_counts"].items()):
+            print(f"  {target}: {count}")
         return 0
 
     report = summarize(args.log_dir)

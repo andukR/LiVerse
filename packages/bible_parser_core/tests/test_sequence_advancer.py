@@ -4,6 +4,7 @@ import unittest
 from bible_parser_core.sequence_advancer import (
     decide_sequence_advance,
     decide_sequence_advance_from_text,
+    decide_sequence_progress_from_text,
 )
 
 
@@ -19,14 +20,62 @@ class SequenceAdvancerTest(unittest.TestCase):
         }
 
     @staticmethod
-    def candidate(verse: int, *, book_id: int = 19):
+    def candidate(verse: int, *, book_id: int = 19, ending_overlap_words: int = 0):
         return SimpleNamespace(
             reference=f"Пс. 72:{verse}",
             book_id=book_id,
             chapter=72,
             start_verse=verse,
             end_verse=verse,
+            ending_overlap_words=ending_overlap_words,
         )
+
+    def test_partial_match_of_current_verse_does_not_advance(self) -> None:
+        decision = decide_sequence_advance(
+            self.state,
+            self.candidate(7),
+            accepted=True,
+            reason="immediate_strong_match",
+            score=95.364,
+            margin=81.048,
+            matched_words=4,
+        )
+
+        self.assertEqual("keep", decision["action"])
+        self.assertEqual("current_end_not_heard", decision["reason"])
+
+    def test_strong_match_activates_initial_slide_before_its_end(self) -> None:
+        state = {
+            **self.state,
+            "current_index": 0,
+            "current_slide_visible": False,
+        }
+        decision = decide_sequence_advance(
+            state,
+            self.candidate(6),
+            accepted=False,
+            reason="score_below_threshold",
+            score=72.507,
+            margin=30.0,
+            matched_words=5,
+        )
+
+        self.assertEqual("activate", decision["action"])
+        self.assertEqual("assisted_initial_element", decision["reason"])
+
+    def test_heard_end_of_current_verse_waits_for_next_verse(self) -> None:
+        decision = decide_sequence_advance(
+            self.state,
+            self.candidate(7, ending_overlap_words=2),
+            accepted=True,
+            reason="immediate_strong_match",
+            score=95.0,
+            margin=40.0,
+            matched_words=4,
+        )
+
+        self.assertEqual("keep", decision["action"])
+        self.assertEqual("await_next_element_after_boundary", decision["reason"])
 
     def test_weak_next_verse_is_suggested_only_inside_known_sequence(self) -> None:
         decision = decide_sequence_advance(
@@ -137,6 +186,34 @@ class SequenceAdvancerTest(unittest.TestCase):
         self.assertEqual("assisted_synchronize_forward", decision["action"])
         self.assertEqual(2, decision["target_index"])
         self.assertEqual("sequence_scoped", decision["evidence_source"])
+
+    def test_one_window_may_catch_up_through_two_consecutive_verses(self) -> None:
+        decisions = {
+            1: SimpleNamespace(
+                accepted=False, reason="score_below_threshold", score=55.0,
+                margin=20.0, matched_words=6, top_candidate=self.candidate(8),
+            ),
+            2: SimpleNamespace(
+                accepted=False, reason="not_enough_matched_content_words", score=71.0,
+                margin=55.0, matched_words=2, top_candidate=self.candidate(9),
+            ),
+            3: SimpleNamespace(
+                accepted=False, reason="score_below_threshold", score=20.0,
+                margin=2.0, matched_words=1, top_candidate=self.candidate(9),
+            ),
+        }
+
+        decision, evidence = decide_sequence_progress_from_text(
+            self.state,
+            None,
+            lambda state: decisions[int(state["current_index"])],
+        )
+
+        self.assertEqual("synchronize_forward", decision["action"])
+        self.assertEqual("sequential_window_catch_up", decision["reason"])
+        self.assertEqual(3, decision["target_index"])
+        self.assertEqual(2, len(decision["sequence_steps"]))
+        self.assertIs(evidence, decisions[2])
 
 
 if __name__ == "__main__":

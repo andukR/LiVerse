@@ -359,7 +359,14 @@ ASR_REPLACEMENTS = (
     (r"\bивангед[а-я]*\b", "евангелие"),
     (r"\bевангелия\b", "евангелие"),
     (r"\bевангелие\s+атеана\b", "евангелие от иоанна"),
+    # Rodnik replay: «Евангелие от Иоанна» -> «евангетана».
+    # This fused form is specific enough to restore the book without making
+    # a generic fuzzy guess from ordinary speech.
+    (r"\bевангетана\b", "евангелие от иоанна"),
     (r"\bиван\s+гелятматфе[яа]\b", "евангелие от матфея"),
+    # Rodnik replay: «Евангелие от Матфея» -> «иван грет матфеев».
+    # Keep all three words together: «иван» by itself can still be Иоанн.
+    (r"\bиван\s+грет\s+матфеев\b", "евангелие от матфея"),
     (r"\bиван\s+гелиатриан[а-я]*\b", "евангелие от иоанна"),
     (r"\bевангелие\s+под\s+иоанна\b", "евангелие от иоанна"),
     (r"\bпод\s+иуанна\b", "от иоанна"),
@@ -368,6 +375,10 @@ ASR_REPLACEMENTS = (
     (r"\bи\s+о\s+анна\b", "иоанна"),
     (r"\bот\s+илана\b", "от иоанна"),
     (r"\bот\s+яна\b", "от иоанна"),
+    # Sherpa: «восьмой» -> «у вас мой» in a spoken verse range.
+    # The surrounding chapter and final-verse marker make this unlike
+    # ordinary speech and preserve the intended first boundary.
+    (r"\b(\d+|[а-я]+)\s+глава\s+у\s+вас\s+мой\s+(\d+|[а-я]+)\s+стих\b", r"\1 глава 8 по \2 стих"),
     (r"\biii\b", "3"),
     (r"\bпереми[яюи]\b", "иеремия"),
     (r"\bтремя\s+я\b", "иеремия"),
@@ -393,6 +404,13 @@ ASR_REPLACEMENTS = (
     (r"\b(?:1|первое|первая|первого)\s+яна\b", "1 иоанна"),
     (r"\b(?:2|второе|вторая|второго)\s+яна\b", "2 иоанна"),
     (r"\b(?:3|третье|третья|третьего)\s+яна\b", "3 иоанна"),
+    # Rodnik replay: "первое послание Иоанна" -> "первое познание ана".
+    # The required following chapter keeps ordinary talk about knowledge out.
+    (
+        r"\b(?:1|первое|первая|первого)\s+познани[ея]\s+ана"
+        r"(?=\s+(?:\d+|перв\w*|втор\w*|трет\w*|четверт\w*|пят\w*|шест\w*|седьм\w*|восьм\w*|девят\w*|десят\w*)\s+глав)",
+        "1 иоанна",
+    ),
     (r"\b(?:1|первая|первое)\s+темофе[яю]\b", "1 тимофею"),
     (r"\b(?:2|вторая|второе)\s+темофе[яю]\b", "2 тимофею"),
     (r"\bкол\s+о\s+сия\s+нам\b", "колоссянам"),
@@ -454,6 +472,10 @@ ASR_REPLACEMENTS = (
     (r"\bи\s+вся\s+на\b", "ефесянам"),
     (r"\bвся\s+на\b", "ефесянам"),
     (r"\b(?:и\s+)?всяна\b", "ефесянам"),
+    # Rodnik replay: "послание Ефесянам" -> "послание все на".
+    # Keep the surrounding word "послание" so ordinary "все на ..." speech
+    # cannot become a Bible book.
+    (r"\bпослани[ея]\s+все\s+на\b", "послание ефесянам"),
     # Sherpa: "Ефесянам шестая глава" -> "вся нам читаю глава".
     (r"\b(?:и\s+)?вся\s+нам\b", "ефесянам"),
     (r"\bефесянам\s+читаю\s+глава\b", "ефесянам шестая глава"),
@@ -505,6 +527,18 @@ TRUNCATED_TWENTY_ORDINALS = {
     "девят": 29,
 }
 
+TRUNCATED_THIRTY_ORDINALS = {
+    "перв": 31,
+    "втор": 32,
+    "трет": 33,
+    "четверт": 34,
+    "пят": 35,
+    "шест": 36,
+    "седьм": 37,
+    "восьм": 38,
+    "девят": 39,
+}
+
 TRUNCATED_ORDINAL_VERSES = {
     "одиннад": 11,
     "двенад": 12,
@@ -554,10 +588,34 @@ TRUNCATED_GENITIVE_RANGE_START_RE = re.compile(
     + r")\s+по\s+(?=(?:\d+|[а-я]+)(?:\s+(?:\d+|[а-я]+)){0,2}\s+стих\b)"
 )
 
+# Sherpa sometimes drops only the final ``я`` from a feminine ordinal in a
+# chapter address: ``двадцать пята глава``.  Keep these fragments out of the
+# general number dictionary; they are restored only immediately before
+# ``глава`` so ordinary speech cannot become a Bible reference.
+TRUNCATED_FEMININE_CHAPTER_ORDINALS = {
+    word[:-1]: word
+    for word in ORDINALS
+    if word.endswith(("ая", "ья"))
+}
+TRUNCATED_FEMININE_CHAPTER_ORDINAL_RE = re.compile(
+    r"\b("
+    + "|".join(sorted(TRUNCATED_FEMININE_CHAPTER_ORDINALS, key=len, reverse=True))
+    + r")\s+(глав\w*)\b"
+)
+THOUSAND_NOISE_VERSE_RANGE_RE = re.compile(
+    r"\b(?P<chapter>\d{1,3})\s+глав\w*\s+"
+    r"(?P<prefix>с\s+)?(?P<start>\d{1,3})\s+1000\s+(?P<end>\d{1,3})\s+стих\w*\b"
+)
+
 
 def replace_truncated_twenty_ordinal(match: re.Match[str]) -> str:
     """Restore a Sherpa-truncated ordinal immediately before ``стих``."""
     return f"{TRUNCATED_TWENTY_ORDINALS[match.group(1)]} стих"
+
+
+def replace_truncated_thirty_ordinal(match: re.Match[str]) -> str:
+    """Restore a Sherpa-truncated ordinal such as ``тридца втором``."""
+    return f"{TRUNCATED_THIRTY_ORDINALS[match.group(1)]} стих"
 
 
 def replace_truncated_ordinal_verse(match: re.Match[str]) -> str:
@@ -568,6 +626,22 @@ def replace_truncated_ordinal_verse(match: re.Match[str]) -> str:
 def replace_truncated_genitive_range_start(match: re.Match[str]) -> str:
     """Restore a truncated first verse only in ``с … по … стих``."""
     return f"с {TRUNCATED_GENITIVE_RANGE_STARTS[match.group(1)]} по "
+
+
+def replace_truncated_feminine_chapter_ordinal(match: re.Match[str]) -> str:
+    return f"{TRUNCATED_FEMININE_CHAPTER_ORDINALS[match.group(1)]} {match.group(2)}"
+
+
+def replace_thousand_noise_verse_range(match: re.Match[str]) -> str:
+    """Treat Sherpa's ``тысяч`` as noise between two verse bounds."""
+    start = int(match.group("start"))
+    end = int(match.group("end"))
+    if not (1 <= start < end <= 176):
+        return match.group(0)
+    return (
+        f"{match.group('chapter')} глава {match.group('prefix') or ''}"
+        f"{start}-{end} стих"
+    )
 
 
 def normalize_text(text: str) -> str:
@@ -590,12 +664,28 @@ def normalize_text(text: str) -> str:
     normalized = re.sub(r"(\d+)\s*[-–]\s*(\d+)\s*[-–]?\s*х\b", r"\1-\2 стих", normalized)
     normalized = re.sub(r"(\d+)[-–]?(?:й|я|ю|е|го|му|м)\b", r"\1", normalized)
     normalized = re.sub(r"[^0-9а-яa-z]+", " ", normalized)
+    normalized = TRUNCATED_FEMININE_CHAPTER_ORDINAL_RE.sub(
+        replace_truncated_feminine_chapter_ordinal,
+        normalized,
+    )
     # Sherpa can cut the ending off an ordinal such as "двадцать пятый".
     # Without this correction the number extractor leaves "20 пят", which
     # the later fuzzy range rule mistakes for a range from verse 20.
     normalized = re.sub(
         r"\bдвадцать\s+(перв|втор|трет|четверт|пят|шест|седьм|восьм|девят)\w*\s+стих\b",
         replace_truncated_twenty_ordinal,
+        normalized,
+    )
+    # In the observed phrase "двадца втором стихе" Sherpa dropped only the
+    # final "ть" of "двадцать".  It is one ordinal (22), not verses 20-22.
+    normalized = re.sub(
+        r"\bдвадца\s+(перв|втор|трет|четверт|пят|шест|седьм|восьм|девят)\w*\s+стих\b",
+        replace_truncated_twenty_ordinal,
+        normalized,
+    )
+    normalized = re.sub(
+        r"\bтридца\s+(перв|втор|трет|четверт|пят|шест|седьм|восьм|девят)\w*\s+стих\b",
+        replace_truncated_thirty_ordinal,
         normalized,
     )
     normalized = re.sub(
@@ -611,12 +701,25 @@ def normalize_text(text: str) -> str:
     tokens = normalized.split()
     tokens = replace_number_words(tokens)
     normalized = " ".join(tokens)
+    normalized = THOUSAND_NOISE_VERSE_RANGE_RE.sub(
+        replace_thousand_noise_verse_range,
+        normalized,
+    )
+    # In spoken Bible ranges Sherpa sometimes hears the connector "по" as
+    # "пол" or "полу".  Restrict the repair to two numeric verse bounds
+    # followed by "стих", so ordinary uses of those words remain untouched.
+    normalized = re.sub(
+        r"\b(\d{1,3})\s+пол(?:у)?\s+(\d{1,3})\s+стих\b",
+        r"\1 по \2 стих",
+        normalized,
+    )
     normalized = re.sub(r"\b1\s+книг\w*\s+(?:пар|пара)липомин[а-я]*\b", "1 паралипоменон", normalized)
     normalized = re.sub(r"\b2\s+книг\w*\s+(?:пар|пара)липомин[а-я]*\b", "2 паралипоменон", normalized)
     normalized = re.sub(r"\b([12])\s+послание\s+коринфянам\b", r"\1 коринфянам", normalized)
     normalized = re.sub(r"\b([12])\s+послание\s+тимофею\b", r"\1 тимофею", normalized)
     normalized = re.sub(r"\b([12])\s+послание\s+петра\b", r"\1 петра", normalized)
     normalized = re.sub(r"\b([123])\s+послание\s+яна\b", r"\1 иоанна", normalized)
+    normalized = re.sub(r"\b([123])\s+послание\s+иана\b", r"\1 иоанна", normalized)
     normalized = re.sub(r"\b([123])\s+послание\s+иоанна\b", r"\1 иоанна", normalized)
     normalized = re.sub(r"\b1\s+послание\s+(?:апостола\s+павл[аы]\s+)?фессалоникийцам\b", "1 фессалоникийцам", normalized)
     normalized = re.sub(r"\b2\s+послание\s+(?:апостола\s+павл[аы]\s+)?фессалоникийцам\b", "2 фессалоникийцам", normalized)
@@ -934,6 +1037,15 @@ def book_candidates(normalized: str) -> list[BookCandidate]:
             # «Апостола» само по себе — обычное слово, а не название книги.
             # Иначе нечёткое сопоставление с «апостол Иуда» даёт ложную Иуд. 1:8.
             if candidate_text in {"апостола", "послания"}:
+                continue
+            # «апостол я» — начало обычной фразы («апостол, я сказал...»),
+            # которое по буквам похоже на «Иаков». Это не название книги и
+            # не должно открывать случайный диапазон по следующим числам.
+            if candidate_text == "апостол я":
+                continue
+            # «самом» — обычное слово в конструкции «в себе самом»;
+            # оно не является искажением «Псалтирь».
+            if candidate_text == "самом":
                 continue
             # Ordinary "нам" must not fuzzy-match the book form "Наума".
             # Other short ASR fragments have established, separately tested

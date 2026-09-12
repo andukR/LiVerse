@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LiVerse — визуальная разметка УПС</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="smart_slide_review.css">
+</head>
+<body>
+  <main class="app review-app">
+    <section class="slide" aria-label="Эмулируемый слайд LiVerse">
+      <div class="slide__shade"></div>
+      <article class="verse">
+        <div class="verse__ref" id="refText">Загрузка…</div>
+        <div class="verse__rule"></div>
+        <p class="verse__text" id="verseText"></p>
+      </article>
+      <div class="transition-banner" id="transitionBanner" hidden></div>
+      <button id="stopError" class="stop-error" type="button" disabled>СТОП — ОШИБКА УПС (Enter)</button>
+    </section>
+
+    <aside class="controls review-controls" aria-label="Разметка решения УПС">
+      <div class="review-progress" id="progressText">Загрузка…</div>
+      <audio id="audio" preload="metadata"></audio>
+      <button id="startReplay" type="button">▶ Запустить эмуляцию</button>
+      <button id="continueReplay" type="button" hidden>▶ Продолжить после ошибки</button>
+      <button id="rewindReplay" type="button" disabled>↶ Назад 10 секунд</button>
+      <button id="restartReplay" type="button" disabled>↺ С начала фрагмента</button>
+      <progress id="audioProgress" max="1" value="0"></progress>
+      <p class="cue-help" id="timeText">Во время правильной работы ничего нажимать не нужно.</p>
+
+      <section class="decision">
+        <strong id="decisionText"></strong>
+        <span id="decisionReason"></span>
+      </section>
+      <p class="speech"><span>Распознано:</span> <q id="speechText"></q></p>
+
+      <section id="errorPanel" class="error-panel" hidden>
+        <strong>Ошибка отмечена. При необходимости уточните:</strong>
+        <div class="error-buttons">
+          <button data-error="wrong_transition" class="bad">Слишком рано / неверный слайд</button>
+          <button data-error="missed_transition" class="warn">Слишком поздно / переход пропущен</button>
+        </div>
+        <label class="note-label">Заметка (необязательно)
+          <textarea id="note" rows="2" placeholder="Например: перескок через стих"></textarea>
+        </label>
+        <button id="saveErrorNote" type="button">Сохранить наблюдение</button>
+        <label class="note-label">Диагностический отчёт
+          <textarea id="incidentReport" rows="7" readonly></textarea>
+        </label>
+        <button id="copyIncident" type="button">Скопировать отчёт</button>
+      </section>
+      <p class="status" id="statusText"></p>
+    </aside>
+  </main>
+  <script src="smart_slide_review.js"></script>
+</body>
+</html>

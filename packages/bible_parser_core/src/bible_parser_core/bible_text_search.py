@@ -60,6 +60,7 @@ class BibleTextSearchResult:
     chapter: int = 0
     start_verse: int = 0
     end_verse: int = 0
+    ending_overlap_words: int = 0
 
 
 def normalize_bible_text(text: str) -> list[str]:
@@ -321,6 +322,11 @@ class BibleTextSearcher:
             else 0.0
         )
         substring_bonus = 1.0 if query_text and query_text in verse_text else 0.0
+        ending_overlap_words = 0
+        for size in range(min(3, len(verse), len(query)), 1, -1):
+            if tuple(verse[-size:]) in _ngrams(query, size):
+                ending_overlap_words = size
+                break
         score = 100.0 * (
             0.48 * coverage + 0.18 * token_similarity + 0.17 * ordered
             + 0.12 * bigram_overlap + 0.05 * substring_bonus
@@ -334,4 +340,5 @@ class BibleTextSearcher:
             book_id=int(row["book_id"]), chapter=int(row["chapter"]),
             start_verse=int(row["verse"]), end_verse=int(row.get("end_verse", row["verse"]))
             if isinstance(row, dict) else int(row["verse"]),
+            ending_overlap_words=ending_overlap_words,
         )

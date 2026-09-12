@@ -17,6 +17,7 @@ from bible_parser_core.parser import (
     ONE_CHAPTER_BOOKS,
     ORDINALS,
     ParsedReference,
+    bible_map,
     book_candidates,
     normalize_text,
     parse_live_reference,
@@ -80,6 +81,7 @@ VOSK_GRAMMAR_EXTRA_WORDS = {
     "четвёртый",
 }
 CONFUSABLE_NUMBER_PAIRS = ((17, 18), (13, 30), (12, 13), (12, 19), (7, 8))
+INCOMPLETE_ADDRESS_CARRY_MS = 5_000
 CONFUSABLE_NUMBER_MAP = {
     value: other
     for left, right in CONFUSABLE_NUMBER_PAIRS
@@ -171,6 +173,10 @@ BLOCKED_CONTEXT_MESSAGES = {
     "weak_fuzzy_book_without_chapter": (
         "Название книги распознано недостаточно надёжно, а глава не названа. "
         "Повторите ссылку с названием книги и номером главы."
+    ),
+    "malformed_address_words": (
+        "Слова «глава» и «стих» распознаны слишком искажённо; "
+        "ссылка не показана, чтобы не открыть неверный текст."
     ),
 }
 
@@ -605,6 +611,19 @@ def ambiguous_reference_alternatives(
     return alternatives
 
 
+def psalm_segment_has_number_before_range(segment: str, book_end: int) -> bool:
+    """Require a psalm number before a spoken ``с … по …`` range."""
+    after_book = segment[max(0, book_end) :]
+    range_match = re.search(r"\bс\s+\S+\s+по\b", after_book)
+    if range_match is None:
+        return True
+    before_range = after_book[:range_match.start()]
+    return any(
+        token.isdigit() or token in NUMBER_WORDS or token in ORDINALS
+        for token in re.findall(r"\w+", before_range)
+    )
+
+
 def compact_reference_list(text: str, bible_path: Path = DEFAULT_BIBLE) -> list[dict[str, str]]:
     normalized = normalize_text(text)
     items: list[dict[str, str]] = []
@@ -635,7 +654,10 @@ def compact_reference_list(text: str, bible_path: Path = DEFAULT_BIBLE) -> list[
         (
             candidate
             for candidate in all_books
-            if candidate.score >= 0.999
+            # A repeated, nearly exact book name can be an ASR inflection:
+            # «послание евреем ... и евреям ...».  It is still reliable when
+            # both separately introduced references contain their own numbers.
+            if candidate.score >= 0.9
             and not any(
                 other is not candidate
                 and other.score >= 0.999
@@ -658,6 +680,14 @@ def compact_reference_list(text: str, bible_path: Path = DEFAULT_BIBLE) -> list[
         number_count = len(re.findall(r"\b\d+\b", segment))
         if number_count < 2 and not (candidate.book == "Псалтирь" and re.search(r"\bпсал\w*\b", segment)):
             continue
+        if (
+            candidate.book == "Псалтирь"
+            and not psalm_segment_has_number_before_range(
+                segment,
+                candidate.end - candidate.start,
+            )
+        ):
+            continue
         parsed = parse_live_reference(segment, bible_path=bible_path)
         if not parsed or parsed.book != candidate.book:
             continue
@@ -665,10 +695,156 @@ def compact_reference_list(text: str, bible_path: Path = DEFAULT_BIBLE) -> list[
     return items if len(items) >= 2 else []
 
 
+def same_book_chapter_reference_list(text: str, bible_path: Path = DEFAULT_BIBLE) -> list[dict[str, str]]:
+    """Collect two separately named verses when the book is said only once.
+
+    For example, «Деяния Апостолов восьмая глава первый стих и
+    одиннадцатая глава девятнадцатый стих» contains two references, not one
+    cross-chapter range.  Require the explicit connector «и» so that ranges
+    phrased with «по» or «до» keep their existing meaning.
+    """
+    normalized = normalize_text(text)
+    books = [
+        candidate
+        for candidate in book_candidates(normalized)
+        if candidate.score >= 0.999
+    ]
+    if not books:
+        return []
+    book = max(books, key=lambda candidate: candidate.end - candidate.start)
+    matches = list(re.finditer(r"\b(\d+)\s+глава\s+(\d+)\s+стих\b", normalized[book.end :]))
+    if len(matches) != 2:
+        return []
+    connector = normalized[book.end + matches[0].end() : book.end + matches[1].start()]
+    if not re.fullmatch(r"\s*и\s*", connector):
+        return []
+
+    items: list[dict[str, str]] = []
+    for match in matches:
+        parsed = parse_live_reference(
+            f"{book.book} {match.group(1)} глава {match.group(2)} стих",
+            bible_path=bible_path,
+        )
+        if parsed is None:
+            return []
+        items.append({"ref": parsed.ref, "source_text": text})
+    return items
+
+
+def mentioned_chapter_reference_list(text: str, bible_path: Path = DEFAULT_BIBLE) -> list[dict[str, str]]:
+    """Return a non-reading chapter citation as a one-item reference list.
+
+    A phrase such as «об этом мы можем прочитать в Деяниях Апостолов,
+    в пятнадцатой главе» names a useful source, but does not name a verse and
+    is not an instruction to open the whole chapter.  The normal parser
+    deliberately requires a verse for a Scripture slide, so preserve this
+    narrower kind of reference as a list item instead.
+    """
+    normalized = normalize_text(text)
+    if not re.search(r"\b(?:можем|можно|могут)\s+прочитать\b", normalized):
+        return []
+    if re.search(r"\bстих\w*\b", normalized):
+        return []
+
+    for candidate in book_candidates(normalized):
+        if candidate.score < 0.999:
+            continue
+        suffix = normalized[candidate.end :]
+        match = re.search(r"\b(\d+)\s+глава\b", suffix)
+        if not match:
+            continue
+        chapter = int(match.group(1))
+        if chapter not in bible_map(bible_path).get(candidate.book, {}):
+            continue
+        return [{"ref": f"{candidate.book} {chapter}", "source_text": text}]
+    return []
+
+
 def resolve_reference_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, show_candidates: bool = False) -> dict:
+    mentioned_chapter_list = mentioned_chapter_reference_list(text, bible_path=bible_path)
+    if mentioned_chapter_list:
+        return {
+            "text": text,
+            "source": "parser_mentioned_chapter_reference",
+            "resolved": None,
+            "parsed": None,
+            "reference_list": mentioned_chapter_list,
+            "invalid_reference": None,
+            "message": None,
+            "matched": True,
+            "bible_path": str(bible_path),
+        }
+
+    same_book_list = same_book_chapter_reference_list(text, bible_path=bible_path)
+    if same_book_list:
+        return {
+            "text": text,
+            "source": "parser_same_book_chapter_reference_list",
+            "resolved": None,
+            "parsed": None,
+            "reference_list": same_book_list,
+            "invalid_reference": None,
+            "message": None,
+            "matched": True,
+            "bible_path": str(bible_path),
+        }
+
     incomplete_reference = incomplete_reference_without_chapter(text)
     reference_list = compact_reference_list(text, bible_path=bible_path)
     if reference_list:
+        # A speaker can state a range, immediately correct its final verse,
+        # and repeat the address.  It is not a reading list when there are
+        # exactly two ranges with the same book, chapter, and first verse.
+        # The latter occurrence is the correction.
+        if len(reference_list) == 2:
+            # ``ref`` is a display string such as ``Бытие 24:1-67``.  Feeding
+            # it back into the spoken-address parser can reinterpret ``1-67``
+            # as ``61-67``.  The source fragments have already produced these
+            # canonical refs, so keep using the original spoken form here.
+            first = parse_live_reference(
+                str(reference_list[0].get("source_text") or ""), bible_path=bible_path
+            )
+            second = parse_live_reference(
+                str(reference_list[1].get("source_text") or ""), bible_path=bible_path
+            )
+            if (
+                first is not None
+                and second is not None
+                and first.book == second.book
+                and first.chapter == second.chapter
+                and first.start_verse == second.start_verse
+            ):
+                first_is_range = (first.end_chapter or first.chapter, first.end_verse) > (
+                    first.chapter,
+                    first.start_verse,
+                )
+                second_is_range = (second.end_chapter or second.chapter, second.end_verse) > (
+                    second.chapter,
+                    second.start_verse,
+                )
+                # A repeated address can be split between final ASR results:
+                # keep the complete first range when the later repetition has
+                # supplied only its starting verse so far.
+                chosen = first if first_is_range and not second_is_range else second
+                return {
+                    "text": text,
+                    "source": (
+                        "parser_repeated_range_fragment"
+                        if chosen is first
+                        else "parser_repeated_range_correction"
+                    ),
+                    "resolved": None,
+                    "parsed": asdict(chosen),
+                    "invalid_reference": None,
+                    "message": None,
+                    "matched": True,
+                    "bible_path": str(bible_path),
+                    "corrected_reference": (
+                        str(reference_list[1].get("ref") or "")
+                        if chosen is first
+                        else str(reference_list[0].get("ref") or "")
+                    ),
+                }
         return {
             "text": text,
             "source": "parser_reference_list",
@@ -706,6 +882,16 @@ def resolve_reference_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, sh
     resolved = None
     invalid_reference = None
     blocked_weak_context = None
+    normalized = normalize_text(text)
+    malformed_address_words = bool(
+        re.search(r"\bголов[а-я]*\b", normalized)
+        and re.search(r"\bсек[а-я]*\b", normalized)
+    )
+    if parsed is not None and malformed_address_words:
+        # ASR has turned both address words into unrelated words (for example,
+        # «3 2 сека 11 головой»).  A fallback numeric parse here is unsafe.
+        parsed = None
+        blocked_weak_context = "malformed_address_words"
     if parsed is not None:
         parsed_invalid_reference = diagnose_invalid_reference(text, bible_path=bible_path)
         if (
@@ -718,7 +904,7 @@ def resolve_reference_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, sh
             invalid_reference = parsed_invalid_reference
             parsed = None
     if parsed is None and incomplete_reference is None:
-        if invalid_reference is None:
+        if invalid_reference is None and blocked_weak_context is None:
             resolved = resolve_best_reference_candidate(text, bible_path=bible_path)
             if resolved:
                 blocked_weak_context = resolver_book_conflict_reason(text, resolved.ref)
@@ -730,7 +916,6 @@ def resolve_reference_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, sh
         if parsed is None and invalid_reference is None:
             invalid_reference = diagnose_invalid_reference(text, bible_path=bible_path)
         if blocked_weak_context is None:
-            normalized = normalize_text(text)
             if any(
                 candidate.book == "Колоссянам" and candidate.score >= 0.999
                 for candidate in book_candidates(normalized)
@@ -776,6 +961,23 @@ def incomplete_reference_without_chapter(text: str) -> dict | None:
     book_candidate = books[0]
     if book_candidate.book in ONE_CHAPTER_BOOKS:
         return None
+    prefix = normalized[: book_candidate.start].strip()
+    # «с первого по пятый стих Послание к Римлянам» names a book and a
+    # verse range, but has not named a chapter yet.  Do not reinterpret the
+    # first verse as a chapter and show a false single verse such as Rom. 1:5.
+    range_before_book = re.search(
+        r"(?:^|\s)(?:с\s+)?(\d{1,3})\s+по\s+(\d{1,3})\s+стих\w*\s*$",
+        prefix,
+    )
+    if range_before_book:
+        start_verse, end_verse = (int(value) for value in range_before_book.groups())
+        if start_verse <= end_verse:
+            return {
+                "book": book_candidate.book,
+                "start_verse": start_verse,
+                "end_verse": end_verse,
+                "source_text": text,
+            }
     suffix = normalized[book_candidate.end :]
     verse_matches = list(re.finditer(r"\b(\d{1,3})\s+стих\w*\b", suffix))
     if len(verse_matches) != 1:
@@ -955,7 +1157,10 @@ def explicit_reference_context(prefix: str) -> bool:
     if not normalized_prefix:
         return False
     words = normalized_prefix.split()
-    opening_match = re.search(r"\b(?:читаем|откроем|откройте)\b", normalized_prefix)
+    opening_match = re.search(
+        r"\b(?:читаем|прочитать|прочт[её]м|откроем|откройте)\b",
+        normalized_prefix,
+    )
     reference_word_match = re.search(
         r"\b(?:книг[аи]?|евангелие|послани[ея]|пророка|глава|главы)\b",
         normalized_prefix,
@@ -965,7 +1170,14 @@ def explicit_reference_context(prefix: str) -> bool:
         for form in BOOK_ONLY_FORMS
         if form and re.search(rf"\b{re.escape(form)}\b", normalized_prefix)
     ]
-    has_book = 1 <= len(book_hits) <= 3
+    # A complete address can contain a mildly distorted inflection of a book
+    # name (for example Sherpa's "римляном").  It remains a safe context when
+    # the book matcher is highly confident and the fragment also says both
+    # "послание" and "глава".
+    has_high_confidence_book = any(
+        candidate.score >= 0.9 for candidate in book_candidates(prefix)
+    )
+    has_book = 1 <= len(book_hits) <= 3 or has_high_confidence_book
     if len(words) > 8:
         # ASR often splits "откроем <книга> <глава>" from the range and can
         # insert an introductory phrase between them.  This remains strong
@@ -973,6 +1185,16 @@ def explicit_reference_context(prefix: str) -> bool:
         # all present; ordinary long speech still cannot supply a book.
         return bool(opening_match and has_book and re.search(r"\b\d+\s+глав", normalized_prefix))
     return bool((opening_match or reference_word_match) and has_book)
+
+
+def incomplete_explicit_address_context(text: str) -> bool:
+    """Whether a book-and-chapter fragment may bridge a short ASR pause."""
+    normalized = normalize_text(text)
+    return bool(
+        explicit_reference_context(text)
+        and re.search(r"\b\d{1,3}\s+глав\w*\b", normalized)
+        and not re.search(r"\bстих\w*\b", normalized)
+    )
 
 
 def explicit_reference_suffix(text: str) -> bool:
@@ -1684,6 +1906,35 @@ def context_chapter_for_verse_range(
     return None
 
 
+def nearby_context_chapter_for_verse_range(
+    context: dict,
+    start_verse: int,
+    end_verse: int,
+    *,
+    preferred_chapter: int | None = None,
+) -> int | None:
+    """Allow a small, immediately following same-chapter reference.
+
+    A preacher can accidentally cite a couple of verses just after an
+    announced reading range.  This is deliberately not a general extension:
+    it is only one or two verses, in a single-chapter context, with at most
+    three omitted verses between the announced end and the new start.
+    """
+    try:
+        chapter = int(context["chapter"])
+        end_chapter = int(context["end_chapter"])
+        context_end = int(context["end_verse"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if chapter != end_chapter or (preferred_chapter is not None and preferred_chapter != chapter):
+        return None
+    if start_verse > end_verse or end_verse - start_verse > 1:
+        return None
+    if start_verse <= context_end or start_verse - context_end > 4:
+        return None
+    return chapter
+
+
 def contextual_spoken_verse_range(text: str, normalized: str) -> tuple[int, int] | None:
     ranges = contextual_spoken_verse_ranges(text, normalized)
     return ranges[0] if ranges else None
@@ -1692,18 +1943,31 @@ def contextual_spoken_verse_range(text: str, normalized: str) -> tuple[int, int]
 def contextual_spoken_verse_ranges(text: str, normalized: str) -> list[tuple[int, int]]:
     """Return ordered verse subranges named under an already selected context."""
     ranges: list[tuple[int, int, int]] = []
+    # Sherpa occasionally turns «стих» into «степень».  It is safe to accept
+    # this only after a concrete Bible context has already been selected.
+    verse_marker = r"(?:стих\w*|степень\w*)"
     connected = re.search(
         r"\b(?:с\s+)?(?P<start>\d{1,3})\s+(?:по|до|и)\s+"
-        r"(?P<end>\d{1,3})\s+стих\w*\b",
+        rf"(?P<end>\d{{1,3}})\s+{verse_marker}\b",
         normalized,
     )
     if connected:
         ranges.append((int(connected.group("start")), int(connected.group("end")), connected.start()))
 
+    adjacent_match = re.search(
+        r"\b(?P<start>\d{1,3})\s+(?P<end>\d{1,3})\s+степень\w*\b",
+        normalized,
+    )
     adjacent_numbers = bool(re.search(
-        r"\b(?P<start>\d{1,3})\s+(?P<end>\d{1,3})\s+стих\w*\b",
+        rf"\b(?P<start>\d{{1,3}})\s+(?P<end>\d{{1,3}})\s+{verse_marker}\b",
         normalized,
     ))
+    if adjacent_match:
+        ranges.append((
+            int(adjacent_match.group("start")),
+            int(adjacent_match.group("end")),
+            adjacent_match.start(),
+        ))
 
     # In "14–16 стих и с 20 по 21" the word "стих" belongs to both
     # subranges.  Keep the latter separate instead of widening the context to
@@ -1718,19 +1982,23 @@ def contextual_spoken_verse_ranges(text: str, normalized: str) -> list[tuple[int
             inherited_marker.start(),
         ))
 
-    raw_words = re.findall(r"[а-я]+", text.lower().replace("ё", "е"))
-    for start_word, end_word, marker in zip(raw_words, raw_words[1:], raw_words[2:]):
-        if not marker.startswith("стих"):
-            continue
-        start_verse = ORDINALS.get(start_word)
-        end_verse = ORDINALS.get(end_word)
-        if start_verse is not None and end_verse is not None:
-            # Compound ordinals such as "двадцать первом" collapse to one
-            # normalized number ("21") and must not become a false 20-1 range.
-            if not adjacent_numbers:
-                return []
-            position = normalized.find(f"{start_verse} {end_verse}")
-            ranges.append((int(start_verse), int(end_verse), position if position >= 0 else len(normalized)))
+    # Once normalization has already found an explicit numeric range, do not
+    # let the original compound ordinal words reinterpret its end as e.g.
+    # "двадцать восьмой" -> a false 20-8 pair.
+    if not connected:
+        raw_words = re.findall(r"[а-я]+", text.lower().replace("ё", "е"))
+        for start_word, end_word, marker in zip(raw_words, raw_words[1:], raw_words[2:]):
+            if not (marker.startswith("стих") or marker.startswith("степень")):
+                continue
+            start_verse = ORDINALS.get(start_word)
+            end_verse = ORDINALS.get(end_word)
+            if start_verse is not None and end_verse is not None:
+                # Compound ordinals such as "двадцать первом" collapse to one
+                # normalized number ("21") and must not become a false 20-1 range.
+                if not adjacent_numbers:
+                    return []
+                position = normalized.find(f"{start_verse} {end_verse}")
+                ranges.append((int(start_verse), int(end_verse), position if position >= 0 else len(normalized)))
 
     ordered: list[tuple[int, int]] = []
     for start_verse, end_verse, _position in sorted(ranges, key=lambda item: item[2]):
@@ -1793,6 +2061,15 @@ def contextual_short_reference(
                 range_end,
                 preferred_chapter=preferred_chapter,
             )
+            nearby_context = False
+            if range_chapter is None:
+                range_chapter = nearby_context_chapter_for_verse_range(
+                    context,
+                    range_start,
+                    range_end,
+                    preferred_chapter=preferred_chapter,
+                )
+                nearby_context = range_chapter is not None
             if range_chapter is None:
                 return None
             parsed_range = parse_live_reference(
@@ -1804,7 +2081,7 @@ def contextual_short_reference(
             reference_list.append({"ref": parsed_range.ref, "source_text": text})
         return {
             "text": text,
-            "source": "context_subrange_list",
+            "source": "context_nearby_same_chapter_list" if nearby_context else "context_subrange_list",
             "resolved": None,
             "parsed": None,
             "reference_list": reference_list,
@@ -1823,10 +2100,24 @@ def contextual_short_reference(
             end_verse,
             preferred_chapter=preferred_chapter,
         )
+    nearby_context = False
+    if chapter is None:
+        chapter = nearby_context_chapter_for_verse_range(
+            context,
+            start_verse,
+            end_verse,
+            preferred_chapter=preferred_chapter,
+        )
+        nearby_context = chapter is not None
     if (
         chapter is None
-        or not context_range_contains(context, chapter, start_verse)
-        or not context_range_contains(context, chapter, end_verse)
+        or (
+            not nearby_context
+            and (
+                not context_range_contains(context, chapter, start_verse)
+                or not context_range_contains(context, chapter, end_verse)
+            )
+        )
     ):
         return None
 
@@ -1836,7 +2127,7 @@ def contextual_short_reference(
         return None
     return {
         "text": text,
-        "source": "context_range",
+        "source": "context_nearby_same_chapter" if nearby_context else "context_range",
         "resolved": None,
         "parsed": asdict(parsed),
         "invalid_reference": None,
@@ -2077,10 +2368,17 @@ class LiveReferencePipeline:
         else:
             delta_ms = None if self.last_text_ms is None else current_ms - self.last_text_ms
             delta_source = "now_ms"
+        incomplete_address_carried = False
         buffer_reset_by_gap = False
         if delta_ms is not None and delta_ms > self.buffer_window_ms:
-            self.text_buffer.clear()
-            buffer_reset_by_gap = True
+            previous_fragment = self.text_buffer.parts[-1] if self.text_buffer.parts else ""
+            incomplete_address_carried = bool(
+                delta_ms <= INCOMPLETE_ADDRESS_CARRY_MS
+                and incomplete_explicit_address_context(previous_fragment)
+            )
+            if not incomplete_address_carried:
+                self.text_buffer.clear()
+                buffer_reset_by_gap = True
         self.last_text_ms = current_ms
         if asr_end_ms is not None:
             self.last_asr_word_end_ms = asr_end_ms
@@ -2120,7 +2418,15 @@ class LiveReferencePipeline:
                 for candidate in spoken_candidate_texts
             )
         )
-        if context_payload and not explicit_buffered_reference:
+        nearby_context_follow_up = bool(
+            context_payload
+            and str(context_payload.get("source") or "").startswith("context_nearby_same_chapter")
+        )
+        # A nearby follow-up has no spoken book of its own.  If the parser
+        # nevertheless manufactured a different book from noisy words, retain
+        # the established same-chapter context.  A real other-book marker was
+        # already rejected by contextual_short_reference above.
+        if context_payload and (not explicit_buffered_reference or nearby_context_follow_up):
             payload = context_payload
         payload["vosk_text"] = text
         payload["vosk_buffer"] = list(self.text_buffer.parts)
@@ -2129,6 +2435,7 @@ class LiveReferencePipeline:
         payload["delta_source"] = delta_source
         payload["buffer_window_ms"] = self.buffer_window_ms
         payload["buffer_reset_by_gap"] = buffer_reset_by_gap
+        payload["buffer_kept_for_incomplete_address"] = incomplete_address_carried
         add_risk_score(payload, asr_result=asr_result)
         if payload.get("blocked_weak_context") == "incomplete_first_verse_after_chapter":
             payload["buffer_kept_for_open_range"] = True

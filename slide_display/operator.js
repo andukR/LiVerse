@@ -1,5 +1,6 @@
 const waiting = document.querySelector("#waiting");
 const candidateCard = document.querySelector("#candidate");
+const candidateCaption = document.querySelector("#candidateCaption");
 const ref = document.querySelector("#ref");
 const verse = document.querySelector("#verse");
 const asr = document.querySelector("#asr");
@@ -30,11 +31,20 @@ const whatsappShare = document.querySelector("#whatsappShare");
 const copySessionQuotes = document.querySelector("#copySessionQuotes");
 const screenModeButton = document.querySelector("#screenModeButton");
 const screenModeStatus = document.querySelector("#screenModeStatus");
+const audioPromptButton = document.querySelector("#audioPromptButton");
 const bibleModeButton = document.querySelector("#bibleModeButton");
 const songModeButton = document.querySelector("#songModeButton");
 const previousSongSlide = document.querySelector("#previousSongSlide");
 const nextSongSlide = document.querySelector("#nextSongSlide");
 const songControlStatus = document.querySelector("#songControlStatus");
+const rangeHintCard = document.querySelector("#rangeHint");
+const rangeHintPassage = document.querySelector("#rangeHintPassage");
+const rangeHintCurrent = document.querySelector("#rangeHintCurrent");
+const rangeHintTarget = document.querySelector("#rangeHintTarget");
+const rangeHintAsr = document.querySelector("#rangeHintAsr");
+const rangeHintKeep = document.querySelector("#rangeHintKeep");
+const rangeHintApply = document.querySelector("#rangeHintApply");
+const rangeHintStatus = document.querySelector("#rangeHintStatus");
 let books = [];
 let bibleStructure = {};
 let applyPickTimer = null;
@@ -43,6 +53,11 @@ let multiTapState = { key: "", count: 0, timer: null };
 let sessionShareText = "";
 let keepScreenAwake = false;
 let wakeLock = null;
+let audioPromptsEnabled = false;
+let audioContext = null;
+let lastAnnouncedRangeHint = "";
+let currentRangeHint = null;
+let lastAnnouncedCandidate = "";
 const rangePick = {
   book: "",
   chapter: null,
@@ -138,6 +153,72 @@ const stageNames = {
   approved: "Отправлено",
   rejected: "Отклонено",
 };
+
+function playAttentionTone() {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) return;
+  audioContext = audioContext || new AudioContextClass();
+  const oscillator = audioContext.createOscillator();
+  const gain = audioContext.createGain();
+  const now = audioContext.currentTime;
+  oscillator.type = "sine";
+  oscillator.frequency.setValueAtTime(740, now);
+  gain.gain.setValueAtTime(0.0001, now);
+  gain.gain.exponentialRampToValueAtTime(0.16, now + 0.02);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.22);
+  oscillator.connect(gain);
+  gain.connect(audioContext.destination);
+  oscillator.start(now);
+  oscillator.stop(now + 0.24);
+}
+
+function speakRangeHint(hint) {
+  if (!("speechSynthesis" in window)) return;
+  const target = hint.target_ref || "следующий слайд";
+  const utterance = new SpeechSynthesisUtterance(`Ли Верс. Нужна проверка. Показать ${target}?`);
+  utterance.lang = "ru-RU";
+  utterance.rate = 0.92;
+  window.speechSynthesis.cancel();
+  window.setTimeout(() => window.speechSynthesis.speak(utterance), 320);
+}
+
+function rangeHintKey(hint) {
+  if (!hint) return "";
+  return [hint.passage, hint.current_ref, hint.target_ref].join("|");
+}
+
+function announceRangeHint(hint) {
+  const key = rangeHintKey(hint);
+  if (!audioPromptsEnabled || !key || key === lastAnnouncedRangeHint) return;
+  lastAnnouncedRangeHint = key;
+  playAttentionTone();
+  speakRangeHint(hint);
+}
+
+function announceWeakTextCandidate(candidate) {
+  if (!audioPromptsEnabled || candidate.label !== "weak_text_match") return;
+  const key = `${candidate.ref || ""}|${candidate.score || ""}`;
+  if (!key || key === lastAnnouncedCandidate) return;
+  lastAnnouncedCandidate = key;
+  playAttentionTone();
+  speakRangeHint({ target_ref: candidate.ref || "следующий слайд" });
+}
+
+audioPromptButton.addEventListener("click", () => {
+  audioPromptsEnabled = !audioPromptsEnabled;
+  audioPromptButton.classList.toggle("enabled", audioPromptsEnabled);
+  audioPromptButton.setAttribute("aria-pressed", String(audioPromptsEnabled));
+  audioPromptButton.textContent = audioPromptsEnabled ? "Звук: включён" : "Звук: выключен";
+  if (audioPromptsEnabled) {
+    if (currentRangeHint) {
+      announceRangeHint(currentRangeHint);
+    } else {
+      playAttentionTone();
+    }
+  } else if ("speechSynthesis" in window) {
+    window.speechSynthesis.cancel();
+  }
+});
 
 function fullscreenElement() {
   return document.fullscreenElement || document.webkitFullscreenElement;
@@ -237,17 +318,60 @@ function renderProcessing(processing = {}) {
 function render(state) {
   renderProcessing((state && state.processing) || {});
   renderSessionShare((state && state.session_share) || {});
+  renderRangeHint((state && state.range_hint) || null);
   const candidate = state && state.candidate;
   waiting.classList.toggle("hidden", Boolean(candidate));
   candidateCard.classList.toggle("hidden", !candidate);
-  if (!candidate) return;
+  if (!candidate) {
+    lastAnnouncedCandidate = "";
+    return;
+  }
+  candidateCaption.textContent = candidate.label === "weak_text_match"
+    ? "Слабое совпадение — нужна проверка"
+    : "Распознана цитата";
   ref.textContent = candidate.ref || "Неизвестная ссылка";
   verse.textContent = candidate.verse || "";
   resizeCandidateVerse();
   asr.textContent = candidate.asr || candidate.detected_text || "";
   approveContext.classList.toggle("hidden", !candidate.can_set_context);
   status.textContent = "";
+  announceWeakTextCandidate(candidate);
 }
+
+function renderRangeHint(hint) {
+  currentRangeHint = hint;
+  rangeHintCard.classList.toggle("hidden", !hint);
+  if (!hint) {
+    lastAnnouncedRangeHint = "";
+    return;
+  }
+  rangeHintPassage.textContent = hint.passage || "Длинный отрывок";
+  rangeHintCurrent.textContent = hint.current_ref || "текущий слайд";
+  rangeHintTarget.textContent = hint.target_ref || "следующий слайд";
+  rangeHintAsr.textContent = hint.asr || "Распознанная речь не сохранена";
+  rangeHintStatus.textContent = "";
+  announceRangeHint(hint);
+}
+
+async function decideRangeHint(action) {
+  rangeHintKeep.disabled = true;
+  rangeHintApply.disabled = true;
+  rangeHintStatus.textContent = action === "apply" ? "Переключаю слайд…" : "Оставляю текущий слайд…";
+  try {
+    const response = await fetch(`/api/range-hint/${action}`, { method: "POST" });
+    const result = await response.json();
+    if (!result.ok) throw new Error(result.reason || "Ошибка");
+    rangeHintStatus.textContent = action === "apply" ? "Слайд переключён" : "Оставлен текущий слайд";
+  } catch (error) {
+    rangeHintStatus.textContent = `Ошибка: ${error.message}`;
+  } finally {
+    rangeHintKeep.disabled = false;
+    rangeHintApply.disabled = false;
+  }
+}
+
+rangeHintKeep.addEventListener("click", () => decideRangeHint("keep"));
+rangeHintApply.addEventListener("click", () => decideRangeHint("apply"));
 
 function renderSessionShare(share = {}) {
   const count = Number(share.count) || 0;

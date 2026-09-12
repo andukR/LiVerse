@@ -1,0 +1,22 @@
+.review-controls { gap: 13px; overflow-y: auto; }
+.review-progress { color: #f4d48d; font-weight: 700; }
+.review-controls audio { width: 100%; }
+.review-controls progress { width: 100%; height: 14px; accent-color: #cfa45e; }
+.cue-help, .speech { margin: 0; color: #cfcfcf; font-size: 13px; line-height: 1.35; }
+.speech span { color: #f4d48d; }
+.decision { display: grid; gap: 5px; padding: 12px; border: 1px solid #6d572f; border-radius: 6px; background: #211a10; }
+.decision span { color: #cfcfcf; font-size: 13px; }
+.note-label { gap: 6px; }
+.error-panel { display: grid; gap: 9px; padding: 12px; border: 2px solid #d07b6c; border-radius: 7px; background: #291615; }
+.error-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.error-buttons button { padding: 8px; line-height: 1.2; }
+.error-buttons .bad { background: #d07b6c; }
+.error-buttons .warn { background: #d0a85e; }
+.stop-error { position: absolute; z-index: 4; right: 4%; bottom: 5%; min-width: min(430px, 52vw); min-height: 76px; border: 3px solid #fff; background: #b41f25; color: #fff; font-size: clamp(20px, 2.2vw, 34px); box-shadow: 0 5px 24px #000a; }
+.stop-error:hover { background: #d02830; }
+.stop-error:disabled { opacity: .45; cursor: default; }
+.transition-banner { position: absolute; z-index: 3; left: 5%; right: 5%; bottom: 7%; padding: 16px; text-align: center; border-radius: 8px; background: rgba(20, 91, 49, .94); color: #fff; font: 700 clamp(18px, 2vw, 30px)/1.2 Arial, sans-serif; box-shadow: 0 3px 20px #0008; }
+.transition-banner.hold { background: rgba(76, 76, 76, .94); }
+.transition-banner.show { animation: banner-in .25s ease-out; }
+@keyframes banner-in { from { transform: translateY(18px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+@media (max-width: 900px) { .review-controls { overflow: visible; } }

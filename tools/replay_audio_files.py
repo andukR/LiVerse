@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import html
 import json
 import re
@@ -26,8 +27,11 @@ from vosk import KaldiRecognizer, Model, SetLogLevel
 
 from bible_parser_core.bible_text_search import BibleTextSearcher
 from bible_parser_core.live_pipeline import LiveReferencePipeline, build_grammar, grammar_diagnostics
-from bible_parser_core.parser import DEFAULT_BIBLE, parse_live_reference
-from bible_parser_core.sequence_advancer import decide_sequence_advance_from_text
+from bible_parser_core.parser import DEFAULT_BIBLE, bible_map, normalize_text, parse_live_reference
+from bible_parser_core.sequence_advancer import (
+    decide_sequence_advance_from_text,
+    decide_sequence_progress_from_text,
+)
 from bible_parser_core.sherpa_streaming import (
     DEFAULT_SHERPA_THREADS,
     SherpaReplayRecognizer,
@@ -39,6 +43,7 @@ from bible_parser_core.text_citation_detector import (
 )
 from bible_parser_core.verse_text_search import CANONICAL_BOOK_NAMES_BY_ID
 from tools.holyrics import (
+    DEFAULT_LONG_RANGE_MIN_VERSES,
     DEFAULT_LONG_RANGE_SLIDE_MAX_VERSES,
     scripture_range,
     scripture_range_quick_presentation_slides,
@@ -50,10 +55,12 @@ from tools.vosk_grammar_probe import (
     DEFAULT_TEXT_DETECTION_DB,
     JsonlLogger,
     add_slide_payload,
+    accumulate_reading_list,
     address_recognition_allowed,
     format_timecode,
     payload_summary,
     text_citation_payload,
+    text_operator_hint_payload,
     text_decision_ready_for_scripture_range,
     trigger_time_info,
 )
@@ -89,6 +96,7 @@ DEFAULT_SEARCH_ROOTS = (
 DEFAULT_SUBTITLE_ROOTS = (
     PROJECTS_ROOT / "bible_parser_cli" / "transcripts",
     PROJECTS_ROOT / "bible_parser_cli" / ".cache" / "whisper_runs",
+    Path(".cache") / "liverse" / "replay_subtitles",
 )
 LATEST_REPLAY_BATCH = "latest_replay_batch.json"
 DEFAULT_TARGET_ANNOTATIONS = 200
@@ -104,6 +112,12 @@ MAX_REPLAY_WINDOW_SECONDS = 120.0
 REPLAY_WINDOW_OVERLAP_SECONDS = 5.0
 MARKER_PADDING_BEFORE_SECONDS = 15.0
 MARKER_PADDING_AFTER_SECONDS = 45.0
+LONG_RANGE_REPLAY_MIN_VERSES = 5
+# The ordinary 45-second tail normally contains the address, a short pause,
+# and roughly the first three verses.  Keep enough additional source audio for
+# each remaining verse of an announced long reading.
+LONG_RANGE_BASE_INCLUDED_VERSES = 3
+LONG_RANGE_EXTRA_SECONDS_PER_VERSE = 12.0
 TEXT_PADDING_BEFORE_SECONDS = 12.0
 TEXT_PADDING_AFTER_SECONDS = 15.0
 CANDIDATE_MERGE_GAP_SECONDS = 30.0
@@ -139,11 +153,22 @@ DEFAULT_SHERPA_MODEL_PATH = (
 BOOK_IDS_BY_CANONICAL_NAME = {
     book_name: book_id for book_id, book_name in CANONICAL_BOOK_NAMES_BY_ID.items()
 }
+CHAPTER_READING_ANNOUNCEMENT_RE = re.compile(
+    r"\b(?:будем\s+читать|давайте\s+(?:сейчас\s+)?(?:читать|прочитаем|откроем))\b"
+)
+# This inference is replay-only and deliberately excludes very long chapters:
+# an ordinary announcement of Psalm 119 must not create 176 virtual slides.
+MAX_INFERRED_CHAPTER_READING_VERSES = 40
+SEQUENTIAL_TEXT_READING_MAX_GAP_SECONDS = 20.0
 
 
 def replay_long_passage(payload: dict) -> dict | None:
     """Represent a long passage that the replay assumes the operator accepted."""
-    selected = scripture_range(payload.get("parsed") or {})
+    minimum_verses = 2 if payload.get("replay_inferred_sequential_text_reading") else DEFAULT_LONG_RANGE_MIN_VERSES
+    selected = scripture_range(
+        payload.get("parsed") or {},
+        min_same_chapter_verses=minimum_verses,
+    )
     if selected is None:
         return None
     book, chapter, start_verse, end_chapter, end_verse = selected
@@ -161,14 +186,174 @@ def replay_long_passage(payload: dict) -> dict | None:
     }
 
 
+def infer_replay_chapter_reading(payload: dict) -> dict | None:
+    """Expand an explicit announcement of reading a small whole chapter.
+
+    A bare chapter name is still a normal reference.  This applies only to
+    replay when the speaker explicitly says that the congregation will read,
+    the parser supplied its implicit first verse, and the chapter is small.
+    """
+    parsed = payload.get("parsed") if isinstance(payload.get("parsed"), dict) else {}
+    if str(payload.get("source") or "") != "parser":
+        return None
+    try:
+        chapter = int(parsed.get("chapter") or 0)
+        start_verse = int(parsed.get("start_verse") or 0)
+        end_chapter = int(parsed.get("end_chapter") or chapter)
+        end_verse = int(parsed.get("end_verse") or start_verse)
+    except (TypeError, ValueError):
+        return None
+    book = str(parsed.get("book") or "")
+    spoken = normalize_text(str(payload.get("text") or ""))
+    if (
+        not book
+        or chapter <= 0
+        or (start_verse, end_chapter, end_verse) != (1, chapter, 1)
+        or "стих" in spoken
+        or not CHAPTER_READING_ANNOUNCEMENT_RE.search(spoken)
+    ):
+        return None
+    verses = bible_map(DEFAULT_BIBLE).get(book, {}).get(chapter, {})
+    last_verse = max(verses, default=0)
+    if not 1 < last_verse <= MAX_INFERRED_CHAPTER_READING_VERSES:
+        return None
+    expanded = parse_live_reference(f"{book} {chapter}:1-{last_verse}")
+    if expanded is None:
+        return None
+    inferred = copy.deepcopy(payload)
+    inferred["source"] = "replay_inferred_chapter_reading"
+    inferred["parsed"] = {
+        "book": expanded.book,
+        "chapter": expanded.chapter,
+        "start_verse": expanded.start_verse,
+        "end_chapter": expanded.end_chapter or expanded.chapter,
+        "end_verse": expanded.end_verse,
+        "ref": expanded.ref,
+        "verse_text": expanded.verse_text,
+    }
+    inferred["replay_inferred_chapter_reading"] = True
+    return add_slide_payload(inferred)
+
+
+def infer_replay_sequential_text_reading(
+    payload: dict,
+    replay_state: dict[str, object],
+    replay_seconds: float,
+) -> dict | None:
+    """Open a replay-only chapter range after two consecutive text matches."""
+    if str(payload.get("source") or "") != "text_citation":
+        return None
+    parsed = payload.get("parsed") if isinstance(payload.get("parsed"), dict) else {}
+    try:
+        chapter = int(parsed.get("chapter") or 0)
+        start_verse = int(parsed.get("start_verse") or 0)
+        end_chapter = int(parsed.get("end_chapter") or chapter)
+        end_verse = int(parsed.get("end_verse") or start_verse)
+    except (TypeError, ValueError):
+        return None
+    book = str(parsed.get("book") or "")
+    if not book or chapter <= 0 or end_chapter != chapter or end_verse < start_verse:
+        return None
+    current = {
+        "book": book,
+        "chapter": chapter,
+        "start_verse": start_verse,
+        "end_verse": end_verse,
+        "replay_seconds": float(replay_seconds),
+    }
+    previous = replay_state.get("sequential_text_reading")
+    replay_state["sequential_text_reading"] = current
+    if not isinstance(previous, dict):
+        return None
+    try:
+        previous_seconds = float(previous.get("replay_seconds") or 0.0)
+        previous_start = int(previous.get("start_verse") or 0)
+        previous_end = int(previous.get("end_verse") or previous_start)
+    except (TypeError, ValueError):
+        return None
+    if (
+        str(previous.get("book") or "") != book
+        or int(previous.get("chapter") or 0) != chapter
+        or replay_seconds - previous_seconds > SEQUENTIAL_TEXT_READING_MAX_GAP_SECONDS
+        # The ranges must overlap or touch and the new one must extend them.
+        or start_verse > previous_end + 1
+        or end_verse <= previous_end
+    ):
+        return None
+    range_start = min(previous_start, start_verse)
+    # The endpoint has not been announced.  Keep it open and grow the range
+    # only when the following verses are actually recognized; guessing the
+    # end of John 14 as verse 31 would mislead the congregation.
+    if end_verse - range_start + 1 < 3:
+        return None
+    expanded = parse_live_reference(f"{book} {chapter}:{range_start}-{end_verse}")
+    if expanded is None:
+        return None
+    inferred = copy.deepcopy(payload)
+    inferred["source"] = "replay_inferred_sequential_text_reading"
+    inferred["parsed"] = {
+        "book": expanded.book,
+        "chapter": expanded.chapter,
+        "start_verse": expanded.start_verse,
+        "end_chapter": expanded.end_chapter or expanded.chapter,
+        "end_verse": expanded.end_verse,
+        "ref": expanded.ref,
+        "verse_text": expanded.verse_text,
+    }
+    inferred["replay_inferred_sequential_text_reading"] = True
+    return add_slide_payload(inferred)
+
+
 def replay_smart_slide_state(payload: dict, slide_mode: str) -> dict | None:
     """Build the same ordered slide bounds as a live Holyrics presentation."""
     range_payload = payload.get("slide") or payload.get("parsed") or payload
     max_verses = 1 if slide_mode == "one_verse" else DEFAULT_LONG_RANGE_SLIDE_MAX_VERSES
-    slides = scripture_range_quick_presentation_slides(range_payload, max_verses=max_verses)
+    minimum_verses = 2 if payload.get("replay_inferred_sequential_text_reading") else DEFAULT_LONG_RANGE_MIN_VERSES
+    slides = scripture_range_quick_presentation_slides(
+        range_payload,
+        max_verses=max_verses,
+        min_same_chapter_verses=minimum_verses,
+    )
     state = scripture_range_reading_state(range_payload, slides)
     if state is not None:
         state["slide_mode"] = slide_mode
+    return state
+
+
+def manual_smart_slide_state(
+    reference: str,
+    *,
+    bible_path: Path,
+    slide_mode: str,
+) -> dict:
+    """Build replay-only slide state for a range announced outside the WAV."""
+    parsed = parse_live_reference(reference, bible_path=bible_path)
+    if parsed is None:
+        raise ValueError(f"Не удалось разобрать диапазон УПС: {reference}")
+    end_chapter = int(parsed.end_chapter or parsed.chapter)
+    end_position = (end_chapter, int(parsed.end_verse))
+    start_position = (int(parsed.chapter), int(parsed.start_verse))
+    if end_position <= start_position:
+        raise ValueError("Для --smart-slide-passage нужен диапазон минимум из двух стихов.")
+    payload = {
+        "book": parsed.book,
+        "chapter": parsed.chapter,
+        "start_verse": parsed.start_verse,
+        "end_chapter": end_chapter,
+        "end_verse": parsed.end_verse,
+        "ref": parsed.ref,
+    }
+    max_verses = 1 if slide_mode == "one_verse" else DEFAULT_LONG_RANGE_SLIDE_MAX_VERSES
+    slides = scripture_range_quick_presentation_slides(
+        payload,
+        max_verses=max_verses,
+        min_same_chapter_verses=2,
+    )
+    state = scripture_range_reading_state(payload, slides)
+    if state is None:
+        raise ValueError(f"Не удалось построить слайды УПС для: {parsed.ref}")
+    state["slide_mode"] = slide_mode
+    state["manual_context"] = True
     return state
 
 
@@ -176,6 +361,8 @@ def apply_replay_smart_slide_decision(state: dict, decision: dict) -> bool:
     """Update only replay's virtual slide; return False when the range is complete."""
     if decision.get("action") == "complete":
         return False
+    if decision.get("action") == "activate":
+        state["current_slide_visible"] = True
     target_index = decision.get("target_index")
     if isinstance(target_index, int):
         state["current_index"] = target_index
@@ -188,11 +375,76 @@ def replay_smart_slide_decision(
     sequence_decision: object | None,
 ) -> dict:
     """Prefer nearby sequence evidence, retaining strong global catch-up."""
-    return dict(decide_sequence_advance_from_text(state, global_decision, sequence_decision))
+    decision = dict(decide_sequence_advance_from_text(state, global_decision, sequence_decision))
+    return defer_open_ended_replay_completion(state, decision)
+
+
+def defer_open_ended_replay_completion(state: dict, decision: dict) -> dict:
+    """Keep a text-derived passage open until later text disproves it.
+
+    The current final slide is merely the final verse observed so far, not the
+    end of a range announced by the preacher.  A later text match can extend
+    its targets, so a sequence-level complete must become a hold.
+    """
+    if not state.get("open_ended") or decision.get("action") != "complete":
+        return decision
+    deferred = dict(decision)
+    deferred.update({
+        "action": "keep",
+        "action_label": "ожидать следующий стих",
+        "will_transition": False,
+        "target_index": None,
+        "target_element": None,
+        "reason": "await_next_element_for_open_reading",
+    })
+    return deferred
+
+
+def handle_replay_smart_slide_partial(
+    partial: str,
+    replay_seconds: float,
+    text_detector: ScriptureTextDetector | None,
+    replay_state: dict[str, object],
+    logger: JsonlLogger,
+) -> None:
+    """Advance replay's virtual slide from evolving Sherpa text."""
+    state = replay_state.get("smart_slide_shadow")
+    if state is None or text_detector is None:
+        return
+    decision, evidence = decide_sequence_progress_from_text(
+        state,
+        None,
+        lambda current: text_detector.evaluate_known_sequence_text(
+            current,
+            partial,
+            replay_seconds,
+        ),
+    )
+    decision = defer_open_ended_replay_completion(state, decision)
+    if decision.get("action") not in {
+        "activate", "advance", "assisted_advance", "synchronize_forward",
+        "assisted_synchronize_forward", "complete",
+    }:
+        return
+    logger.write(
+        "SMART_SLIDE_SHADOW",
+        {
+            **decision,
+            "passage": str(state.get("ref") or ""),
+            "slide_mode": str(state.get("slide_mode") or ""),
+            "window": str(getattr(evidence, "window_text", "") or partial),
+            "replay_seconds": replay_seconds,
+            "recognition_result": "partial",
+        },
+    )
+    if not apply_replay_smart_slide_decision(state, decision):
+        replay_state["smart_slide_shadow"] = None
 
 
 def replay_long_passage_match(decision: object, passage: dict) -> dict:
     """Check whether Bible-text recognition has reached the passage's last verse."""
+    if passage.get("open_ended"):
+        return {"active": True, "completed": False, "reason": "sequential_reading_open"}
     if not text_decision_ready_for_scripture_range(decision):
         return {"active": True, "completed": False, "reason": "boundary_not_ready"}
     candidate = getattr(decision, "top_candidate", None)
@@ -211,9 +463,58 @@ def replay_long_passage_match(decision: object, passage: dict) -> dict:
     }
 
 
+def extend_open_ended_replay_passage(
+    passage: dict,
+    state: object,
+    decision: object,
+) -> bool:
+    """Append newly confirmed verses to a text-derived one-verse sequence."""
+    if not passage.get("open_ended") or not isinstance(state, dict):
+        return False
+    if str(state.get("slide_mode") or "") != "one_verse":
+        return False
+    candidate = getattr(decision, "top_candidate", None)
+    if candidate is None:
+        return False
+    try:
+        candidate_book = int(getattr(candidate, "book_id", 0) or 0)
+        candidate_chapter = int(getattr(candidate, "chapter", 0) or 0)
+        candidate_end = int(getattr(candidate, "end_verse", 0) or 0)
+        current_end = int(passage.get("end_verse") or 0)
+    except (TypeError, ValueError):
+        return False
+    if (
+        candidate_book != int(passage.get("book_id") or 0)
+        or candidate_chapter != int(passage.get("end_chapter") or 0)
+        or candidate_end <= current_end
+    ):
+        return False
+    book = str(passage.get("book") or "")
+    chapter = int(passage.get("chapter") or 0)
+    targets = state.get("targets")
+    if not book or chapter <= 0 or not isinstance(targets, list):
+        return False
+    for verse in range(current_end + 1, candidate_end + 1):
+        parsed = parse_live_reference(f"{book} {chapter}:{verse}")
+        if parsed is None:
+            return False
+        targets.append({
+            "slide_index": len(targets),
+            "start_chapter": chapter,
+            "start_verse": verse,
+            "chapter": chapter,
+            "verse": verse,
+            "text": parsed.verse_text,
+        })
+    passage["end_verse"] = candidate_end
+    passage["ref"] = f"{book} {chapter}:{int(passage['start_verse'])}-{candidate_end}"
+    state["ref"] = passage["ref"]
+    return True
+
+
 def restore_replay_session_context(
     pipeline: LiveReferencePipeline,
-    replay_state: dict[str, dict | None],
+    replay_state: dict[str, object],
     session_state: dict[str, object] | None,
 ) -> bool:
     """Restore only semantic state when the next WAV continues one window.
@@ -244,7 +545,7 @@ def restore_replay_session_context(
 
 def save_replay_session_context(
     pipeline: LiveReferencePipeline,
-    replay_state: dict[str, dict | None],
+    replay_state: dict[str, object],
     session_state: dict[str, object] | None,
 ) -> None:
     """Keep selected range state for the following part of the same window."""
@@ -343,6 +644,22 @@ def collect_subtitle_youtube_ids(search_roots: list[Path]) -> dict[str, Path]:
     return ids
 
 
+def collect_timed_subtitle_youtube_ids(search_roots: list[Path]) -> dict[str, Path]:
+    """Return only SRT/VTT sources usable for choosing replay windows."""
+    ids: dict[str, Path] = {}
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for path in iter_subtitle_files(root):
+            if path.suffix.lower() not in TIMED_SUBTITLE_EXTENSIONS:
+                continue
+            for video_id in youtube_ids_from_path(path):
+                current = ids.get(video_id)
+                if current is None or subtitle_file_preference(path) < subtitle_file_preference(current):
+                    ids[video_id] = path
+    return ids
+
+
 def subtitle_file_preference(path: Path) -> tuple[int, str]:
     """Prefer timed subtitle formats over plain transcript text."""
     return (0 if path.suffix.lower() in TIMED_SUBTITLE_EXTENSIONS else 1, str(path))
@@ -377,6 +694,31 @@ def read_timed_subtitle_cues(path: Path) -> list[dict[str, object]]:
     return cues
 
 
+def announced_range_verse_count(parsed: object) -> int | None:
+    """Return a same-chapter range size known from its spoken address."""
+    if parsed is None:
+        return None
+    try:
+        chapter = int(getattr(parsed, "chapter"))
+        end_chapter = int(getattr(parsed, "end_chapter") or chapter)
+        start_verse = int(getattr(parsed, "start_verse"))
+        end_verse = int(getattr(parsed, "end_verse"))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if end_chapter != chapter or end_verse < start_verse:
+        return None
+    return end_verse - start_verse + 1
+
+
+def announced_range_padding_after(parsed: object, default_padding: float) -> float:
+    """Reserve source audio for reading a long, explicitly announced range."""
+    verse_count = announced_range_verse_count(parsed)
+    if verse_count is None or verse_count < LONG_RANGE_REPLAY_MIN_VERSES:
+        return default_padding
+    remaining_verses = max(0, verse_count - LONG_RANGE_BASE_INCLUDED_VERSES)
+    return default_padding + remaining_verses * LONG_RANGE_EXTRA_SECONDS_PER_VERSE
+
+
 def subtitle_marker_candidates(
     cues: list[dict[str, object]],
     *,
@@ -400,6 +742,8 @@ def subtitle_marker_candidates(
             continue
         core_start = float(cue["start_seconds"])
         core_end = float(cue["end_seconds"])
+        range_verse_count = announced_range_verse_count(parsed)
+        reading_padding_after = announced_range_padding_after(parsed, padding_after_seconds)
         candidates.append(
             {
                 "start_seconds": core_start,
@@ -407,10 +751,11 @@ def subtitle_marker_candidates(
                 "core_start_seconds": core_start,
                 "core_end_seconds": core_end,
                 "padding_before_seconds": padding_before_seconds,
-                "padding_after_seconds": padding_after_seconds,
+                "padding_after_seconds": reading_padding_after,
                 "sources": ["explicit_address_marker"],
                 "markers": markers,
                 "references": [parsed.ref] if parsed is not None else [],
+                "range_verse_count": range_verse_count,
                 "cue_text": text,
             }
         )
@@ -840,6 +1185,16 @@ def youtube_ids_from_path(path: Path) -> list[str]:
     for component in path.parts:
         if len(component) == 11:
             add(component)
+    # yt-dlp writes subtitles as e.g. ``VIDEO_ID.ru.vtt``.  Recognise this
+    # exact shape, but do not scan arbitrary filenames: an audio name can
+    # itself contain an unrelated eleven-character fragment.
+    language_suffixed = re.match(
+        r"^([A-Za-z0-9_-]{11})\.[a-z]{2,3}(?:-[A-Za-z]+)?\.(?:srt|vtt)$",
+        path.name,
+        re.IGNORECASE,
+    )
+    if language_suffixed:
+        add(language_suffixed.group(1))
     trailing = re.search(r"(?:^|_)([A-Za-z0-9_-]{11})$", path.stem)
     if trailing:
         add(trailing.group(1))
@@ -967,23 +1322,27 @@ def skip_processed_audio_files(files: list[Path], processed: set[Path]) -> tuple
     return selected, skipped
 
 
-def download_audio(urls: list[str], output_dir: Path) -> list[Path]:
+def download_audio(
+    urls: list[str], output_dir: Path, cookies_from_browser: str | None = None
+) -> list[Path]:
     if not urls:
         return []
-    if not shutil.which("yt-dlp"):
-        raise RuntimeError("yt-dlp не найден. Установите yt-dlp или положите аудиофайлы вручную.")
     output_dir.mkdir(parents=True, exist_ok=True)
     downloaded: list[Path] = []
     for url in urls:
         before = {path.resolve() for path in output_dir.glob("*")}
         command = [
-            "yt-dlp",
+            sys.executable,
+            "-m",
+            "yt_dlp",
             "-f",
             "bestaudio",
             "-o",
             str(output_dir / "%(title).120s_%(id)s.%(ext)s"),
-            url,
         ]
+        if cookies_from_browser:
+            command.extend(("--cookies-from-browser", cookies_from_browser))
+        command.append(url)
         try:
             subprocess.run(command, check=True)
         except subprocess.CalledProcessError as error:
@@ -997,6 +1356,44 @@ def download_audio(urls: list[str], output_dir: Path) -> list[Path]:
             if path.is_file() and path.resolve() not in before and path.suffix.lower() in AUDIO_EXTENSIONS:
                 downloaded.append(path)
     return downloaded
+
+
+def download_timed_subtitles(video_ids: list[str], output_dir: Path) -> tuple[list[Path], list[str]]:
+    """Download Russian YouTube subtitles only; never download media audio."""
+    if not video_ids:
+        return [], []
+    output_dir.mkdir(parents=True, exist_ok=True)
+    downloaded: list[Path] = []
+    unavailable: list[str] = []
+    for video_id in video_ids:
+        before = {path.resolve() for path in iter_subtitle_files(output_dir)}
+        command = [
+            sys.executable,
+            "-m",
+            "yt_dlp",
+            "--skip-download",
+            "--write-subs",
+            "--write-auto-subs",
+            "--sub-langs",
+            "ru",
+            "--sub-format",
+            "vtt",
+            "--no-overwrites",
+            "-o",
+            str(output_dir / "%(id)s.%(ext)s"),
+            youtube_watch_url(video_id),
+        ]
+        try:
+            subprocess.run(command, check=True)
+        except subprocess.CalledProcessError:
+            unavailable.append(video_id)
+            continue
+        new_paths = [path.resolve() for path in iter_subtitle_files(output_dir) if path.resolve() not in before]
+        if new_paths:
+            downloaded.extend(new_paths)
+        else:
+            unavailable.append(video_id)
+    return downloaded, unavailable
 
 
 def write_latest_replay_batch(log_dir: Path, run_dirs: list[Path]) -> Path | None:
@@ -1068,9 +1465,25 @@ def replay_case_audio_position(case: dict, cases_path: Path) -> tuple[str, str, 
     )
 
 
+def replay_case_identity(case: dict) -> tuple[str, tuple[str, ...]]:
+    """Return the displayed reference together with list contents when present.
+
+    All reading-list slides share the title ``Ссылки для чтения``.  The title
+    alone therefore cannot identify a duplicated replay trigger.
+    """
+    payload = case.get("payload") if isinstance(case.get("payload"), dict) else {}
+    references = payload.get("reference_list") if isinstance(payload.get("reference_list"), list) else []
+    listed_refs = tuple(
+        str(item.get("ref") or "").strip()
+        for item in references
+        if isinstance(item, dict) and str(item.get("ref") or "").strip()
+    )
+    return str(case.get("ref") or "").strip(), listed_refs
+
+
 def exclude_replay_overlap_duplicates(run_dirs: list[Path]) -> int:
     """Exclude only triggers duplicated by overlapping WAV parts of one window."""
-    seen: list[tuple[str, str, str, float, float, float]] = []
+    seen: list[tuple[str, str, tuple[str, tuple[str, ...]], float, float, float]] = []
     excluded = 0
     for run_dir in run_dirs:
         cases_path = run_dir / "trigger_cases.jsonl"
@@ -1079,19 +1492,19 @@ def exclude_replay_overlap_duplicates(run_dirs: list[Path]) -> int:
         for case in cases:
             if not is_unreviewed_case(case):
                 continue
-            ref = str(case.get("ref") or "").strip()
+            identity = replay_case_identity(case)
             position = replay_case_audio_position(case, cases_path)
-            if not ref or position is None:
+            if not identity[0] or position is None:
                 continue
             video, window, start, end, first_word_at = position
             duplicate = False
-            for prior_video, prior_window, prior_ref, prior_start, prior_end, prior_first_word_at in seen:
+            for prior_video, prior_window, prior_identity, prior_start, prior_end, prior_first_word_at in seen:
                 overlap_start = max(start, prior_start)
                 overlap_end = min(end, prior_end)
                 if (
                     video == prior_video
                     and window == prior_window
-                    and ref == prior_ref
+                    and identity == prior_identity
                     and overlap_start <= overlap_end
                     and overlap_start <= first_word_at <= overlap_end
                     and overlap_start <= prior_first_word_at <= overlap_end
@@ -1105,7 +1518,7 @@ def exclude_replay_overlap_duplicates(run_dirs: list[Path]) -> int:
                 changed = True
                 excluded += 1
                 continue
-            seen.append((video, window, ref, start, end, first_word_at))
+            seen.append((video, window, identity, start, end, first_word_at))
         if changed:
             save_jsonl(cases_path, cases)
     return excluded
@@ -1113,7 +1526,10 @@ def exclude_replay_overlap_duplicates(run_dirs: list[Path]) -> int:
 
 def citation_detection_label(case: dict) -> str:
     payload = case.get("payload") if isinstance(case.get("payload"), dict) else {}
-    return "по тексту" if payload.get("source") == "text_citation" else "по адресу"
+    source = str(payload.get("source") or "")
+    return "по тексту" if source in {
+        "text_citation", "replay_inferred_sequential_text_reading",
+    } else "по адресу"
 
 
 def citation_summary_lines(
@@ -1526,11 +1942,16 @@ def replay_audio_file(
         if text_searcher is not None
         else None
     )
-    replay_state: dict[str, dict | None] = {
+    replay_state: dict[str, object] = {
         "long_passage": None,
         "smart_slide_shadow": None,
+        "sequential_text_reading": None,
     }
+    reading_list: list[dict] = []
     context_restored = restore_replay_session_context(pipeline, replay_state, session_state)
+    manual_smart_slide = getattr(args, "_smart_slide_context", None)
+    if isinstance(manual_smart_slide, dict):
+        replay_state["smart_slide_shadow"] = copy.deepcopy(manual_smart_slide)
     if args.asr_engine == "sherpa-0.54":
         recognizer = SherpaReplayRecognizer(model, args.samplerate)
     else:
@@ -1568,17 +1989,29 @@ def replay_audio_file(
             "chunk_bytes": args.chunk_bytes,
             "open_vocabulary": args.open_vocabulary,
             "citation_detection_mode": args.citation_detection_mode,
+            "text_operator_hints": bool(args.text_operator_hints),
             "long_range_slide_mode": args.long_range_slide_mode,
             "text_detection_db": str(args.text_detection_db) if text_searcher is not None else None,
             "vosk_buffer_parts": args.vosk_buffer_parts,
             "audio": "audio.wav" if audio_path else "",
             "grammar": None if grammar is None else grammar_diagnostics(grammar),
             "continued_window_context": context_restored,
+            "smart_slide_passage": str(getattr(args, "smart_slide_passage", "") or ""),
         }
     )
+    if isinstance(manual_smart_slide, dict):
+        logger.write(
+            "REPLAY_SMART_SLIDE_CONTEXT_SELECTED",
+            {
+                "passage": str(manual_smart_slide.get("ref") or ""),
+                "slide_mode": str(manual_smart_slide.get("slide_mode") or ""),
+                "source": "manual_argument",
+            },
+        )
 
     audio_bytes_seen = 0
     trigger_case_count = 0
+    last_sherpa_partial = ""
     try:
         for data in pcm_chunks(path, args.samplerate, args.chunk_bytes):
             if audio_log:
@@ -1587,6 +2020,16 @@ def replay_audio_file(
             replay_seconds = audio_bytes_seen / float(args.samplerate * 2)
             if args.asr_engine == "sherpa-0.54":
                 results = recognizer.accept_waveform(data, replay_seconds)
+                partial = "" if results else recognizer.partial_result()
+                if partial and partial != last_sherpa_partial:
+                    handle_replay_smart_slide_partial(
+                        partial,
+                        replay_seconds,
+                        text_detector,
+                        replay_state,
+                        logger,
+                    )
+                last_sherpa_partial = partial
             elif recognizer.AcceptWaveform(data):
                 results = [json.loads(recognizer.Result())]
             else:
@@ -1602,6 +2045,7 @@ def replay_audio_file(
                     args=args,
                     text_detector=text_detector,
                     replay_state=replay_state,
+                    reading_list=reading_list,
                 )
 
         replay_seconds = audio_bytes_seen / float(args.samplerate * 2)
@@ -1622,6 +2066,7 @@ def replay_audio_file(
                 args=args,
                 text_detector=text_detector,
                 replay_state=replay_state,
+                reading_list=reading_list,
             )
     finally:
         if audio_log:
@@ -1646,7 +2091,8 @@ def handle_result(
     trigger_case_count: int,
     args: argparse.Namespace,
     text_detector: ScriptureTextDetector | None,
-    replay_state: dict[str, dict | None],
+    replay_state: dict[str, object],
+    reading_list: list[dict],
 ) -> int:
     text = str(result.get("text") or "").strip()
     logger.write("final_raw", {"result": result, "text": text, "replay_seconds": replay_seconds})
@@ -1717,6 +2163,11 @@ def handle_result(
                 replay_state["incomplete_reference"] = None
 
     if long_passage is not None:
+        extend_open_ended_replay_passage(
+            long_passage,
+            replay_state.get("smart_slide_shadow"),
+            text_decision,
+        )
         range_action = replay_long_passage_match(text_decision, long_passage)
         logger.write(
             "REPLAY_LONG_PASSAGE",
@@ -1735,6 +2186,28 @@ def handle_result(
         payload = text_citation_payload(text_decision, text)
     else:
         payload = add_slide_payload(pipeline_payload)
+    accumulate_reading_list(payload, reading_list)
+
+    if (
+        long_passage is None
+        and args.text_operator_hints
+        and text_decision is not None
+    ):
+        operator_hint_payload = text_operator_hint_payload(text_decision, text)
+        if operator_hint_payload is not None:
+            hint_slide = operator_hint_payload["slide"]
+            logger.write(
+                "TEXT_OPERATOR_HINT",
+                {
+                    "reference": hint_slide.get("ref"),
+                    "score": hint_slide.get("score"),
+                    "margin": round(text_decision.margin, 3),
+                    "matched_words": text_decision.matched_words,
+                    "window": text_decision.window_text,
+                    "replay_seconds": replay_seconds,
+                },
+            )
+            payload = operator_hint_payload
 
     smart_slide_shadow = replay_state.get("smart_slide_shadow")
     if (
@@ -1742,14 +2215,14 @@ def handle_result(
         and text_detector is not None
         and text_decision is not None
     ):
-        sequence_decision = text_detector.evaluate_known_sequence(
-            smart_slide_shadow,
-            replay_seconds,
-        )
-        shadow_decision = replay_smart_slide_decision(
+        shadow_decision, sequence_decision = decide_sequence_progress_from_text(
             smart_slide_shadow,
             text_decision,
-            sequence_decision,
+            lambda state: text_detector.evaluate_known_sequence(state, replay_seconds),
+        )
+        shadow_decision = defer_open_ended_replay_completion(
+            smart_slide_shadow,
+            shadow_decision,
         )
         logger.write(
             "SMART_SLIDE_SHADOW",
@@ -1768,23 +2241,69 @@ def handle_result(
         if not apply_replay_smart_slide_decision(smart_slide_shadow, shadow_decision):
             replay_state["smart_slide_shadow"] = None
 
+    inferred_chapter_reading = infer_replay_chapter_reading(payload)
+    if inferred_chapter_reading is not None:
+        payload = inferred_chapter_reading
+    inferred_sequential_reading = None
+    if long_passage is None and inferred_chapter_reading is None:
+        inferred_sequential_reading = infer_replay_sequential_text_reading(
+            payload, replay_state, replay_seconds
+        )
+        if inferred_sequential_reading is not None:
+            payload = inferred_sequential_reading
     accepted_passage = replay_long_passage(payload)
     if (
         text_detector is not None
         and accepted_passage is not None
-        and pipeline_payload.get("matched")
+        and (
+            pipeline_payload.get("matched")
+            or bool((payload.get("text_citation") or {}).get("announced_range_expanded"))
+            or inferred_sequential_reading is not None
+        )
     ):
         if pipeline.set_context_range(payload.get("slide")):
+            if inferred_sequential_reading is not None:
+                accepted_passage["open_ended"] = True
             replay_state["long_passage"] = accepted_passage
             replay_state["smart_slide_shadow"] = replay_smart_slide_state(
                 payload,
                 args.long_range_slide_mode,
             )
+            if inferred_sequential_reading is not None:
+                smart_slide_shadow = replay_state.get("smart_slide_shadow")
+                if isinstance(smart_slide_shadow, dict):
+                    smart_slide_shadow["open_ended"] = True
+                    targets = smart_slide_shadow.get("targets")
+                    if isinstance(targets, list) and targets:
+                        # Earlier text has already established the current
+                        # verse.  Start there, rather than flashing a title or
+                        # replaying verses the congregation just heard.
+                        smart_slide_shadow["current_index"] = len(targets) - 1
+                        smart_slide_shadow["current_slide_visible"] = True
             logger.write(
                 "REPLAY_CONTEXT_RANGE_SELECTED",
                 {"passage": accepted_passage, "replay_seconds": replay_seconds},
             )
-    output = {"replay": {"enabled": True, "sent": bool(payload.get("slide"))}}
+            if inferred_chapter_reading is not None:
+                logger.write(
+                    "REPLAY_INFERRED_CHAPTER_READING_SELECTED",
+                    {"passage": accepted_passage, "replay_seconds": replay_seconds},
+                )
+            if inferred_sequential_reading is not None:
+                logger.write(
+                    "REPLAY_INFERRED_SEQUENTIAL_TEXT_READING_SELECTED",
+                    {"passage": accepted_passage, "replay_seconds": replay_seconds},
+                )
+    replay_operator_hint = (
+        str((payload.get("slide") or {}).get("source") or "") == "text_operator_hint"
+    )
+    output = {
+        "replay": {
+            "enabled": True,
+            "sent": bool(payload.get("slide")) and not replay_operator_hint,
+            "operator_hint": replay_operator_hint,
+        }
+    }
     payload["output"] = output
     logger.write(
         "parsed",
@@ -1885,9 +2404,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run", action="store_true", help="Actually run replay. Without this, only list files.")
     parser.add_argument("--download-url", action="append", default=[], help="YouTube URL to download before replay.")
     parser.add_argument(
+        "--cookies-from-browser",
+        help="Use cookies from a named browser profile only for this download, e.g. chrome.",
+    )
+    parser.add_argument(
         "--download-from-subtitles",
         action="store_true",
         help="Find YouTube IDs in .srt/.txt files and download missing audio before replay.",
+    )
+    parser.add_argument(
+        "--download-subtitles",
+        action="store_true",
+        help="Download only missing Russian YouTube VTT subtitles for local audio; requires --run.",
+    )
+    parser.add_argument(
+        "--subtitle-download-dir",
+        type=Path,
+        default=Path(".cache") / "liverse" / "replay_subtitles",
+        help="Where --download-subtitles stores downloaded VTT files.",
     )
     parser.add_argument(
         "--include-processed",
@@ -1931,6 +2465,18 @@ def parse_args() -> argparse.Namespace:
         default="compact",
         help="Slide layout whose automatic transitions SMART_SLIDE_SHADOW evaluates.",
     )
+    parser.add_argument(
+        "--text-operator-hints",
+        action="store_true",
+        help="Record web-operator proposals for useful weak text matches; never send them as slides.",
+    )
+    parser.add_argument(
+        "--smart-slide-passage",
+        help=(
+            "Replay-only Bible range for SMART_SLIDE_SHADOW when its spoken announcement "
+            "is outside the WAV, for example 'Колоссянам 3:5-7'."
+        ),
+    )
     parser.add_argument("--vosk-buffer-parts", type=int, default=3)
     parser.add_argument("--vosk-log-level", type=int, default=-1)
     parser.add_argument("--show-candidates", action="store_true")
@@ -1952,11 +2498,22 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.smart_slide_passage:
+        try:
+            args._smart_slide_context = manual_smart_slide_state(
+                args.smart_slide_passage,
+                bible_path=args.bible,
+                slide_mode=args.long_range_slide_mode,
+            )
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
     if args.results_only:
         print_latest_citation_summary(args.log_dir, bible_path=args.bible)
         return 0
     search_roots = args.search_root or list(DEFAULT_SEARCH_ROOTS)
     subtitle_roots = args.subtitle_root or list(DEFAULT_SUBTITLE_ROOTS)
+    if args.subtitle_download_dir not in subtitle_roots:
+        subtitle_roots = [*subtitle_roots, args.subtitle_download_dir]
     if args.inventory:
         print_replay_inventory(
             search_roots,
@@ -1964,6 +2521,33 @@ def main() -> int:
             args.download_dir,
             include_chunks=args.include_chunks,
         )
+        return 0
+    if args.download_subtitles:
+        if args.audio:
+            audio_sources = {}
+            for path in args.audio:
+                for video_id in youtube_ids_from_path(path):
+                    audio_sources.setdefault(video_id, path)
+        else:
+            audio_sources = collect_audio_youtube_sources(
+                search_roots,
+                args.download_dir,
+                args.include_chunks,
+            )
+        subtitle_sources = collect_timed_subtitle_youtube_ids(subtitle_roots)
+        missing_ids = sorted(set(audio_sources) - set(subtitle_sources))
+        print(f"Аудиозаписей без субтитров с таймкодами: {len(missing_ids)}", flush=True)
+        for video_id in missing_ids:
+            print(f"  {video_id}  {youtube_watch_url(video_id)}", flush=True)
+        if not args.run:
+            print("Это только список. Для докачки одних субтитров добавьте --run.", flush=True)
+            return 0
+        downloaded, unavailable = download_timed_subtitles(missing_ids, args.subtitle_download_dir)
+        print(f"Скачано VTT-файлов: {len(downloaded)}", flush=True)
+        if unavailable:
+            print("Не найдены или не скачаны русские субтитры:", flush=True)
+            for video_id in unavailable:
+                print(f"  {video_id}", flush=True)
         return 0
     if args.plan_subtitle_windows:
         audio_paths = list(args.audio or [])
@@ -2047,7 +2631,7 @@ def main() -> int:
         if args.run:
             download_video_ids = list(missing_ids)
             download_urls.extend(youtube_watch_url(video_id) for video_id in missing_ids)
-    downloaded = download_audio(download_urls, args.download_dir)
+    downloaded = download_audio(download_urls, args.download_dir, args.cookies_from_browser)
     if args.download_from_subtitles and args.run and download_video_ids:
         downloaded = collect_audio_files_by_youtube_ids(args.download_dir, download_video_ids)
     explicit_audio = [*planned_audio, *(args.audio or [])]

@@ -231,6 +231,11 @@ class SherpaReplayRecognizer:
         self.time_offset = replay_seconds
         return [result] if result["text"] else []
 
+    def partial_result(self) -> str:
+        """Return the current non-final text without resetting the stream."""
+        raw_result = self.recognizer.get_result_all(self.stream)
+        return str(getattr(raw_result, "text", "") or "").strip()
+
     def final_results(self) -> list[dict]:
         import numpy as np
 
