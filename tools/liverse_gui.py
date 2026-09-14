@@ -409,6 +409,7 @@ def engine_command(
     python_executable: str | None = None,
     application_executable: Path | None = None,
     frozen: bool | None = None,
+    popup_anchor: tuple[int, int] | None = None,
 ) -> list[str]:
     selected_frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
     if selected_frozen:
@@ -449,6 +450,9 @@ def engine_command(
         command.append("--require-approval")
     if config.audio_device_name:
         command.extend(("--device-name", config.audio_device_name))
+    if popup_anchor is not None:
+        command.extend(("--popup-anchor-x", str(popup_anchor[0])))
+        command.extend(("--popup-anchor-y", str(popup_anchor[1])))
     # The GUI owns the QR window so an external image viewer cannot enlarge it.
     command.append("--no-open-operator-qr")
     return command
@@ -1125,7 +1129,12 @@ class LiVerseGui:
             self.show_window()
             return
 
-        command = engine_command(self.config)
+        self.root.update_idletasks()
+        popup_anchor = (
+            int(self.root.winfo_rootx() + max(1, self.root.winfo_width()) // 2),
+            int(self.root.winfo_rooty() + max(1, self.root.winfo_height()) // 2),
+        )
+        command = engine_command(self.config, popup_anchor=popup_anchor)
         try:
             engine_stop_path().unlink()
         except FileNotFoundError:

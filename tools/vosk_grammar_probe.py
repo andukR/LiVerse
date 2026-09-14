@@ -27,6 +27,7 @@ _POPUP_APPROVAL_LOCK = threading.Lock()
 _POPUP_APPROVAL_REVISION = 0
 _POPUP_TK_ROOT = None
 _POPUP_TK_THREAD_ID: int | None = None
+_POPUP_MONITOR_ANCHOR: tuple[int, int] | None = None
 
 
 class GracefulStopRequested(Exception):
@@ -839,8 +840,17 @@ def xrandr_monitor_bounds(output: str, pointer_x: int, pointer_y: int) -> tuple[
 
 
 def tk_monitor_bounds(root) -> tuple[int, int, int, int]:
-    pointer_x = int(root.winfo_pointerx())
-    pointer_y = int(root.winfo_pointery())
+    # The public presentation may be on a second monitor. Never use the
+    # mouse location for an approval popup: the operator can move the pointer
+    # there while following the presentation. The GUI supplies its own centre
+    # point when it starts the engine.
+    if _POPUP_MONITOR_ANCHOR is not None:
+        point_x, point_y = _POPUP_MONITOR_ANCHOR
+    else:
+        # A direct command-line launch has no GUI window to anchor to. Use an
+        # off-desktop point so the platform chooses its primary (operator)
+        # monitor, rather than following the public-screen mouse pointer.
+        point_x = point_y = -1_000_000
     if sys.platform == "win32":
         try:
             import ctypes
@@ -861,7 +871,7 @@ def tk_monitor_bounds(root) -> tuple[int, int, int, int]:
             get_monitor_info.argtypes = [ctypes.c_void_p, ctypes.POINTER(MonitorInfo)]
             get_monitor_info.restype = wintypes.BOOL
             monitor = monitor_from_point(
-                wintypes.POINT(pointer_x, pointer_y),
+                wintypes.POINT(point_x, point_y),
                 1,
             )
             info = MonitorInfo(cbSize=ctypes.sizeof(MonitorInfo))
@@ -880,7 +890,7 @@ def tk_monitor_bounds(root) -> tuple[int, int, int, int]:
                 stderr=subprocess.DEVNULL,
                 timeout=1.0,
             )
-            bounds = xrandr_monitor_bounds(result.stdout, pointer_x, pointer_y)
+            bounds = xrandr_monitor_bounds(result.stdout, point_x, point_y)
             if bounds is not None:
                 return bounds
         except (OSError, subprocess.SubprocessError):
@@ -913,7 +923,7 @@ def approval_popup_dimensions(
     return width, min(max(1, requested_height), max_height)
 
 
-def popup_tk_window(tk, title: str):
+def popup_tk_window(tk, title: str, *, show: bool = True):
     """Reuse the engine's one visible Tk popup window.
 
     Tk must be created and destroyed by the same thread.  In particular, do
@@ -958,7 +968,10 @@ def popup_tk_window(tk, title: str):
     ):
         root.unbind(sequence)
     root.title(title)
-    root.deiconify()
+    if show:
+        root.deiconify()
+    else:
+        root.withdraw()
     return root
 
 
@@ -1890,7 +1903,7 @@ def popup_approval_decision(slide: dict) -> str:
 
     decision = {"action": "skip"}
     approval_revision = popup_approval_revision()
-    root = popup_tk_window(tk, "LiVerse")
+    root = popup_tk_window(tk, "LiVerse", show=False)
     root.attributes("-topmost", True)
     root.configure(bg="#101820")
     root.resizable(True, True)
@@ -1898,7 +1911,7 @@ def popup_approval_decision(slide: dict) -> str:
     alternatives = [item for item in slide.get("alternatives") or [] if isinstance(item, dict)]
     has_context_button = bool(slide.get("can_set_context"))
     is_sermon_plan = slide.get("source") == "sermon_plan"
-    wrong_reference_key = "Tab" if os.name == "nt" else "W"
+    wrong_reference_key = "Backspace/Delete"
     screen_width = int(root.winfo_screenwidth())
     screen_height = int(root.winfo_screenheight())
     width = min(760, max(520, screen_width - 80))
@@ -2089,11 +2102,8 @@ def popup_approval_decision(slide: dict) -> str:
         bind_popup_key(str(index), f"alternative:{index - 1}")
     if not is_sermon_plan:
         bind_popup_key("<space>", "not_citation")
-        if os.name == "nt":
-            bind_popup_key("<Tab>", "wrong_reference")
-        else:
-            bind_popup_key("w", "wrong_reference")
-            bind_popup_key("W", "wrong_reference")
+        bind_popup_key("<BackSpace>", "wrong_reference")
+        bind_popup_key("<Delete>", "wrong_reference")
     bind_popup_key("<Escape>", "skip")
     root.protocol("WM_DELETE_WINDOW", lambda: close("skip"))
 
@@ -2123,6 +2133,10 @@ def popup_approval_decision(slide: dict) -> str:
         approve.focus_set()
         approve.focus_force()
 
+    # Do not expose a reused window at its old coordinates. It becomes
+    # visible only after the operator-monitor geometry and keyboard bindings
+    # are complete.
+    root.deiconify()
     close_if_superseded_job = root.after(100, close_if_superseded)
     root.after_idle(claim_keyboard_focus)
     root.after(100, claim_keyboard_focus)
@@ -3775,6 +3789,16 @@ def main() -> int:
         default="web",
         help="Approval UI for --require-approval. Use popup for a local keyboard-driven window.",
     )
+    parser.add_argument(
+        "--popup-anchor-x",
+        type=int,
+        help="Operator-window horizontal anchor for local approval popups.",
+    )
+    parser.add_argument(
+        "--popup-anchor-y",
+        type=int,
+        help="Operator-window vertical anchor for local approval popups.",
+    )
     parser.add_argument("--start-slide-server", action="store_true", help="Start local web slide/operator server.")
     parser.add_argument("--slide-host", default="0.0.0.0", help="Web slide server host.")
     parser.add_argument("--slide-port", type=int, default=8765, help="Web slide server port.")
@@ -3844,6 +3868,14 @@ def main() -> int:
     )
     parser.set_defaults(session_summary_popup=True, log_audio=True)
     args = parser.parse_args()
+    if (args.popup_anchor_x is None) != (args.popup_anchor_y is None):
+        parser.error("--popup-anchor-x and --popup-anchor-y must be used together")
+    global _POPUP_MONITOR_ANCHOR
+    _POPUP_MONITOR_ANCHOR = (
+        (args.popup_anchor_x, args.popup_anchor_y)
+        if args.popup_anchor_x is not None
+        else None
+    )
     if args.installer_test_hold:
         print("LiVerse installer test process is running.", flush=True)
         while True:

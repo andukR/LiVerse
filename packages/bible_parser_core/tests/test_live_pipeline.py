@@ -65,6 +65,7 @@ class LiveReferencePipelineTest(unittest.TestCase):
             config,
             project_root=Path("C:/LiVerse"),
             python_executable="pythonw.exe",
+            popup_anchor=(640, 360),
         )
 
         self.assertEqual("pythonw.exe", command[0])
@@ -78,6 +79,8 @@ class LiveReferencePipelineTest(unittest.TestCase):
         )
         self.assertIn("--long-range-operator-hints", command)
         self.assertIn("--text-operator-hints", command)
+        self.assertEqual("640", command[command.index("--popup-anchor-x") + 1])
+        self.assertEqual("360", command[command.index("--popup-anchor-y") + 1])
         self.assertNotIn("secret-token", command)
 
     def test_packaged_gui_engine_command_uses_sibling_executable(self):
@@ -215,6 +218,45 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertEqual(2, fake_tk.root.deiconify_calls)
         self.assertIn("<Tab>", fake_tk.root.unbound)
         self.assertEqual(1, fake_tk.root.destroy_calls)
+
+    def test_approval_popup_stays_hidden_until_its_geometry_is_ready(self):
+        import tools.vosk_grammar_probe as probe
+
+        class FakeRoot:
+            def __init__(self):
+                self.withdraw_calls = 0
+                self.deiconify_calls = 0
+
+            def withdraw(self):
+                self.withdraw_calls += 1
+
+            def deiconify(self):
+                self.deiconify_calls += 1
+
+            def winfo_children(self):
+                return []
+
+            def unbind(self, _sequence):
+                return None
+
+            def title(self, _value):
+                return None
+
+        class FakeTk:
+            def __init__(self):
+                self.root = FakeRoot()
+
+            def Tk(self):
+                return self.root
+
+        fake_tk = FakeTk()
+        with patch.object(probe, "_POPUP_TK_ROOT", None), patch.object(
+            probe, "_POPUP_TK_THREAD_ID", None
+        ), patch("tools.vosk_grammar_probe.threading.get_ident", return_value=17):
+            probe.popup_tk_window(fake_tk, "LiVerse", show=False)
+
+        self.assertEqual(0, fake_tk.root.deiconify_calls)
+        self.assertEqual(2, fake_tk.root.withdraw_calls)
 
     def test_log_archive_contains_only_selected_diagnostic_files(self):
         from tools.liverse_gui import create_log_archive, list_log_sessions
@@ -861,6 +903,10 @@ class LiveReferencePipelineTest(unittest.TestCase):
 """
         self.assertEqual((0, 0, 1920, 1080), xrandr_monitor_bounds(monitor_list, 500, 400))
         self.assertEqual((1920, 0, 1920, 1080), xrandr_monitor_bounds(monitor_list, 2500, 400))
+        self.assertEqual(
+            (0, 0, 1920, 1080),
+            xrandr_monitor_bounds(monitor_list, -1_000_000, -1_000_000),
+        )
 
         geometries: list[str] = []
         root = SimpleNamespace(geometry=geometries.append)
