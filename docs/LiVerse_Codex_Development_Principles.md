@@ -466,4 +466,5 @@ Pipeline должен автоматически:
 [ ] installer clean-install test OK
 [ ] installer upgrade test OK
 [ ] release SHA-256 generated
+[ ] docs/RELEASE_NOTES_<version>.md создан: изменения, новые внешние разрешения (включая Holyrics API) и порядок проверки на целевом компьютере
 ```

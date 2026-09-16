@@ -7,6 +7,7 @@ const decisionText = document.querySelector("#decisionText");
 const decisionReason = document.querySelector("#decisionReason");
 const speechText = document.querySelector("#speechText");
 const note = document.querySelector("#note");
+const noteScope = document.querySelector("#noteScope");
 const statusText = document.querySelector("#statusText");
 const timeText = document.querySelector("#timeText");
 const audioProgress = document.querySelector("#audioProgress");
@@ -14,6 +15,9 @@ const startReplay = document.querySelector("#startReplay");
 const continueReplay = document.querySelector("#continueReplay");
 const rewindReplay = document.querySelector("#rewindReplay");
 const restartReplay = document.querySelector("#restartReplay");
+const previousPart = document.querySelector("#previousPart");
+const nextPart = document.querySelector("#nextPart");
+const partText = document.querySelector("#partText");
 const stopError = document.querySelector("#stopError");
 const errorPanel = document.querySelector("#errorPanel");
 const incidentReport = document.querySelector("#incidentReport");
@@ -22,6 +26,7 @@ let timeline = null;
 let trackIndex = 0;
 let decisionIndex = 0;
 let displayIndex = 0;
+let speechIndex = 0;
 let currentError = null;
 let currentIncidentId = null;
 let bannerTimer = null;
@@ -52,6 +57,12 @@ function showSlide(element, passage, emptyText = "Текст слайда отс
 
 function currentTrack() {
   return timeline?.tracks?.[trackIndex] || null;
+}
+
+function partLabel() {
+  const first = timeline.sequence_start_number ?? timeline.sequence_number;
+  const last = timeline.sequence_end_number ?? timeline.sequence_number;
+  return first === last ? `${first}/${timeline.sequence_total}` : `${first}–${last}/${timeline.sequence_total}`;
 }
 
 function showBanner(text, hold = false) {
@@ -105,6 +116,7 @@ function resetTrack(index) {
   trackIndex = index;
   decisionIndex = 0;
   displayIndex = 0;
+  speechIndex = 0;
   const track = currentTrack();
   if (!track) return;
   showNeutralSlide();
@@ -114,6 +126,9 @@ function resetTrack(index) {
   startReplay.disabled = !track.audio_available;
   rewindReplay.disabled = !track.audio_available;
   restartReplay.disabled = !track.audio_available;
+  previousPart.disabled = (timeline.sequence_start_number ?? timeline.sequence_number) <= 1;
+  nextPart.disabled = (timeline.sequence_end_number ?? timeline.sequence_number) >= timeline.sequence_total;
+  partText.textContent = `Часть ${partLabel()}`;
   stopError.disabled = true;
 }
 
@@ -124,10 +139,15 @@ function processUntil(seconds) {
   while (true) {
     const decision = track.decisions[decisionIndex];
     const display = displays[displayIndex];
+    const speech = (track.speech_updates || [])[speechIndex];
     const decisionTime = decision ? Number(decision.replay_seconds || 0) : Infinity;
     const displayTime = display ? Number(display.replay_seconds || 0) : Infinity;
-    if (Math.min(decisionTime, displayTime) > seconds) break;
-    if (decisionTime <= displayTime) {
+    const speechTime = speech ? Number(speech.replay_seconds || 0) : Infinity;
+    if (Math.min(decisionTime, displayTime, speechTime) > seconds) break;
+    if (speechTime <= decisionTime && speechTime <= displayTime) {
+      speechText.textContent = speech.text;
+      speechIndex += 1;
+    } else if (decisionTime <= displayTime) {
       applyDecision(decision);
       decisionIndex += 1;
     } else {
@@ -173,15 +193,34 @@ function setTimeline(nextTimeline) {
   observedEventIds.clear();
   currentError = null;
   currentIncidentId = null;
+  note.value = "";
+  noteScope.textContent = "Заметка будет сохранена только для текущей остановки.";
   errorPanel.hidden = true;
   incidentReport.value = "";
   continueReplay.hidden = true;
   startReplay.hidden = false;
-  progressText.textContent = `Диапазон ${timeline.sequence_number}/${timeline.sequence_total}: ${timeline.passage}; неразмечено: ${timeline.remaining}`;
+  progressText.textContent = `Диапазон ${partLabel()}: ${timeline.passage}; неразмечено: ${timeline.remaining}`;
   decisionText.textContent = "УПС ещё не принял решение";
   decisionReason.textContent = "Во время правильной работы ничего нажимать не нужно.";
   speechText.textContent = "—";
   resetTrack(0);
+}
+
+async function selectPart(delta) {
+  if (!timeline || (delta < 0 && (timeline.sequence_start_number ?? timeline.sequence_number) <= 1) || (delta > 0 && (timeline.sequence_end_number ?? timeline.sequence_number) >= timeline.sequence_total)) return;
+  audio.pause();
+  stopPlaybackClock();
+  previousPart.disabled = true;
+  nextPart.disabled = true;
+  statusText.textContent = "Переключаю часть…";
+  try {
+    const result = await request("/api/sequence", { delta });
+    setTimeline(result.timeline);
+    statusText.textContent = `Выбрана часть ${partLabel()}. Нажмите «Запустить эмуляцию».`;
+  } catch (error) {
+    statusText.textContent = `Не удалось переключить часть: ${error.message}`;
+    resetTrack(trackIndex);
+  }
 }
 
 async function request(path, payload) {
@@ -200,6 +239,12 @@ async function loadTimeline() {
 }
 
 async function playCurrentTrack() {
+  if (currentIncidentId) {
+    note.value = "";
+    currentIncidentId = null;
+    currentError = null;
+    noteScope.textContent = "Предыдущее наблюдение сохранено; для новой остановки заметка очищена.";
+  }
   startReplay.hidden = true;
   continueReplay.hidden = true;
   errorPanel.hidden = true;
@@ -247,6 +292,8 @@ audio.addEventListener("ended", async () => {
 
 startReplay.addEventListener("click", playCurrentTrack);
 continueReplay.addEventListener("click", playCurrentTrack);
+previousPart.addEventListener("click", () => selectPart(-1));
+nextPart.addEventListener("click", () => selectPart(1));
 rewindReplay.addEventListener("click", async () => {
   if (!currentTrack()?.audio_available) return;
   audio.pause();
@@ -283,6 +330,9 @@ stopError.addEventListener("click", async () => {
       note: note.value.trim(),
     });
     currentIncidentId = incident.incident_id || null;
+    noteScope.textContent = currentIncidentId
+      ? `Заметка относится к остановке ${currentIncidentId}. При продолжении она будет очищена.`
+      : "Заметка относится к текущей остановке.";
     incidentReport.value = incident.report || "";
     errorPanel.hidden = false;
     continueReplay.hidden = false;

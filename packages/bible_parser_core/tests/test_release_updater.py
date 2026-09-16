@@ -225,7 +225,8 @@ class ReleaseUpdaterTest(unittest.TestCase):
                 launch_windows_release_installer(installer)
 
         popen.assert_called_once_with(
-            [str(installer)], cwd=str(installer.parent), close_fds=True
+            [str(installer), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"],
+            cwd=str(installer.parent), close_fds=True
         )
 
 

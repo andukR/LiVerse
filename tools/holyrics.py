@@ -27,6 +27,8 @@ DEFAULT_CROSS_CHAPTER_SLIDE_MAX_CHARS = 760
 DEFAULT_CROSS_CHAPTER_SLIDE_MAX_VERSES = 9
 DEFAULT_LONG_RANGE_SLIDE_MAX_CHARS = 620
 DEFAULT_LONG_RANGE_SLIDE_MAX_VERSES = 7
+# Keep the live Holyrics threshold unchanged.  The browser review timeline has
+# its own slightly wider rule for four-verse announcements.
 DEFAULT_LONG_RANGE_MIN_VERSES = 5
 MIN_RECOMMENDED_HOLYRICS_VERSION = "2.28.1"
 HOLYRICS_JSLIB_DOC_URL = "https://github.com/holyrics/jslib/blob/main/README-en.md"

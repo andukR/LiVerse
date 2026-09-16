@@ -63,7 +63,7 @@ class SequenceAdvancerTest(unittest.TestCase):
         self.assertEqual("activate", decision["action"])
         self.assertEqual("assisted_initial_element", decision["reason"])
 
-    def test_heard_end_of_current_verse_waits_for_next_verse(self) -> None:
+    def test_heard_end_of_current_verse_advances_to_next_known_verse(self) -> None:
         decision = decide_sequence_advance(
             self.state,
             self.candidate(7, ending_overlap_words=2),
@@ -74,8 +74,9 @@ class SequenceAdvancerTest(unittest.TestCase):
             matched_words=4,
         )
 
-        self.assertEqual("keep", decision["action"])
-        self.assertEqual("await_next_element_after_boundary", decision["reason"])
+        self.assertEqual("advance", decision["action"])
+        self.assertEqual("strong_current_boundary_auto_next", decision["reason"])
+        self.assertEqual(2, decision["target_index"])
 
     def test_weak_next_verse_is_suggested_only_inside_known_sequence(self) -> None:
         decision = decide_sequence_advance(
@@ -90,6 +91,58 @@ class SequenceAdvancerTest(unittest.TestCase):
 
         self.assertEqual("assisted_synchronize_forward", decision["action"])
         self.assertEqual(2, decision["target_index"])
+        self.assertEqual("required", decision["confirmation_state"])
+
+    def test_weak_tail_cannot_cascade_after_assisted_advance(self) -> None:
+        state = {
+            "book_id": 21,
+            "current_index": 2,
+            "targets": [
+                {"start_chapter": 2, "start_verse": verse, "chapter": 2, "verse": verse}
+                for verse in range(18, 24)
+            ],
+        }
+
+        def eccl(verse: int, *, ending_overlap_words: int = 0):
+            return SimpleNamespace(
+                reference=f"Еккл. 2:{verse}", book_id=21, chapter=2,
+                start_verse=verse, end_verse=verse,
+                ending_overlap_words=ending_overlap_words,
+            )
+
+        first = decide_sequence_advance(
+            state, eccl(20, ending_overlap_words=2), accepted=False,
+            reason="score_below_threshold", score=72.299, margin=54.914,
+            matched_words=7,
+        )
+        self.assertEqual("assisted_advance", first["action"])
+        self.assertEqual(3, first["target_index"])
+        self.assertEqual("required", first["confirmation_state"])
+
+        # Replay's state update after the first decision is represented here.
+        state["current_index"] = first["target_index"]
+        state["await_current_confirmation"] = True
+        weak_tail = decide_sequence_advance(
+            state, eccl(22), accepted=False, reason="score_below_threshold",
+            score=52.152, margin=29.584, matched_words=3,
+        )
+        self.assertEqual("keep", weak_tail["action"])
+        self.assertEqual("await_current_element_confirmation", weak_tail["reason"])
+
+        confirmed_current = decide_sequence_advance(
+            state, eccl(21), accepted=True, reason="immediate_strong_match",
+            score=91.0, margin=40.0, matched_words=5,
+        )
+        self.assertEqual("keep", confirmed_current["action"])
+        self.assertEqual("confirmed", confirmed_current["confirmation_state"])
+
+        # After the current verse is confirmed, normal progression resumes.
+        state.pop("await_current_confirmation")
+        next_verse = decide_sequence_advance(
+            state, eccl(22), accepted=False, reason="score_below_threshold",
+            score=52.152, margin=29.584, matched_words=3,
+        )
+        self.assertEqual("assisted_synchronize_forward", next_verse["action"])
 
     def test_two_words_may_advance_only_with_strong_nearby_evidence(self) -> None:
         accepted = decide_sequence_advance(
@@ -187,7 +240,7 @@ class SequenceAdvancerTest(unittest.TestCase):
         self.assertEqual(2, decision["target_index"])
         self.assertEqual("sequence_scoped", decision["evidence_source"])
 
-    def test_one_window_may_catch_up_through_two_consecutive_verses(self) -> None:
+    def test_one_window_advances_only_one_intermediate_verse(self) -> None:
         decisions = {
             1: SimpleNamespace(
                 accepted=False, reason="score_below_threshold", score=55.0,
@@ -209,11 +262,11 @@ class SequenceAdvancerTest(unittest.TestCase):
             lambda state: decisions[int(state["current_index"])],
         )
 
-        self.assertEqual("synchronize_forward", decision["action"])
-        self.assertEqual("sequential_window_catch_up", decision["reason"])
-        self.assertEqual(3, decision["target_index"])
-        self.assertEqual(2, len(decision["sequence_steps"]))
-        self.assertIs(evidence, decisions[2])
+        self.assertEqual("assisted_synchronize_forward", decision["action"])
+        self.assertEqual("assisted_next_element", decision["reason"])
+        self.assertEqual(2, decision["target_index"])
+        self.assertNotIn("sequence_steps", decision)
+        self.assertIs(evidence, decisions[1])
 
 
 if __name__ == "__main__":

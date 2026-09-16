@@ -11,7 +11,7 @@ from bible_parser_core.live_pipeline import (
     build_grammar,
     should_block_matched_payload,
 )
-from bible_parser_core.parser import normalize_text
+from bible_parser_core.parser import normalize_text, parse_live_reference
 from bible_parser_core.risk_model import load_risk_model, score_payload_with_model
 from tools.holyrics import (
     capture_holyrics_current_appearance,
@@ -1878,6 +1878,135 @@ class LiveReferencePipelineTest(unittest.TestCase):
                 self.assertNotIn("can_set_context", slide)
                 self.assertFalse(action_selects_context("approve_context", slide))
 
+    def test_context_range_resolves_first_n_verses_as_range(self):
+        pipeline = LiveReferencePipeline()
+        self.assertTrue(pipeline.set_context_range({
+            "book": "Ефесянам", "chapter": 5,
+            "start_verse": 1, "end_chapter": 5, "end_verse": 14,
+        }))
+        result = pipeline.process_text(
+            "первые два стиха сегодняшнего отрывка"
+        )
+        self.assertEqual("Ефесянам 5:1-2", result["parsed"]["ref"])
+        self.assertEqual("context_range", result.get("source"))
+
+    def test_context_range_ignores_quantity_phrase_in_two_verses(self):
+        pipeline = LiveReferencePipeline()
+        self.assertTrue(pipeline.set_context_range({
+            "book": "Ефесянам", "chapter": 5,
+            "start_verse": 1, "end_chapter": 5, "end_verse": 14,
+        }))
+        result = pipeline.process_text("в двух стихах")
+        self.assertNotEqual("Ефесянам 5:2", (result.get("parsed") or {}).get("ref"))
+
+    def test_context_range_ignores_quantity_phrase_in_these_six_verses(self):
+        pipeline = LiveReferencePipeline()
+        self.assertTrue(pipeline.set_context_range({
+            "book": "Ефесянам", "chapter": 4,
+            "start_verse": 1, "end_chapter": 4, "end_verse": 6,
+        }))
+        result = pipeline.process_text("в этих шести стихах")
+        self.assertNotEqual("Ефесянам 4:6", (result.get("parsed") or {}).get("ref"))
+
+    def test_ivan_says_ona_is_not_misread_as_jonah(self):
+        pipeline = LiveReferencePipeline()
+        result = pipeline.process_text(
+            "иван говорит она третья глава двадцатый двадцать первый стих"
+        )
+        self.assertEqual("Иоанн 3:20-21", result["parsed"]["ref"])
+
+    def test_restarted_number_before_chapter_uses_number_next_to_chapter(self):
+        pipeline = LiveReferencePipeline()
+        observed = pipeline.process_text(
+            "после того как бог вернулся к людям евангелия от иоанна один из "
+            "первая глава одиннадцати стих пришёл к своим"
+        )
+        conflicting = pipeline.process_text(
+            "евангелие от иоанна два совершенно первая глава одиннадцатый стих"
+        )
+
+        self.assertEqual("Иоанн 1:11", observed.get("parsed", {}).get("ref"))
+        self.assertEqual("Иоанн 1:11", conflicting.get("parsed", {}).get("ref"))
+
+    def test_ordinary_chapter_and_numbered_epistle_references_are_unchanged(self):
+        chapter_ref = LiveReferencePipeline().process_text(
+            "евангелие от иоанна первая глава одиннадцатый стих"
+        )
+        epistle_ref = LiveReferencePipeline().process_text(
+            "второе послание коринфянам четвёртая глава пятый стих"
+        )
+
+        self.assertEqual("Иоанн 1:11", chapter_ref.get("parsed", {}).get("ref"))
+        self.assertEqual("2 Коринфянам 4:5", epistle_ref.get("parsed", {}).get("ref"))
+
+    def test_ephesians_ovsyana_alias(self):
+        pipeline = LiveReferencePipeline()
+        result = pipeline.process_text(
+            "послание и овсяна в там третья глава шестнадцатый семнадцатый стих"
+        )
+        self.assertEqual("Ефесянам 3:16-17", result["parsed"]["ref"])
+
+    def test_second_timothy_nominative_form_preserves_chapter_three(self):
+        pipeline = LiveReferencePipeline()
+        result = pipeline.process_text("второй тимофей три двенадцать")
+        self.assertEqual("2 Тимофею 3:12", result["parsed"]["ref"])
+
+    def test_corinthians_replay_aliases(self):
+        pipeline = LiveReferencePipeline()
+        result = pipeline.process_text(
+            "название коррейфеном второе послание карете на "
+            "четвёртая глава с тринадцатого по восемнадцатый стих"
+        )
+        self.assertEqual("2 Коринфянам 4:13-18", result["parsed"]["ref"])
+
+    def test_corinthians_standalone_replay_alias(self):
+        result = LiveReferencePipeline().process_text(
+            "второе послание карете на четвёртая глава с тринадцатого по восемнадцатый стих"
+        )
+        self.assertEqual("2 Коринфянам 4:13-18", result["parsed"]["ref"])
+
+    def test_tenth_verse_as_tensok_range_distortion(self):
+        pipeline = LiveReferencePipeline()
+        result = pipeline.process_text(
+            "послание ефесянам вторая глава с первого по десяток стих"
+        )
+        self.assertEqual("Ефесянам 2:1-10", result["parsed"]["ref"])
+
+    def test_other_masculine_ordinal_ok_endings_in_ranges(self):
+        for distorted, expected in (("первок", 1), ("четверток", 4), ("девяток", 9)):
+            with self.subTest(distorted=distorted):
+                result = LiveReferencePipeline().process_text(
+                    f"послание ефесянам вторая глава с первого по {distorted} стих"
+                )
+                expected_ref = (
+                    f"Ефесянам 2:{expected}"
+                    if expected == 1
+                    else f"Ефесянам 2:1-{expected}"
+                )
+                self.assertEqual(expected_ref, result["parsed"]["ref"])
+
+    def test_non_y_ordinal_ok_forms_are_not_assumed(self):
+        for distorted in ("второк", "треток", "шесток", "восьмок"):
+            self.assertIn(
+                f"по {distorted} стих",
+                normalize_text(f"с первого по {distorted} стих"),
+            )
+
+    def test_compound_ordinal_ok_ending_in_range(self):
+        result = LiveReferencePipeline().process_text(
+            "послание ефесянам вторая глава с первого по двадцать первок стих"
+        )
+        self.assertEqual("Ефесянам 2:1-21", result["parsed"]["ref"])
+
+    def test_psalm_quantity_uses_active_psalm_context(self):
+        pipeline = LiveReferencePipeline()
+        self.assertTrue(pipeline.set_context_range({
+            "book": "Псалтирь", "chapter": 125,
+            "start_verse": 1, "end_chapter": 125, "end_verse": 14,
+        }))
+        result = pipeline.process_text("псалом дачу пятый шестой стих")
+        self.assertEqual("Псалтирь 125:5-6", result["parsed"]["ref"])
+
     def test_context_allows_only_nearby_two_verse_same_chapter_follow_up(self):
         pipeline = LiveReferencePipeline()
         self.assertTrue(pipeline.set_context_range({
@@ -2175,6 +2304,41 @@ class LiveReferencePipelineTest(unittest.TestCase):
         second = pipeline.process_text("третья глава шестнадцатый стих")
         self.assertEqual("Матфей 3:16", second.get("parsed", {}).get("ref"))
 
+    def test_karenkoma_asr_alias_resolves_to_first_corinthians(self):
+        result = LiveReferencePipeline().process_text(
+            "первое послание каренкома одиннадцатая глава девятнадцатый стих"
+        )
+
+        self.assertEqual("1 Коринфянам 11:19", result.get("parsed", {}).get("ref"))
+
+    def test_second_corinthians_constant_root_vinova_asr_alias(self):
+        result = LiveReferencePipeline().process_text(
+            "второй постоянный корень винова третья глава четырнадцатый шестнадцатый стих"
+        )
+
+        self.assertEqual("2 Коринфянам 3:14-16", result.get("parsed", {}).get("ref"))
+
+    def test_second_corinthians_karifinam_asr_alias(self):
+        result = LiveReferencePipeline().process_text(
+            "второму посланию карифинам четвёртая глава пятый шестой стих"
+        )
+
+        self.assertEqual("2 Коринфянам 4:5-6", result.get("parsed", {}).get("ref"))
+
+    def test_numbered_epistle_number_is_not_used_as_chapter_without_stich(self):
+        result = LiveReferencePipeline().process_text(
+            "второму посланию карифинам четвёртая глава пятый"
+        )
+
+        self.assertEqual("2 Коринфянам 4:5", result.get("parsed", {}).get("ref"))
+
+    def test_sherpa_sehi_range_keeps_both_verses(self):
+        result = LiveReferencePipeline().process_text(
+            "евангелие от матфея шестнадцатая глава и прочитаем с шестнадцатого по девятнадцатой сехи"
+        )
+
+        self.assertEqual("Матфей 16:16-19", result.get("parsed", {}).get("ref"))
+
     def test_bare_book_fragment_can_start_short_numeric_reference(self):
         pipeline = LiveReferencePipeline()
 
@@ -2269,6 +2433,22 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
                 self.assertEqual(expected, result.get("parsed", {}).get("ref"))
 
+    def test_iezekiel_sherpa_book_aliases(self):
+        pipeline = LiveReferencePipeline()
+
+        for alias in (
+            "языкель",
+            "книга пророка языке или",
+            "языкиль",
+            "книга пророка и языке или",
+            "пророк языки",
+            "книга про рокаизикиля",
+            "книга пророка языке",
+        ):
+            with self.subTest(alias=alias):
+                result = pipeline.process_text(f"{alias} десятая глава первый стих")
+                self.assertEqual("Иезекииль 10:1", result.get("parsed", {}).get("ref"))
+
     def test_ephesians_safe_grammar_aliases(self):
         pipeline = LiveReferencePipeline()
 
@@ -2284,6 +2464,19 @@ class LiveReferencePipelineTest(unittest.TestCase):
                 result = pipeline.process_text(text)
 
                 self.assertEqual("Ефесянам 2:9-10", result.get("parsed", {}).get("ref"))
+
+    def test_ephesians_recorded_asr_aliases(self):
+        pipeline = LiveReferencePipeline()
+        aliases = (
+            "офисянам", "фисе", "послание ефестской церкви",
+            "послание и фисиалам", "послание диффессиана", "ефисянам", "ефисяна",
+            "и все нам", "ефисианам", "и фестианам", "ивстяном", "евстяном", "евсянам", "и сян",
+            "и фестиана", "ефисиана", "послание ефисиана", "послание ефисианам",
+        )
+        for alias in aliases:
+            with self.subTest(alias=alias):
+                result = pipeline.process_text(f"{alias} четвёртая глава первый стих")
+                self.assertEqual("Ефесянам 4:1", result.get("parsed", {}).get("ref"))
 
     def test_ephesians_sixth_chapter_sherpa_distortion_keeps_range(self):
         pipeline = LiveReferencePipeline()
@@ -2445,6 +2638,22 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertEqual("Иоанн 3:16", gospel.get("parsed", {}).get("ref"))
         self.assertEqual("1 Иоанна 5:13", epistle.get("parsed", {}).get("ref"))
+
+    def test_full_gospel_title_disambiguates_asr_iona_from_prophet_iona(self):
+        pipeline = LiveReferencePipeline()
+
+        self.assertEqual("евангелие", normalize_text("и в ангелие"))
+        gospel = pipeline.process_text(
+            "есть ещё да вот один отрывок которого мы тоже сегодня ещё обратимся "
+            "и в ангелие от иона три шестнадцать ибо так возлюбил бок мир "
+            "что отдал сына своего единородного"
+        )
+        full_title = pipeline.process_text("Евангелие от Иона три шестнадцать")
+        prophet = pipeline.process_text("книга пророка Ионы первая глава третий стих")
+
+        self.assertEqual("Иоанн 3:16", gospel.get("parsed", {}).get("ref"))
+        self.assertEqual("Иоанн 3:16", full_title.get("parsed", {}).get("ref"))
+        self.assertEqual("Иона 1:3", prophet.get("parsed", {}).get("ref"))
 
     def test_john_3_16_does_not_require_ml_confirmation_when_clean(self):
         pipeline = LiveReferencePipeline()
@@ -2634,6 +2843,19 @@ class LiveReferencePipelineTest(unittest.TestCase):
                 result = LiveReferencePipeline().process_text(text)
 
                 self.assertEqual(expected, result.get("parsed", {}).get("ref"))
+
+    def test_person_named_yakov_does_not_supply_book_for_later_chapter_only_range(self):
+        text = (
+            "яков алфеев и семён зелот иуда брата иакова ксении "
+            "единодушно пребывали в молитве и молениях с некоторыми жёнами "
+            "и марию матерью иисусом из братьями его а давайте прочитаем ещё "
+            "вторая глава с первого по восьмой стих"
+        )
+
+        self.assertIsNone(parse_live_reference(text))
+        result = LiveReferencePipeline().process_text(text)
+        self.assertFalse(result.get("matched"))
+        self.assertNotEqual("Иаков 2:1-8", (result.get("parsed") or {}).get("ref"))
 
     def test_confident_book_without_chapter_marker_still_parses(self):
         pipeline = LiveReferencePipeline()
@@ -3183,6 +3405,22 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertFalse(result.get("matched"))
         self.assertEqual("suspicious_first_verse_form", result.get("blocked_weak_context"))
 
+    def test_explicit_book_and_chapter_allow_asr_feminine_first_verse(self):
+        result = LiveReferencePipeline().process_text(
+            "послание ефисианам четвёртая глава первой стих"
+        )
+
+        self.assertEqual("Ефесянам 4:1", result.get("parsed", {}).get("ref"))
+
+    def test_known_ephesians_alias_is_not_marked_fuzzy(self):
+        result = LiveReferencePipeline().process_text(
+            "так а теперь ещё раз прочитаем послание ефисянам третья глава тринадцатый стих"
+        )
+
+        self.assertEqual("Ефесянам 3:13", result.get("parsed", {}).get("ref"))
+        self.assertEqual(1.0, result.get("parsed", {}).get("confidence"))
+        self.assertNotIn("fuzzy_book_match", result.get("risk_reasons") or [])
+
     def test_incomplete_first_verse_after_chapter_waits_for_range(self):
         pipeline = LiveReferencePipeline()
 
@@ -3271,6 +3509,14 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertEqual("Иоанн 3:16-4:2", next_chapter_without_start_verse_word.get("parsed", {}).get("ref"))
         self.assertEqual("Иоанн 3:16-4:2", next_chapter_without_from.get("parsed", {}).get("ref"))
         self.assertEqual("Иоанн 3:16-4:2", compact.get("parsed", {}).get("ref"))
+
+    def test_cross_chapter_range_with_sherpa_seha_distortion(self):
+        result = LiveReferencePipeline().process_text(
+            "если мы еванглие от матфея двадцать третьего главу "
+            "с тридцать седьмого сеха по двадцать четвёртого глава второй стих"
+        )
+
+        self.assertEqual("Матфей 23:37-24:2", result.get("parsed", {}).get("ref"))
 
     def test_cross_chapter_range_builds_quick_presentation_slides(self):
         pipeline = LiveReferencePipeline()
@@ -3791,6 +4037,24 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertEqual("обычная пята попытка", normalize_text("обычная пята попытка"))
 
+    def test_masculine_asr_forms_restore_feminine_chapter_context(self):
+        for distorted, expected in (
+            ("возьмого", "Исаия 58:3"),
+            ("тредьего", "Исаия 53:3"),
+            ("сетьмого", "Исаия 57:3"),
+            ("седьмого", "Исаия 57:3"),
+        ):
+            with self.subTest(distorted=distorted):
+                result = LiveReferencePipeline().process_text(
+                    f"исаия пятьдесят {distorted} три стих"
+                )
+                self.assertEqual(expected, result.get("parsed", {}).get("ref"))
+
+        self.assertEqual(
+            "возьмого 3 стих",
+            normalize_text("возьмого три стих"),
+        )
+
     def test_thousand_noise_between_verse_bounds_becomes_range(self):
         result = LiveReferencePipeline().process_text(
             "евреям четвёртая глава четырнадцать тысяч шестнадцатая стих итак "
@@ -4003,6 +4267,33 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertEqual("Деяния 1:7-8", result.get("parsed", {}).get("ref"))
 
+    def test_book_of_acts_asr_alias_and_split_chapter_context(self):
+        pipeline = LiveReferencePipeline()
+
+        book = pipeline.process_text("книга ения апостолов", now_ms=0)
+        chapter = pipeline.process_text("вторая голова", now_ms=500)
+
+        self.assertFalse(book.get("matched"))
+        self.assertFalse(chapter.get("matched"))
+        self.assertEqual(
+            {"book": "Деяния", "chapter": 2, "source_text": "книга ения апостолов вторая голова"},
+            chapter.get("book_chapter_context"),
+        )
+
+        expired = pipeline.process_text("продолжаем читать", now_ms=91_000)
+        self.assertEqual({}, expired.get("book_chapter_context"))
+
+    def test_book_of_acts_asr_alias_assembles_explicit_verse(self):
+        pipeline = LiveReferencePipeline()
+        pipeline.process_text("книга ения апостолов", now_ms=0)
+
+        result = pipeline.process_text(
+            "вторая голова сорок четвертый стих",
+            now_ms=500,
+        )
+
+        self.assertEqual("Деяния 2:44", result.get("parsed", {}).get("ref"))
+
     def test_confusable_thirteen_thirty_chapter_adds_existing_alternative(self):
         pipeline = LiveReferencePipeline()
 
@@ -4200,6 +4491,37 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertEqual("Марк 1:21-24", result.get("parsed", {}).get("ref"))
         self.assertEqual("Марк 1:21-34", result.get("corrected_reference"))
 
+    def test_repeated_identical_compact_reference_is_not_a_verse_range(self):
+        cases = (
+            (
+                "числа двадцать третьего девятнадцатый стиль если вы не верите "
+                "можете прочитать числа двадцать три девятнадцать",
+                "Числа 23:19",
+            ),
+            (
+                "евангелие от иоанна три шестнадцать иоанн три шестнадцать",
+                "Иоанн 3:16",
+            ),
+        )
+        for text, expected_ref in cases:
+            with self.subTest(text=text):
+                result = LiveReferencePipeline().process_text(text)
+                self.assertEqual("parser_repeated_compact_reference", result.get("source"))
+                self.assertEqual(expected_ref, result.get("parsed", {}).get("ref"))
+                self.assertEqual([], result.get("reference_list") or [])
+
+    def test_different_explicit_compact_references_are_still_a_list(self):
+        result = LiveReferencePipeline().process_text(
+            "числа двадцать третьего девятнадцатый стих "
+            "числа двадцать третьего двадцатый стих"
+        )
+
+        self.assertEqual("parser_reference_list", result.get("source"))
+        self.assertEqual(
+            ["Числа 23:19", "Числа 23:20"],
+            [item.get("ref") for item in result.get("reference_list") or []],
+        )
+
     def test_pol_connector_and_partial_repeat_keep_complete_first_range(self):
         pipeline = LiveReferencePipeline()
 
@@ -4260,6 +4582,50 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertEqual(["Деяния 8:1", "Деяния 11:19"], [
             item.get("ref") for item in result.get("reference_list") or []
         ])
+
+    def test_reading_plan_keeps_single_verse_and_later_adjacent_range(self):
+        result = LiveReferencePipeline().process_text(
+            "положение очень серьёзное послание римляном десятая глава "
+            "девятый тринадцатый и четырнадцатый стих ибо если устами твоими "
+            "будешь исповедовать иисуса господам и стерством твоим вера что "
+            "бог воскресил его из мёртвых"
+        )
+
+        self.assertTrue(result.get("matched"))
+        self.assertEqual("parser_reference_list", result.get("source"))
+        self.assertIsNone(result.get("parsed"))
+        self.assertEqual(
+            ["Римлянам 10:9", "Римлянам 10:13-14"],
+            [item.get("ref") for item in result.get("reference_list") or []],
+        )
+
+    def test_reading_plan_does_not_reinterpret_continuous_range(self):
+        result = LiveReferencePipeline().process_text(
+            "послание римлянам десятая глава с девятого по четырнадцатый стих "
+            "ибо всякий кто призовет имя господне спасется"
+        )
+
+        self.assertNotEqual("parser_reference_list", result.get("source"))
+        self.assertEqual("Римлянам 10:9-14", result.get("parsed", {}).get("ref"))
+        self.assertEqual([], result.get("reference_list") or [])
+
+    def test_bare_verse_enumeration_does_not_become_a_reading_plan(self):
+        result = LiveReferencePipeline().process_text(
+            "послание римлянам десятая глава девятый тринадцатый и "
+            "четырнадцатый стих"
+        )
+
+        self.assertNotEqual("parser_reference_list", result.get("source"))
+        self.assertEqual([], result.get("reference_list") or [])
+
+    def test_repeated_verse_numbers_do_not_become_a_reading_plan(self):
+        result = LiveReferencePipeline().process_text(
+            "послание римлянам десятая глава десятый и десятый стих "
+            "ибо так возлюбил бог мир"
+        )
+
+        self.assertNotEqual("parser_reference_list", result.get("source"))
+        self.assertEqual([], result.get("reference_list") or [])
 
     def test_cross_chapter_range_is_not_converted_to_a_reference_list(self):
         result = LiveReferencePipeline().process_text(
@@ -4727,6 +5093,34 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertFalse(result.get("matched"))
         self.assertIsNone(result.get("parsed"))
 
+    def test_isaiah_soroka_alias_is_used_in_reference_list(self):
+        result = LiveReferencePipeline().process_text(
+            "пророк и слаия сорока третий стих малахия третья глава первый стих "
+            "книга исход двадцать три"
+        )
+
+        references = [item["ref"] for item in result.get("reference_list") or []]
+        self.assertIn("Исаия 40:3", references)
+        self.assertIn("Малахия 3:1", references)
+
+    def test_exact_ephesians_alias_beats_earlier_fuzzy_buffer_candidate(self):
+        result = LiveReferencePipeline().process_text(
+            "мы или вы мы вместе ну так как я часть церкви я должен сегодня уметь "
+            "увидеть что бог с в слове сегодня я обращается конкретно ко мне "
+            "давайте сейчас мы откроем сегодняшний отрывок это послание к офисянам "
+            "пятая глава с пятнадцатого по двадцать первый стих"
+        )
+
+        self.assertEqual("Ефесянам 5:15-21", result.get("parsed", {}).get("ref"))
+
+    def test_standalone_inflected_epistle_word_does_not_beat_james_book_mention(self):
+        result = LiveReferencePipeline().process_text(
+            "пишет в своём послании четвёртая глава восьмой десятый стих "
+            "апостол веков пишет очень простые слова"
+        )
+
+        self.assertEqual("Иаков 4:8-10", result.get("parsed", {}).get("ref"))
+
     def test_verse_range_before_book_without_chapter_stays_incomplete(self):
         result = LiveReferencePipeline().process_text(
             "с первого по пятый стих послание к римлянам"
@@ -4956,6 +5350,14 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertEqual("Иисус Навин 14:12-14", result.get("parsed", {}).get("ref"))
 
+    def test_joshua_recorded_asr_alias_иисуса_наверное(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text("да иисуса наверное первая глава восьмой стих")
+
+        self.assertEqual("Иисус Навин 1:8", result.get("parsed", {}).get("ref"))
+        self.assertFalse(LiveReferencePipeline().process_text("иисуса наверное").get("matched"))
+
     def test_noise_context_does_not_create_new_reference(self):
         pipeline = LiveReferencePipeline()
 
@@ -4991,6 +5393,37 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         second = pipeline.process_text("послание евр")
         self.assertFalse(second.get("matched"))
+
+    def test_promotes_explicit_reference_assembled_from_book_and_range_fragments(self):
+        pipeline = LiveReferencePipeline()
+
+        first = pipeline.process_text(
+            "итак еще раз давайте прочитаем с вами послание ефисианам"
+        )
+        self.assertFalse(first.get("matched"))
+
+        second = pipeline.process_text("вторая глава одиннадцатая стих")
+
+        self.assertTrue(second.get("matched"))
+        self.assertEqual("Ефесянам 2:11", second.get("parsed", {}).get("ref"))
+        self.assertTrue(second.get("promoted_assembled_reference"))
+
+    def test_book_only_fragment_survives_short_pause_before_chapter_and_verse(self):
+        pipeline = LiveReferencePipeline()
+
+        first = pipeline.process_text(
+            "итак сегодня будем читать послание ефисианам",
+            now_ms=0,
+        )
+        self.assertFalse(first.get("matched"))
+
+        second = pipeline.process_text(
+            "пятая глава десятый стих",
+            now_ms=5_400,
+        )
+
+        self.assertTrue(second.get("matched"))
+        self.assertEqual("Ефесянам 5:10", second.get("parsed", {}).get("ref"))
 
 
 if __name__ == "__main__":

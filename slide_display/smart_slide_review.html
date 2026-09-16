@@ -23,6 +23,11 @@
     <aside class="controls review-controls" aria-label="Разметка решения УПС">
       <div class="review-progress" id="progressText">Загрузка…</div>
       <audio id="audio" preload="metadata"></audio>
+      <div class="part-navigation" aria-label="Навигация по аудиочастям">
+        <button id="previousPart" type="button" disabled>← Предыдущая часть</button>
+        <span id="partText">Часть —/—</span>
+        <button id="nextPart" type="button" disabled>Следующая часть →</button>
+      </div>
       <button id="startReplay" type="button">▶ Запустить эмуляцию</button>
       <button id="continueReplay" type="button" hidden>▶ Продолжить после ошибки</button>
       <button id="rewindReplay" type="button" disabled>↶ Назад 10 секунд</button>
@@ -42,9 +47,10 @@
           <button data-error="wrong_transition" class="bad">Слишком рано / неверный слайд</button>
           <button data-error="missed_transition" class="warn">Слишком поздно / переход пропущен</button>
         </div>
-        <label class="note-label">Заметка (необязательно)
+        <label class="note-label">Заметка к этой остановке (необязательно)
           <textarea id="note" rows="2" placeholder="Например: перескок через стих"></textarea>
         </label>
+        <p id="noteScope" class="cue-help">Заметка будет сохранена только для текущей остановки.</p>
         <button id="saveErrorNote" type="button">Сохранить наблюдение</button>
         <label class="note-label">Диагностический отчёт
           <textarea id="incidentReport" rows="7" readonly></textarea>

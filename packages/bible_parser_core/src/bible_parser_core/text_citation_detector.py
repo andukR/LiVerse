@@ -23,6 +23,9 @@ COMMON_SPEECH_LEMMAS = {
     "так", "то", "у", "что", "это", "я",
 }
 BROADER_RANGE_SCORE_TOLERANCE = 10.0
+CONTEXTUAL_CHAPTER_MIN_SCORE = 85.0
+CONTEXTUAL_CHAPTER_MIN_MARGIN = 25.0
+CONTEXTUAL_CHAPTER_MIN_MATCHED_WORDS = 4
 
 
 def _reference_key(reference: str) -> tuple[str, int, int, int, int] | str:
@@ -232,6 +235,7 @@ class ScriptureTextDetector:
         now: float,
         *,
         incomplete_address_correction: bool = False,
+        book_chapter_context: Mapping[str, object] | None = None,
     ) -> TextCitationDecision:
         fragment_tokens = normalize_bible_text(text)
         windows = self.buffer.add(text)
@@ -290,8 +294,11 @@ class ScriptureTextDetector:
                 ),
             )
         else:
+            ready_candidates = [
+                item for item in evaluated if item.reason == "candidate_ready"
+            ]
             best = max(
-                evaluated,
+                ready_candidates or evaluated,
                 key=lambda item: (
                     item.accepted,
                     item.score,
@@ -300,6 +307,38 @@ class ScriptureTextDetector:
                     len(item.window_text.split()),
                 ),
             )
+        context_book = str((book_chapter_context or {}).get("book") or "")
+        context_chapter = int((book_chapter_context or {}).get("chapter") or 0)
+        top = best.top_candidate
+        if (
+            not best.accepted
+            and best.reason == "candidate_ready"
+            and top is not None
+            and top.start_verse == top.end_verse
+            and context_book
+            and context_chapter > 0
+            and CANONICAL_BOOK_NAMES_BY_ID.get(top.book_id) == context_book
+            and top.chapter == context_chapter
+            and best.score >= CONTEXTUAL_CHAPTER_MIN_SCORE
+            and best.margin >= CONTEXTUAL_CHAPTER_MIN_MARGIN
+            and best.matched_words >= CONTEXTUAL_CHAPTER_MIN_MATCHED_WORDS
+        ):
+            best = self._decision(
+                accepted=True,
+                reference=best.reference,
+                score=best.score,
+                margin=best.margin,
+                matched_words=best.matched_words,
+                window_text=best.window_text,
+                reason="strong_match_in_explicit_book_chapter_context",
+                confirmations=1,
+                top=top,
+                second=best.second_candidate,
+            )
+            self._shown_at[_candidate_key(top)] = now
+            self._reset_pending()
+            self._emit("TEXT_ACCEPTED", self._event_payload(best))
+            return best
         if best.accepted and best.top_candidate is not None:
             broader = [
                 item

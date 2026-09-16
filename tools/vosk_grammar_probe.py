@@ -791,6 +791,11 @@ def session_reference_record(payload: dict, action: str = "recognized") -> dict 
 
 
 def append_session_reference(records: list[dict], payload: dict, action: str = "recognized") -> None:
+    # The end-of-session report is a list of references actually accepted or
+    # sent to Holyrics.  A rejected/ignored operator proposal must not appear
+    # there merely because the parser produced a candidate slide.
+    if action in {"reject", "not_citation", "wrong_reference", "skip", "auto_reject"}:
+        return
     record = session_reference_record(payload, action=action)
     if not record:
         return
@@ -1846,6 +1851,11 @@ def payload_summary(payload: dict) -> dict:
     parsed = payload.get("parsed") or {}
     slide = payload.get("slide") or {}
     invalid_reference = payload.get("invalid_reference") or {}
+    text_citation = (
+        payload.get("text_citation")
+        if isinstance(payload.get("text_citation"), dict)
+        else {}
+    )
     return {
         "text": payload.get("text"),
         "ref": parsed.get("ref"),
@@ -1853,11 +1863,13 @@ def payload_summary(payload: dict) -> dict:
         "chapter": parsed.get("chapter"),
         "start_verse": parsed.get("start_verse"),
         "end_verse": parsed.get("end_verse"),
+        "sequential_display_verse": payload.get("sequential_display_verse"),
         "source": payload.get("source"),
         "has_slide": bool(slide),
         "can_set_context": bool(slide.get("can_set_context")),
         "context_reference": bool(payload.get("context_reference")),
         "context_range": payload.get("context_range") or {},
+        "book_chapter_context": payload.get("book_chapter_context") or {},
         "invalid_reference": invalid_reference,
         "incomplete_reference": payload.get("incomplete_reference") or {},
         "message": payload.get("message"),
@@ -1869,6 +1881,9 @@ def payload_summary(payload: dict) -> dict:
         "risk": payload.get("risk") or {},
         "ml_risk": payload.get("ml_risk") or {},
         "ambiguous_alternatives": payload.get("ambiguous_alternatives") or [],
+        # Keep the accepted text-search evidence in trigger_cases.jsonl so the
+        # reviewer can see which ASR window produced the displayed reference.
+        "text_citation": text_citation,
     }
 
 
@@ -3314,6 +3329,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                                     incomplete_address_correction=(
                                         pending_incomplete_reference is not None
                                     ),
+                                    book_chapter_context=pipeline_payload.get("book_chapter_context"),
                                 )
                                 if pending_incomplete_reference is not None:
                                     if text_decision.reason == "text_corrected_incomplete_address":

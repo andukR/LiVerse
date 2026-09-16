@@ -130,6 +130,84 @@ class ScriptureTextDetectorTest(unittest.TestCase):
         self.assertEqual("Ин. 3:16", accepted.reference)
         self.assertEqual("confirmed_stable_match", accepted.reason)
 
+    def test_candidate_meeting_all_gates_is_not_hidden_by_higher_scoring_weak_candidate(self) -> None:
+        ready = hit(
+            "Деян. 2:44", 72.0,
+            matched=("чудеса", "знамения", "апостолы", "совершилось"),
+            book_id=44,
+            chapter=2,
+            verse=44,
+        )
+        weak = hit(
+            "1Кор. 12:28", 85.0,
+            matched=("чудеса", "знамения"),
+            book_id=46,
+            chapter=12,
+            verse=28,
+        )
+        lower = hit(
+            "Ин. 1:1", 40.0,
+            matched=("чудеса",),
+            book_id=43,
+            chapter=1,
+            verse=1,
+        )
+        detector = ScriptureTextDetector(
+            FakeSearcher([[ready, lower], [weak]]),
+            self.config(window_sizes=(5, 10)),
+        )
+
+        decision = detector.process_fragment(
+            "вера десять двадцать чудеса знамения апостолы совершилось",
+            now=0.0,
+        )
+
+        self.assertFalse(decision.accepted)
+        self.assertEqual("pending_confirmation", decision.reason)
+        self.assertEqual("Деян. 2:44", decision.reference)
+        self.assertEqual(1, decision.confirmations)
+
+    def test_strong_single_verse_match_can_use_exact_book_chapter_context(self) -> None:
+        acts_verse = hit(
+            "Деян. 2:44", 88.6,
+            matched=("верующие", "были", "вместе", "имели", "все"),
+            book_id=44,
+            chapter=2,
+            verse=44,
+        )
+        competitor = hit(
+            "Ин. 16:30", 49.7,
+            matched=("вместе",),
+            book_id=43,
+            chapter=16,
+            verse=30,
+        )
+        detector = ScriptureTextDetector(
+            FakeSearcher([[acts_verse, competitor]]),
+            self.config(window_sizes=(5,)),
+        )
+
+        decision = detector.process_fragment(
+            "верующие были вместе имели все",
+            now=1.0,
+            book_chapter_context={"book": "Деяния", "chapter": 2},
+        )
+
+        self.assertTrue(decision.accepted)
+        self.assertEqual("Деян. 2:44", decision.reference)
+        self.assertEqual("strong_match_in_explicit_book_chapter_context", decision.reason)
+
+        other_chapter = ScriptureTextDetector(
+            FakeSearcher([[acts_verse, competitor]]),
+            self.config(window_sizes=(5,)),
+        ).process_fragment(
+            "верующие были вместе имели все",
+            now=1.0,
+            book_chapter_context={"book": "Деяния", "chapter": 3},
+        )
+        self.assertFalse(other_chapter.accepted)
+        self.assertEqual("pending_confirmation", other_chapter.reason)
+
     def test_very_strong_exact_candidate_can_be_accepted_immediately(self) -> None:
         strong = hit(
             "Ин. 1:1", 96.0,
@@ -1377,6 +1455,40 @@ class TextCitationIntegrationTest(unittest.TestCase):
         self.assertNotIn(entries[2].event_id, reviews)
         self.assertEqual(1, result["remaining"])
 
+    def test_browser_timeline_combines_adjacent_ranges_from_one_audio_file(self) -> None:
+        from tools.review_trigger_cases import SmartSlideBrowserReview, collect_smart_slide_entries
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first_run = root / "20260914_160000_000001"
+            second_run = root / "20260914_160100_000001"
+            first_run.mkdir()
+            second_run.mkdir()
+            first_run_events = [
+                {"event": "SMART_SLIDE_SHADOW", "passage": "Марк 3:8-10", "action": "keep", "replay_seconds": 52},
+                {"event": "SMART_SLIDE_SHADOW", "passage": "Марк 3:8-12", "action": "advance", "replay_seconds": 62},
+                {"event": "SMART_SLIDE_SHADOW", "passage": "Марк 3:8-12", "action": "keep", "replay_seconds": 66},
+            ]
+            (first_run / "events.jsonl").write_text(
+                "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in first_run_events), encoding="utf-8"
+            )
+            (first_run / "audio.wav").write_bytes(b"placeholder")
+            (second_run / "events.jsonl").write_text(json.dumps({
+                "event": "SMART_SLIDE_SHADOW", "passage": "Лука 1:1-3", "action": "keep", "replay_seconds": 10,
+            }, ensure_ascii=False) + "\n", encoding="utf-8")
+            (second_run / "audio.wav").write_bytes(b"placeholder")
+
+            entries = collect_smart_slide_entries([first_run / "events.jsonl", second_run / "events.jsonl"])
+            controller = SmartSlideBrowserReview(entries, no_resume=False)
+            timeline = controller.timeline()
+            next_timeline = controller.move_sequence(1)
+
+        self.assertEqual((1, 2, 3), (
+            timeline["sequence_start_number"], timeline["sequence_end_number"], timeline["sequence_total"],
+        ))
+        self.assertEqual(3, len(timeline["tracks"][0]["decisions"]))
+        self.assertEqual((3, 3), (next_timeline["sequence_start_number"], next_timeline["sequence_end_number"]))
+
     def test_browser_timeline_includes_normal_liverse_slide_updates(self) -> None:
         from tools.review_trigger_cases import SmartSlideBrowserReview, collect_smart_slide_entries
 
@@ -1420,6 +1532,73 @@ class TextCitationIntegrationTest(unittest.TestCase):
         self.assertEqual("Иаков 1:5-10", updates[0]["ref"])
         self.assertEqual("", updates[0]["element"]["text"])
 
+    def test_browser_timeline_shows_only_address_for_four_verse_range(self) -> None:
+        from tools.review_trigger_cases import normal_slide_updates
+
+        with tempfile.TemporaryDirectory() as temporary:
+            events_path = Path(temporary) / "events.jsonl"
+            events_path.write_text(
+                json.dumps({
+                    "event": "parsed",
+                    "replay_seconds": 20.0,
+                    "payload": {"ref": "Филиппийцам 1:8-11", "source": "parser"},
+                    "output": {"replay": {"sent": True}},
+                }, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            updates = normal_slide_updates(events_path)
+
+        self.assertEqual("range_announcement", updates[0]["kind"])
+        self.assertEqual("Филиппийцам 1:8-11", updates[0]["ref"])
+        self.assertEqual("", updates[0]["element"]["text"])
+
+    def test_browser_timeline_includes_final_asr_speech_updates(self) -> None:
+        from tools.review_trigger_cases import speech_updates
+
+        with tempfile.TemporaryDirectory() as temporary:
+            events_path = Path(temporary) / "events.jsonl"
+            events_path.write_text(
+                json.dumps({
+                    "event": "final_raw",
+                    "text": "пастор продолжает читать",
+                    "replay_seconds": 40.0,
+                }, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            updates = speech_updates(events_path)
+
+        self.assertEqual("пастор продолжает читать", updates[0]["text"])
+        self.assertEqual(40.0, updates[0]["replay_seconds"])
+
+    def test_browser_sequential_update_uses_logged_first_confirmed_verse(self) -> None:
+        from tools.review_trigger_cases import normal_slide_updates
+        from tools.vosk_grammar_probe import payload_summary
+
+        with tempfile.TemporaryDirectory() as temporary:
+            events_path = Path(temporary) / "events.jsonl"
+            payload = payload_summary({
+                "parsed": {
+                    "book": "Деяния", "chapter": 2,
+                    "start_verse": 11, "end_verse": 14,
+                    "ref": "Деяния 2:11-14",
+                },
+                "source": "replay_inferred_sequential_text_reading",
+                "sequential_display_verse": 11,
+            })
+            events_path.write_text(
+                json.dumps({
+                    "event": "parsed",
+                    "replay_seconds": 40.5,
+                    "payload": payload,
+                    "output": {"replay": {"sent": True}},
+                }, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            updates = normal_slide_updates(events_path)
+
+        self.assertEqual("Деяния 2:11-14", updates[0]["ref"])
+        self.assertEqual(11, updates[0]["element"]["verse"])
+
     def test_browser_timeline_shows_current_verse_for_inferred_sequential_reading(self) -> None:
         from tools.review_trigger_cases import normal_slide_updates
 
@@ -1442,6 +1621,18 @@ class TextCitationIntegrationTest(unittest.TestCase):
         self.assertEqual("Иоанн 14:1-3", updates[0]["ref"])
         self.assertEqual(3, updates[0]["element"]["verse"])
         self.assertIn("и когда пойду", updates[0]["element"]["text"].lower())
+
+    def test_sequential_resume_starts_at_candidate_start_not_candidate_end(self) -> None:
+        from tools.replay_audio_files import sequential_resume_index
+
+        targets = [
+            {"start_verse": 4},
+            {"start_verse": 5},
+            {"start_verse": 6},
+            {"start_verse": 7},
+        ]
+
+        self.assertEqual(1, sequential_resume_index(targets, 5))
 
     def test_browser_stop_writes_separate_diagnostic_incident(self) -> None:
         from tools.review_trigger_cases import SmartSlideBrowserReview, collect_smart_slide_entries, load_jsonl
@@ -1469,6 +1660,86 @@ class TextCitationIntegrationTest(unittest.TestCase):
         self.assertEqual("Мф. 7:26-27", incidents[0]["evidence"][-1]["ref"])
         self.assertIn("log=", result["report"])
         self.assertIn("timecode=01:15.500", result["report"])
+
+    def test_browser_incident_uses_state_at_stop_and_reports_future_decision_separately(self) -> None:
+        from tools.review_trigger_cases import SmartSlideBrowserReview, collect_smart_slide_entries, load_jsonl
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run = root / "20260916_120000_000001"
+            run.mkdir()
+            events = [
+                {"event": "SMART_SLIDE_SHADOW", "active": True,
+                 "passage": "Притчи 4:3-4", "action": "activate", "reason": "initial",
+                 "replay_seconds": 10, "current_index": 0},
+                {"event": "parsed", "replay_seconds": 30,
+                 "payload": {"ref": "Притчи 19:13-19", "source": "parser"},
+                 "output": {"replay": {"sent": True}}},
+                {"event": "SMART_SLIDE_SHADOW", "active": True,
+                 "passage": "Притчи 22:6-16", "action": "activate", "reason": "later_range",
+                 "replay_seconds": 90, "current_index": 0},
+            ]
+            (run / "events.jsonl").write_text(
+                "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events),
+                encoding="utf-8",
+            )
+            entries = collect_smart_slide_entries([run / "events.jsonl"])
+            controller = SmartSlideBrowserReview(entries, no_resume=False, report_dir=root)
+            incident = controller.record_incident(
+                entries[0].event_id, 50, "Притчи 4:3-4", "ранняя остановка"
+            )
+            saved_incident = load_jsonl(run / "smart_slide_incidents.jsonl")[0]
+            report = controller.write_error_report().read_text(encoding="utf-8")
+
+        self.assertEqual("Притчи 4:3-4", saved_incident["active_passage"])
+        self.assertEqual(10, saved_incident["decision_at_or_before_stop"]["replay_seconds"])
+        self.assertEqual(90, saved_incident["first_decision_after_stop"]["replay_seconds"])
+        self.assertIn("active_passage_at_stop=Притчи 4:3-4", incident["report"])
+        self.assertIn("first_decision_after_stop=activate at 90.000s", incident["report"])
+        self.assertIn("Активный диапазон УПС на момент остановки: Притчи 4:3-4", report)
+        self.assertIn("Первое решение после остановки: activate в 90.000 с", report)
+
+    def test_browser_incident_before_first_smart_slide_has_no_active_passage(self) -> None:
+        from tools.review_trigger_cases import SmartSlideBrowserReview, collect_smart_slide_entries, load_jsonl
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run = Path(temporary) / "20260916_120100_000001"
+            run.mkdir()
+            (run / "events.jsonl").write_text(
+                json.dumps({
+                    "event": "SMART_SLIDE_SHADOW", "active": True,
+                    "passage": "Екклесиаст 5:12-15", "action": "activate",
+                    "reason": "later_text_match", "replay_seconds": 59.75,
+                }, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            entries = collect_smart_slide_entries([run / "events.jsonl"])
+            incident = SmartSlideBrowserReview(entries, no_resume=False).record_incident(
+                entries[0].event_id, 17.5, "Эмуляция ещё не дошла до ссылки", ""
+            )
+            saved_incident = load_jsonl(run / "smart_slide_incidents.jsonl")[0]
+
+        self.assertEqual("", saved_incident["active_passage"])
+        self.assertEqual({}, saved_incident["decision_at_or_before_stop"])
+        self.assertEqual(59.75, saved_incident["first_decision_after_stop"]["replay_seconds"])
+        self.assertIn("нет активного диапазона УПС", incident["report"])
+        self.assertIn("До остановки ещё нет решения УПС.", incident["report"])
+
+    def test_browser_incident_note_is_scoped_and_cleared_before_new_observation(self) -> None:
+        project_root = Path(__file__).resolve().parents[3]
+        script = (project_root / "slide_display" / "smart_slide_review.js").read_text(
+            encoding="utf-8"
+        )
+        page = (project_root / "slide_display" / "smart_slide_review.html").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('id="noteScope"', page)
+        self.assertIn("Заметка к этой остановке", page)
+        self.assertIn("Заметка относится к остановке ${currentIncidentId}", script)
+        self.assertIn("if (currentIncidentId) {\n    note.value = \"\";", script)
+        self.assertIn("currentIncidentId = null;", script)
+        self.assertIn("note.value = \"\";\n  noteScope.textContent", script)
 
     def test_browser_session_error_report_contains_only_stops_from_that_session(self) -> None:
         from tools.review_trigger_cases import SmartSlideBrowserReview, collect_smart_slide_entries
@@ -1679,6 +1950,138 @@ class TextCitationIntegrationTest(unittest.TestCase):
 
         self.assertEqual("вошел он в синагогу и учил", adapter.partial_result())
 
+    def test_replay_can_override_sherpa_minimum_utterance_length(self) -> None:
+        from unittest.mock import patch
+        from bible_parser_core.sherpa_streaming import load_sherpa_recognizer
+
+        calls = []
+        fake_module = SimpleNamespace(
+            OnlineRecognizer=SimpleNamespace(
+                from_transducer=lambda **kwargs: calls.append(kwargs) or object()
+            )
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            model_path = Path(temporary)
+            for relative in (
+                "am-onnx/encoder.onnx", "am-onnx/decoder.onnx",
+                "am-onnx/joiner.onnx", "lang/tokens.txt",
+            ):
+                path = model_path / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            with patch.dict("sys.modules", {"sherpa_onnx": fake_module}):
+                load_sherpa_recognizer(
+                    model_path, sample_rate=16000, num_threads=1,
+                    min_utterance_length=3.0,
+                )
+                load_sherpa_recognizer(
+                    model_path, sample_rate=16000, num_threads=1,
+                )
+
+        self.assertEqual([3.0, 10.0], [call["rule3_min_utterance_length"] for call in calls])
+
+    def test_recent_speech_rate_uses_recent_sherpa_word_timestamps(self) -> None:
+        from bible_parser_core.sherpa_streaming import estimate_recent_speech_rate
+
+        result = SimpleNamespace(
+            text="раз два три четыре",
+            tokens=[" раз", " два", " три", " четыре"],
+            timestamps=[0.0, 0.25, 0.5, 0.75],
+            ys_probs=[-0.1, -0.1, -0.1, -0.1],
+        )
+
+        self.assertEqual(4.0, estimate_recent_speech_rate(result))
+
+    def test_recent_speech_rate_is_unknown_with_too_few_timestamps(self) -> None:
+        from bible_parser_core.sherpa_streaming import estimate_recent_speech_rate
+
+        result = SimpleNamespace(
+            text="раз два",
+            tokens=[" раз", " два"],
+            timestamps=[0.0, 0.25],
+            ys_probs=[-0.1, -0.1],
+        )
+
+        self.assertIsNone(estimate_recent_speech_rate(result))
+
+    def test_recent_speech_rate_accepts_final_vosk_shaped_word_timings(self) -> None:
+        from bible_parser_core.sherpa_streaming import estimate_recent_speech_rate
+
+        result = {
+            "text": "раз два три четыре",
+            "result": [
+                {"word": word, "start": start, "end": start + 0.2}
+                for word, start in zip(("раз", "два", "три", "четыре"), (0.0, 0.25, 0.5, 0.75))
+            ],
+        }
+
+        self.assertEqual(4.0, estimate_recent_speech_rate(result))
+
+    def test_adaptive_sherpa_segment_length_tracks_pace_with_three_to_ten_second_bounds(self) -> None:
+        from bible_parser_core.sherpa_streaming import adaptive_sherpa_segment_seconds
+
+        self.assertEqual(10.0, adaptive_sherpa_segment_seconds(None))
+        self.assertEqual(3.25, adaptive_sherpa_segment_seconds(3.0))
+        self.assertEqual(5.0, adaptive_sherpa_segment_seconds(2.0))
+        self.assertEqual(10.0, adaptive_sherpa_segment_seconds(0.5))
+        self.assertEqual(3.0, adaptive_sherpa_segment_seconds(8.0))
+
+    def test_adaptive_sherpa_replay_finishes_and_resets_at_calculated_boundary(self) -> None:
+        from bible_parser_core.sherpa_streaming import SherpaReplayRecognizer
+
+        class FakeStream:
+            def __init__(self):
+                self.finished = False
+
+            def accept_waveform(self, sample_rate, samples):
+                pass
+
+            def input_finished(self):
+                self.finished = True
+
+        class FakeRecognizer:
+            def __init__(self):
+                self.stream = FakeStream()
+                self.reset_calls = 0
+                self.raw = SimpleNamespace(
+                    text="раз два три четыре",
+                    tokens=[" раз", " два", " три", " четыре"],
+                    timestamps=[0.0, 1.0, 2.0, 3.0],
+                    ys_probs=[-0.1, -0.1, -0.1, -0.1],
+                )
+
+            def create_stream(self):
+                return self.stream
+
+            def is_ready(self, stream):
+                return False
+
+            def decode_stream(self, stream):
+                pass
+
+            def is_endpoint(self, stream):
+                return False
+
+            def get_result_all(self, stream):
+                return self.raw
+
+            def reset(self, stream):
+                self.reset_calls += 1
+                stream.finished = False
+
+        recognizer = FakeRecognizer()
+        adapter = SherpaReplayRecognizer(
+            recognizer, 16000, adaptive_segmentation=True
+        )
+
+        results = adapter.accept_waveform(bytes(8000), 10.0)
+
+        self.assertEqual(1, len(results))
+        self.assertEqual("adaptive_interval", results[0]["segmentation_reason"])
+        self.assertEqual(10.0, results[0]["segment_duration_seconds"])
+        self.assertEqual(1, recognizer.reset_calls)
+        self.assertFalse(recognizer.stream.finished)
+
     def test_replay_summary_groups_overlapping_windows_into_one_citation_event(self) -> None:
         from tools.replay_audio_files import citation_event_summary_lines
 
@@ -1796,6 +2199,32 @@ class TextCitationIntegrationTest(unittest.TestCase):
 
         self.assertIsNone(inferred)
 
+    def test_replay_suppresses_short_psalm_after_recent_three_digit_psalm(self) -> None:
+        from tools.replay_audio_files import is_conflicting_psalm_chapter_inference
+
+        self.assertTrue(
+            is_conflicting_psalm_chapter_inference(
+                {
+                    "source": "parser",
+                    "text": "что двадцать пятый псалом если вы открыли давайте сейчас прочитаем",
+                    "parsed": {
+                        "book": "Псалтирь",
+                        "chapter": 25,
+                        "start_verse": 1,
+                        "end_verse": 1,
+                        "ref": "Псалтирь 25:1",
+                    },
+                },
+                {
+                    "book": "Псалтирь",
+                    "chapter": 125,
+                    "start_verse": 1,
+                    "end_verse": 1,
+                    "ref": "Псалтирь 125:1",
+                },
+            )
+        )
+
     def test_replay_opens_and_grows_only_a_sequential_text_reading(self) -> None:
         from tools.replay_audio_files import (
             extend_open_ended_replay_passage,
@@ -1840,6 +2269,39 @@ class TextCitationIntegrationTest(unittest.TestCase):
         self.assertEqual("Иоанн 14:1-4", passage["ref"])
         self.assertEqual([1, 2, 3, 4], [item["verse"] for item in slides["targets"]])
 
+    def test_replay_overlapping_windows_starts_sequence_at_first_confirmed_verse(self) -> None:
+        from tools.replay_audio_files import (
+            infer_replay_sequential_text_reading,
+            replay_smart_slide_state,
+            sequential_resume_index,
+        )
+
+        state = {}
+        first = {
+            "source": "text_citation",
+            "parsed": {
+                "book": "Деяния", "chapter": 2,
+                "start_verse": 11, "end_chapter": 2, "end_verse": 12,
+            },
+        }
+        second = {
+            "source": "text_citation",
+            "parsed": {
+                "book": "Деяния", "chapter": 2,
+                "start_verse": 12, "end_chapter": 2, "end_verse": 14,
+            },
+        }
+
+        self.assertIsNone(infer_replay_sequential_text_reading(first, state, 28.5))
+        inferred = infer_replay_sequential_text_reading(second, state, 38.75)
+
+        self.assertEqual("Деяния 2:11-14", inferred["parsed"]["ref"])
+        slides = replay_smart_slide_state(inferred, "one_verse")
+        self.assertEqual(
+            0,
+            sequential_resume_index(slides["targets"], inferred["parsed"]["start_verse"]),
+        )
+
     def test_open_ended_replay_reading_waits_instead_of_completing(self) -> None:
         from tools.replay_audio_files import defer_open_ended_replay_completion
 
@@ -1857,6 +2319,87 @@ class TextCitationIntegrationTest(unittest.TestCase):
         self.assertEqual("ожидать следующий стих", decision["action_label"])
         self.assertEqual("await_next_element_for_open_reading", decision["reason"])
 
+    def test_replay_builds_range_list_only_before_reading_starts(self) -> None:
+        from tools.replay_audio_files import (
+            replay_reference_list_payload,
+            replay_unread_range_reference,
+            update_replay_unread_range_list,
+        )
+
+        active_passage = {"book": "Левит", "chapter": 23, "ref": "Левит 23:4-8"}
+        second = replay_unread_range_reference(
+            {},
+            "праздник труб иголевита двадцать третья глава двадцать третий двадцать пятый стих",
+            active_passage,
+        )
+        self.assertEqual("Левит 23:23-25", second["ref"])
+
+        replay_state = {
+            "unread_range_candidate": {
+                "ref": "Левит 23:4-8", "source_text": "левит 23 с 4 по 8 стих",
+            },
+        }
+        references = update_replay_unread_range_list(
+            replay_state, second, reading_started=False
+        )
+        self.assertEqual(
+            ["Левит 23:4-8", "Левит 23:23-25"],
+            [item["ref"] for item in references],
+        )
+
+        third = {"ref": "Левит 23:33-44", "source_text": "левит 23:33-44"}
+        references = update_replay_unread_range_list(
+            replay_state, third, reading_started=False
+        )
+        self.assertEqual(
+            ["Левит 23:4-8", "Левит 23:23-25", "Левит 23:33-44"],
+            [item["ref"] for item in references],
+        )
+        list_payload = replay_reference_list_payload(references, "следующий праздник")
+        self.assertEqual("reference_list", list_payload["slide"]["slide_type"])
+        self.assertEqual(
+            "Левит 23:4-8\nЛевит 23:23-25\nЛевит 23:33-44",
+            list_payload["slide"]["verse"],
+        )
+
+        fresh_state = {
+            "unread_range_candidate": {
+                "ref": "Левит 23:4-8", "source_text": "левит 23 с 4 по 8 стих",
+            },
+        }
+        self.assertIsNone(
+            update_replay_unread_range_list(
+                fresh_state, second, reading_started=True
+            )
+        )
+        self.assertNotIn("range_list_mode", fresh_state)
+
+    def test_specific_range_refines_a_previously_announced_whole_psalm(self) -> None:
+        from tools.replay_audio_files import update_replay_unread_range_list
+
+        replay_state = {
+            "unread_range_candidate": {
+                "ref": "Псалтирь 76:1-21",
+                "source_text": "давайте сейчас откроем семьдесят шестой псалом",
+            },
+        }
+        result = update_replay_unread_range_list(
+            replay_state,
+            {
+                "ref": "Псалтирь 76:2-7",
+                "source_text": "шестой псалом со второго по седьмой стих",
+            },
+            reading_started=False,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(
+            "Псалтирь 76:2-7",
+            replay_state.get("range_refinement", {}).get("ref"),
+        )
+        self.assertNotIn("range_list_mode", replay_state)
+        self.assertNotIn("unread_range_candidate", replay_state)
+
     def test_replay_does_not_open_text_reading_after_a_long_gap(self) -> None:
         from tools.replay_audio_files import infer_replay_sequential_text_reading
 
@@ -1872,7 +2415,30 @@ class TextCitationIntegrationTest(unittest.TestCase):
         infer_replay_sequential_text_reading(first, state, 80.25)
         self.assertIsNone(infer_replay_sequential_text_reading(second, state, 101.0))
 
-    def test_replay_smart_slide_shadow_waits_for_next_verse_after_current_boundary(self) -> None:
+    def test_inferred_reading_preserves_explicit_announced_range_start(self) -> None:
+        from tools.replay_audio_files import infer_replay_sequential_text_reading
+
+        state = {
+            "announced_range": {
+                "book": "Филиппийцам", "chapter": 1,
+                "start_verse": 8, "end_verse": 11,
+            },
+        }
+        first = {"source": "text_citation", "parsed": {
+            "book": "Филиппийцам", "chapter": 1,
+            "start_verse": 9, "end_chapter": 1, "end_verse": 10,
+        }}
+        second = {"source": "text_citation", "parsed": {
+            "book": "Филиппийцам", "chapter": 1,
+            "start_verse": 10, "end_chapter": 1, "end_verse": 11,
+        }}
+        self.assertIsNone(infer_replay_sequential_text_reading(first, state, 10.0))
+        inferred = infer_replay_sequential_text_reading(second, state, 15.0)
+
+        self.assertIsNotNone(inferred)
+        self.assertEqual("Филиппийцам 1:8-11", inferred["parsed"]["ref"])
+
+    def test_replay_smart_slide_shadow_advances_after_current_boundary(self) -> None:
         from bible_parser_core.sequence_advancer import decide_sequence_advance
         from tools.replay_audio_files import (
             apply_replay_smart_slide_decision,
@@ -1888,6 +2454,15 @@ class TextCitationIntegrationTest(unittest.TestCase):
         self.assertIsNotNone(state)
         self.assertEqual(9, len(state["targets"]))
         self.assertFalse(state["current_slide_visible"])
+
+        visible_state = replay_smart_slide_state({
+            "parsed": {
+                "book": "Иаков", "chapter": 1, "start_verse": 19,
+                "end_chapter": 1, "end_verse": 27, "ref": "Иаков 1:19-27",
+            },
+        }, "one_verse", initially_visible=True)
+        self.assertIsNotNone(visible_state)
+        self.assertTrue(visible_state["current_slide_visible"])
 
         activation = decide_sequence_advance(
             state,
@@ -1913,9 +2488,10 @@ class TextCitationIntegrationTest(unittest.TestCase):
             margin=20.0,
             matched_words=3,
         )
-        self.assertEqual("keep", decision["action"])
+        self.assertEqual("advance", decision["action"])
+        self.assertEqual("strong_current_boundary_auto_next", decision["reason"])
         self.assertTrue(apply_replay_smart_slide_decision(state, decision))
-        self.assertEqual(0, state["current_index"])
+        self.assertEqual(1, state["current_index"])
 
     def test_manual_smart_slide_context_builds_one_verse_range(self) -> None:
         from tools.replay_audio_files import manual_smart_slide_state

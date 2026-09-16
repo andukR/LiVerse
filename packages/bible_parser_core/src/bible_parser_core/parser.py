@@ -313,6 +313,31 @@ FUZZY_NUMBER_HINTS = {
     "пят": [5, 15, 50],
 }
 ASR_REPLACEMENTS = (
+    # Sherpa can replace a feminine chapter ordinal with a masculine-looking
+    # form and omit the word «глава»: «пятьдесят возьмого три стих».
+    # Restore it only when a preceding number and a following verse marker
+    # make the Bible-address context explicit; ordinary «седьмого» speech is
+    # therefore left untouched.
+    (
+        r"\b((?:\d+|[а-я]+)\s+)возьмого"
+        r"(?=\s+(?:\d+|[а-я]+)\s+стих\w*\b)",
+        r"\1восьмая глава",
+    ),
+    (
+        r"\b((?:\d+|[а-я]+)\s+)тредьего"
+        r"(?=\s+(?:\d+|[а-я]+)\s+стих\w*\b)",
+        r"\1третья глава",
+    ),
+    (
+        r"\b((?:\d+|[а-я]+)\s+)сетьмого"
+        r"(?=\s+(?:\d+|[а-я]+)\s+стих\w*\b)",
+        r"\1седьмая глава",
+    ),
+    (
+        r"\b((?:\d+|[а-я]+)\s+)седьмого"
+        r"(?=\s+(?:\d+|[а-я]+)\s+стих\w*\b)",
+        r"\1седьмая глава",
+    ),
     (r"\bи\s+у\s*ван(?:на|ов)\b", "иоанна"),
     (r"\bи\s+уанна\b", "иоанна"),
     (r"\bиоана\b", "иоанна"),
@@ -355,6 +380,7 @@ ASR_REPLACEMENTS = (
     (r"\bио\s+иль\b", "иоиль"),
     (r"\b(книга|книги)\s+ио\b", r"\1 иова"),
     (r"\bеванглий\s+от\s+матвеевич\b", "евангелие от матфея"),
+    (r"\bи\s+в\s+ангелие\b", "евангелие"),
     (r"\bивангел[а-я]*\b", "евангелие"),
     (r"\bивангед[а-я]*\b", "евангелие"),
     (r"\bевангелия\b", "евангелие"),
@@ -386,6 +412,19 @@ ASR_REPLACEMENTS = (
     (r"\bремью\b", "иеремия"),
     (r"\bпаророка\s+и\s+языки\b", "пророка иезекииля"),
     (r"\bко[\s-]*ко[\s-]*и[\s-]*с[\s-]*а[\s-]*и\b", "исай"),
+    # Sherpa may hear «Исаия сорок третий стих» as «и слая сорока
+    # третий стих».  Insert the omitted chapter marker only for this
+    # book-specific form; otherwise «сорока» remains ordinary speech.
+    (
+        r"\b(и\s+сла(?:я|ия))\s+сорока\s+"
+        r"(перв\w*|втор\w*|трет\w*|четверт\w*|пят\w*|шест\w*|"
+        r"седьм\w*|восьм\w*|девят\w*|десят\w*|\d+)\s+стих",
+        r"\1 сорок глава \2 стих",
+    ),
+    # Sherpa can turn «сорок» into «сорока» in an Isaiah 40:3 address.
+    # Keep this correction tied to the following verse marker so ordinary
+    # speech about a magpie («сорока») is unaffected.
+    (r"\bсорока\s+(?=(?:перв\w*|втор\w*|трет\w*|четверт\w*|пят\w*|шест\w*|седьм\w*|восьм\w*|девят\w*|десят\w*|\d+)\s+стих)", "сорок "),
     (r"\bмалахи\b", "малахия"),
     (r"\bпервым\s+посланником\b", "первое послание"),
     (r"\bвторым\s+посланником\b", "второе послание"),
@@ -404,6 +443,9 @@ ASR_REPLACEMENTS = (
     (r"\b(?:1|первое|первая|первого)\s+яна\b", "1 иоанна"),
     (r"\b(?:2|второе|вторая|второго)\s+яна\b", "2 иоанна"),
     (r"\b(?:3|третье|третья|третьего)\s+яна\b", "3 иоанна"),
+    # Sherpa can insert «она» after «Иван/Иоанн говорит». In an address
+    # followed by «глава» this is a false fragment, not the book Иона.
+    (r"\bиван\s+говорит\s+она(?=\s+(?:\d+|перв\w*|втор\w*|трет\w*|четверт\w*|пят\w*|шест\w*|седьм\w*|восьм\w*|девят\w*|десят\w*)\s+глав)", "иоанн говорит"),
     # Rodnik replay: "первое послание Иоанна" -> "первое познание ана".
     # The required following chapter keeps ordinary talk about knowledge out.
     (
@@ -413,6 +455,10 @@ ASR_REPLACEMENTS = (
     ),
     (r"\b(?:1|первая|первое)\s+темофе[яю]\b", "1 тимофею"),
     (r"\b(?:2|вторая|второе)\s+темофе[яю]\b", "2 тимофею"),
+    # Spoken nominative forms «первый/второй Тимофей» still name the epistle,
+    # not a chapter number; normalize them before number parsing.
+    (r"\bпервый\s+тимофе[йяю]\b", "1 тимофею"),
+    (r"\bвторой\s+тимофе[йяю]\b", "2 тимофею"),
     (r"\bкол\s+о\s+сия\s+нам\b", "колоссянам"),
     (r"\bкол\s+оси\s+нам\b", "колоссянам"),
     (r"\bкол\s+оси\s+яна\b", "колоссянам"),
@@ -429,6 +475,18 @@ ASR_REPLACEMENTS = (
     (r"\bкоренция\s+нам\b", "коринфянам"),
     (r"\bкаринфен[а-я]*\b", "коринфянам"),
     (r"\bкаримфин[а-я]*\b", "коринфянам"),
+    (r"\bкаренкома\b", "коринфянам"),
+    (r"\bкарифинам\b", "коринфянам"),
+    # Rodnik replay ASR: «второй постоянный корень винова» ->
+    # «второе послание Коринфянам».
+    (r"\bвторой\s+постоянный\b", "второе послание"),
+    (r"\bвторому\s+посланию(?=\s+(?:карифинам|коринфянам))", "второе послание"),
+    (r"\bкорень\s+винова\b", "коринфянам"),
+    # Replay ASR: «название коррейфеном» / «послание карете на» name
+    # Коринфянам; keep the second form compatible with numbered epistles.
+    (r"\bназвание\s+коррейфеном\b", "коринфянам"),
+    (r"\bпослание\s+карете\s+на\b", "послание коринфянам"),
+    (r"\bкарете\s+на\b", "коринфянам"),
     (
         r"(?<!первое )(?<!первая )(?<!первого )(?<!второе )(?<!вторая )(?<!второго )(?<!1 )(?<!2 )\bпослани[ея]\s+фес\b",
         "послание фи",
@@ -452,6 +510,8 @@ ASR_REPLACEMENTS = (
     ),
     (r"\bантрите\s+огова\b", "3 глава"),
     (r"\b(?:солм|салм)[а-я]*\b", "псалом"),
+    # Sherpa may render «псалом дачу» instead of «псалом дальше».
+    (r"\bпсалом\s+дачу\b", "псалом"),
     (r"\bаге[яй]\b", "аггей"),
     (r"\b(\d+)\s+агла\b", r"\1 глава"),
     (r"\bпервоглава\b", "1 глава"),
@@ -472,6 +532,8 @@ ASR_REPLACEMENTS = (
     (r"\bи\s+вся\s+на\b", "ефесянам"),
     (r"\bвся\s+на\b", "ефесянам"),
     (r"\b(?:и\s+)?всяна\b", "ефесянам"),
+    # Sherpa: «Ефесянам» -> «и овсяна» in a spoken epistle address.
+    (r"\bи\s+овсяна(?=\s+(?:в\s+там\s+)?(?:\d+|перв\w*|втор\w*|трет\w*|четверт\w*|пят\w*|шест\w*|седьм\w*|восьм\w*|девят\w*|десят\w*)\s+глав)", "ефесянам"),
     # Rodnik replay: "послание Ефесянам" -> "послание все на".
     # Keep the surrounding word "послание" so ordinary "все на ..." speech
     # cannot become a Bible book.
@@ -492,6 +554,14 @@ ASR_REPLACEMENTS = (
     (r"\bтестих\b", "стих"),
     (r"\bстив\b", "стих"),
     (r"\bсих\b", "стих"),
+    # Sherpa: «стихи» can be heard as «сехи».
+    (r"\bсехи\b", "стих"),
+    # In cross-chapter ranges Sherpa also heard «стиха» as «сеха».
+    (r"\bсеха\b", "стих"),
+    # Observed Sherpa distortion in a range: «десятый» -> «десяток».
+    # Restrict it to the «по … стих» boundary so the noun «десяток» keeps
+    # its ordinary meaning elsewhere.
+    (r"\bпо\s+десяток\s+стих\b", "по десятый стих"),
     (r"\b(открыть|откройте|открываем|откроем)[^0-9а-яa-z]+при\s+(\d+\s+глав[аеуы])\b", r"\1 притчи \2"),
     (r"\bглавус\b", "глава"),
     (r"\bглавоз\b", "глава"),
@@ -538,6 +608,49 @@ TRUNCATED_THIRTY_ORDINALS = {
     "восьм": 38,
     "девят": 39,
 }
+
+# Sherpa may replace the ``-ый`` ending of a masculine ordinal with ``-ок``.
+# These repairs are enabled only in the explicit ``по … стих`` range shape.
+TRUNCATED_OK_ORDINALS = {
+    "первок": 1,
+    "четверток": 4,
+    "пяток": 5,
+    "девяток": 9,
+    "десяток": 10,
+    "одиннадцаток": 11,
+    "двенадцаток": 12,
+    "тринадцаток": 13,
+    "четырнадцаток": 14,
+    "пятнадцаток": 15,
+    "шестнадцаток": 16,
+    "семнадцаток": 17,
+    "восемнадцаток": 18,
+    "девятнадцаток": 19,
+    "двадцаток": 20,
+    "тридцаток": 30,
+    "пятидесяток": 50,
+    "шестидесяток": 60,
+    "семидесяток": 70,
+    "восьмидесяток": 80,
+    "девяносток": 90,
+    "соток": 100,
+}
+TRUNCATED_OK_ORDINAL_RE = re.compile(
+    r"\bпо\s+(" + "|".join(sorted(TRUNCATED_OK_ORDINALS, key=len, reverse=True)) + r")\s+стих\b"
+)
+TRUNCATED_OK_TENS = {
+    "двадцать": 20, "тридцать": 30, "сорок": 40,
+    "пятьдесят": 50, "шестьдесят": 60, "семьдесят": 70,
+    "восемьдесят": 80, "девяносто": 90,
+}
+TRUNCATED_OK_UNITS = {"первок": 1, "четверток": 4, "пяток": 5, "девяток": 9}
+TRUNCATED_OK_COMPOUND_RE = re.compile(
+    r"\bпо\s+("
+    + "|".join(sorted(TRUNCATED_OK_TENS, key=len, reverse=True))
+    + r")\s+("
+    + "|".join(sorted(TRUNCATED_OK_UNITS, key=len, reverse=True))
+    + r")\s+стих\b"
+)
 
 TRUNCATED_ORDINAL_VERSES = {
     "одиннад": 11,
@@ -644,6 +757,14 @@ def replace_thousand_noise_verse_range(match: re.Match[str]) -> str:
     )
 
 
+def replace_truncated_ok_ordinal(match: re.Match[str]) -> str:
+    return f"по {TRUNCATED_OK_ORDINALS[match.group(1)]} стих"
+
+
+def replace_truncated_ok_compound(match: re.Match[str]) -> str:
+    return f"по {TRUNCATED_OK_TENS[match.group(1)] + TRUNCATED_OK_UNITS[match.group(2)]} стих"
+
+
 def normalize_text(text: str) -> str:
     normalized = text.lower().replace("ё", "е")
     for pattern, replacement in ASR_REPLACEMENTS:
@@ -664,6 +785,14 @@ def normalize_text(text: str) -> str:
     normalized = re.sub(r"(\d+)\s*[-–]\s*(\d+)\s*[-–]?\s*х\b", r"\1-\2 стих", normalized)
     normalized = re.sub(r"(\d+)[-–]?(?:й|я|ю|е|го|му|м)\b", r"\1", normalized)
     normalized = re.sub(r"[^0-9а-яa-z]+", " ", normalized)
+    normalized = TRUNCATED_OK_ORDINAL_RE.sub(
+        replace_truncated_ok_ordinal,
+        normalized,
+    )
+    normalized = TRUNCATED_OK_COMPOUND_RE.sub(
+        replace_truncated_ok_compound,
+        normalized,
+    )
     normalized = TRUNCATED_FEMININE_CHAPTER_ORDINAL_RE.sub(
         replace_truncated_feminine_chapter_ordinal,
         normalized,
@@ -716,6 +845,14 @@ def normalize_text(text: str) -> str:
     normalized = re.sub(r"\b1\s+книг\w*\s+(?:пар|пара)липомин[а-я]*\b", "1 паралипоменон", normalized)
     normalized = re.sub(r"\b2\s+книг\w*\s+(?:пар|пара)липомин[а-я]*\b", "2 паралипоменон", normalized)
     normalized = re.sub(r"\b([12])\s+послание\s+коринфянам\b", r"\1 коринфянам", normalized)
+    # If Sherpa stops after a single ordinal verse ("четвёртая глава
+    # пятый"), keep the explicit chapter marker.  Otherwise the number of
+    # the numbered epistle can be mistaken for the chapter number.
+    normalized = re.sub(
+        r"\b([12])\s+коринфянам\s+(\d+)\s+глава\s+(\d+)\s*$",
+        r"\1 коринфянам \2 глава \3 стих",
+        normalized,
+    )
     normalized = re.sub(r"\b([12])\s+послание\s+тимофею\b", r"\1 тимофею", normalized)
     normalized = re.sub(r"\b([12])\s+послание\s+петра\b", r"\1 петра", normalized)
     normalized = re.sub(r"\b([123])\s+послание\s+яна\b", r"\1 иоанна", normalized)
@@ -1013,7 +1150,11 @@ def book_candidates(normalized: str) -> list[BookCandidate]:
         if not variant or variant in GENERIC_BOOK_VARIANTS:
             continue
         for match in re.finditer(rf"(?<!\S){re.escape(variant)}(?!\S)", normalized):
-            score = min(1.0, 0.72 + len(variant) / 45)
+            # A phrase found verbatim in the maintained alias dictionary is
+            # an exact lexical match, regardless of its length.  Previously
+            # short but intentional ASR aliases (for example «ефисянам»)
+            # received a sub-1.0 score and were later mislabeled as fuzzy.
+            score = 1.0
             candidate = BookCandidate(canonical, score, match.start(), match.end(), variant)
             key = (candidate.book, candidate.start, candidate.end)
             if key not in seen or candidate.score > seen[key].score:
@@ -1027,6 +1168,12 @@ def book_candidates(normalized: str) -> list[BookCandidate]:
             end = tokens[index + size - 1][2]
             candidate_text = " ".join(token for token, _start, _end in tokens[index : index + size])
             if candidate_text in GENERIC_BOOK_VARIANTS:
+                continue
+            # Inflected standalone forms of «послание» are ordinary context,
+            # not a particular epistle.  Treating «послании» as a fuzzy alias
+            # for Philippians (or another book) can beat a real book mention
+            # elsewhere in the same ASR window.
+            if re.fullmatch(r"послани\w*", candidate_text):
                 continue
             # Обычные слова «бы» и «быть» фонетически близки к сокращению
             # «Быт», но сами по себе не должны означать книгу Бытие.
@@ -1075,8 +1222,7 @@ def book_candidates(normalized: str) -> list[BookCandidate]:
         candidate
         for candidate in candidates
         if not any(
-            exact.book != candidate.book
-            and candidate.score < 0.999
+            candidate.score < 0.999
             and candidate.start <= exact.start
             and candidate.end >= exact.end
             for exact in exact_candidates
@@ -1099,6 +1245,11 @@ def book_candidate_specificity_bonus(candidate: BookCandidate, candidates: list[
     bonus = 0.0
     family = book_candidate_family(candidate.book)
     text = candidate.text
+    # An exact dictionary alias is stronger evidence than a fuzzy fragment
+    # elsewhere in the same ASR buffer (for example, «офисянам» must beat
+    # the earlier accidental «послание к» -> 1 Иоанна).
+    if candidate.score >= 0.999:
+        bonus += 0.5
     if re.match(r"^\d+\s", text):
         bonus += 0.75
     if any(keyword in text for keyword in ("послание", "евангелие", "книга")):
@@ -1854,14 +2005,78 @@ def split_compact_range_token(token: str, chapter_map: dict[int, str], require_r
     return list(range(best_start, best_end + 1))
 
 
+def _unanchored_person_name_book_candidate(
+    book_candidate: BookCandidate,
+    ref_candidate: RefCandidate,
+    normalized: str,
+) -> bool:
+    if (
+        book_candidate.book == "Иаков"
+        and book_candidate.text in {"яков", "иакова", "иаково"}
+        and not 0 <= ref_candidate.start - book_candidate.end <= 3
+    ):
+        return True
+    # In «Иуда, брата Иакова» the two book-like words are names in the
+    # surrounding biblical text, not a new citation.
+    return (
+        book_candidate.book == "Иуда"
+        and book_candidate.text == "иуда"
+        and bool(re.match(r"\s+брата\s+иакова\b", normalized[book_candidate.end :]))
+    )
+
+
+def remove_restarted_number_before_chapter(normalized: str) -> str:
+    """Discard one restarted number and its one-word noise before a chapter.
+
+    ASR may render «Иоанна, один из ... первая глава, одиннадцатый стих» as
+    ``Иоанна 1 из 1 глава 11 стих``.  Once a book has been identified, the
+    number directly before ``глава`` is the chapter; the preceding number and
+    arbitrary intervening word are a false restart.  Requiring the following
+    explicit verse marker keeps ordinary book titles and numbered epistles
+    outside this repair.
+    """
+    book_matches = [candidate for candidate in book_candidates(normalized) if candidate.score >= 0.9]
+    for candidate in sorted(book_matches, key=lambda item: (item.end - item.start, -item.start), reverse=True):
+        suffix = normalized[candidate.end :]
+        noise = re.match(
+            r"\s+\d+\s+[a-zа-я]+\s+(?=\d+\s+глав[а-я]*\s+\d+\s+стих\b)",
+            suffix,
+        )
+        if noise:
+            return f"{normalized[:candidate.end]} {suffix[noise.end():]}".strip()
+    return normalized
+
+
 def parse_live_reference(text: str, bible_path: Path = DEFAULT_BIBLE) -> ParsedReference | None:
     normalized = normalize_text(text)
     if is_first_n_chapters_discussion(normalized):
         return None
+    normalized = remove_restarted_number_before_chapter(normalized)
     bible = bible_map(bible_path)
     books = book_candidates(normalized)
     if not books:
         return None
+    full_gospel_titles = [
+        candidate
+        for candidate in books
+        if candidate.book in {"Матфей", "Марк", "Лука", "Иоанн"}
+        and candidate.score >= 0.999
+        and candidate.text.startswith(("евангелие от ", "ангелие от "))
+    ]
+    if full_gospel_titles:
+        # A short book name inside a recognized complete Gospel title is an
+        # ASR fragment of that title, not a second book mention (e.g. «Иона»
+        # inside «Евангелие от Иона»).
+        books = [
+            candidate
+            for candidate in books
+            if not any(
+                title.book != candidate.book
+                and title.start <= candidate.start
+                and candidate.end <= title.end
+                for title in full_gospel_titles
+            )
+        ]
     explicit_numbered_books = [
         candidate
         for candidate in books
@@ -1880,7 +2095,51 @@ def parse_live_reference(text: str, bible_path: Path = DEFAULT_BIBLE) -> ParsedR
     book_bonuses = {id(candidate): book_candidate_specificity_bonus(candidate, books) for candidate in books}
     best: tuple[float, BookCandidate, RefCandidate] | None = None
     for book_candidate in books:
-        for ref_candidate in ref_candidates(normalized, book_candidate.book, bible):
+        gospel_title_anchor = next(
+            (
+                title
+                for title in full_gospel_titles
+                if title.book == book_candidate.book
+                and title.start == book_candidate.start
+                and title.end == book_candidate.end
+            ),
+            None,
+        )
+        number_search_offset = gospel_title_anchor.start if gospel_title_anchor else 0
+        number_search_text = normalized[number_search_offset:]
+        candidates_for_book = ref_candidates(number_search_text, book_candidate.book, bible)
+        if number_search_offset:
+            candidates_for_book = [
+                RefCandidate(
+                    chapter=candidate.chapter,
+                    verses=candidate.verses,
+                    start=candidate.start + number_search_offset,
+                    end=candidate.end + number_search_offset,
+                    score=candidate.score,
+                    end_chapter=candidate.end_chapter,
+                    end_verse=candidate.end_verse,
+                )
+                for candidate in candidates_for_book
+            ]
+        for ref_candidate in candidates_for_book:
+            # Bare forms such as «Яков» and «Иакова» can name a person in
+            # ordinary sermon text (for example, «Яков Алфеев» or «брата
+            # Иакова»). Treat them as the book only when the address follows
+            # immediately; the fuller aliases «послание Иакова» remain
+            # unambiguous even when the speaker pauses before the numbers.
+            if _unanchored_person_name_book_candidate(book_candidate, ref_candidate, normalized):
+                continue
+            # A full Gospel title is a strong anchor for the reference that
+            # follows it. Ignore numeric fragments from earlier sermon speech
+            # (e.g. «один отрывок ... Евангелие от Иона 3:16»), which can
+            # otherwise be combined with the real chapter and verse into a
+            # false range such as John 1:3-16.
+            if (
+                book_candidate.book in {"Матфей", "Марк", "Лука", "Иоанн"}
+                and book_candidate.text.startswith(("евангелие от ", "ангелие от "))
+                and ref_candidate.start < book_candidate.end
+            ):
+                continue
             book_center = (book_candidate.start + book_candidate.end) / 2
             ref_center = (ref_candidate.start + ref_candidate.end) / 2
             distance = abs(book_center - ref_center)
@@ -1910,8 +2169,19 @@ def parse_live_reference(text: str, bible_path: Path = DEFAULT_BIBLE) -> ParsedR
                 best = (score, book_candidate, ref_candidate)
 
     if best is None:
-        selected_book_candidate = books[0]
-        book, confidence = books[0].book, books[0].score
+        safe_books = []
+        for candidate in books:
+            refs = ref_candidates(normalized, candidate.book, bible)
+            if refs and all(
+                _unanchored_person_name_book_candidate(candidate, ref, normalized)
+                for ref in refs
+            ):
+                continue
+            safe_books.append(candidate)
+        if not safe_books:
+            return None
+        selected_book_candidate = safe_books[0]
+        book, confidence = selected_book_candidate.book, selected_book_candidate.score
         chapter, verses = infer_chapter_and_verses(normalized, book, bible)
         ref_candidate = None
     else:

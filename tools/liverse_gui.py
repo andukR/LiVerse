@@ -1442,6 +1442,16 @@ class LiVerseGui:
             else:
                 local_label = str(update.get("local_label") or "установленная версия")
                 remote_label = str(update.get("remote_label") or "новая версия")
+            notes = str(update.get("release_notes") or "").strip()
+            if notes:
+                notes_prompt = messagebox.askyesno(
+                    "Что нового в LiVerse",
+                    f"Release Notes для версии {remote_label}:\n\n{notes}\n\n"
+                    "Продолжить обновление?",
+                )
+                if not notes_prompt:
+                    self._start_after_update_check()
+                    return
             install = messagebox.askyesno(
                 "Обновление LiVerse",
                 f"Доступно обновление.\n\nСейчас: {local_label}\nНа GitHub: {remote_label}\n\nУстановить сейчас?",

@@ -177,6 +177,56 @@ def float_value(value: object, default: float = 0.0) -> float:
         return default
 
 
+def accepted_text_citation_from_events(
+    case: dict[str, Any], cases_path: Path | None,
+) -> dict[str, Any]:
+    """Recover TEXT_ACCEPTED evidence for trigger files created by older code."""
+    if cases_path is None:
+        return {}
+    events_path = cases_path.parent / "events.jsonl"
+    if not events_path.exists():
+        return {}
+    case_payload = case.get("payload") if isinstance(case.get("payload"), dict) else {}
+    if isinstance(case_payload.get("text_citation"), dict):
+        return case_payload["text_citation"]
+
+    def ref_key(value: object) -> tuple[int, int] | None:
+        match = re.search(r"(\d+)\s*:\s*(\d+)", str(value or ""))
+        return (int(match.group(1)), int(match.group(2))) if match else None
+
+    target_key = ref_key(case.get("ref"))
+    case_time = float_value(case.get("timecode_seconds"))
+    start = float_value(case.get("window_start_seconds"), case_time - 1.0)
+    end = float_value(case.get("window_end_seconds"), case_time + 1.0)
+    candidates: list[tuple[float, dict[str, Any]]] = []
+    last_replay_seconds = case_time
+    for event in load_jsonl(events_path):
+        if event.get("replay_seconds") is not None:
+            last_replay_seconds = float_value(event.get("replay_seconds"), last_replay_seconds)
+        if event.get("event") != "TEXT_ACCEPTED":
+            continue
+        # TEXT_ACCEPTED historically had no replay_seconds of its own; use
+        # the timestamp of the preceding final_raw event in that case.
+        replay_seconds = float_value(event.get("replay_seconds"), last_replay_seconds)
+        if not start <= replay_seconds <= end:
+            continue
+        if target_key is not None and ref_key(event.get("reference")) != target_key:
+            continue
+        candidates.append((abs(replay_seconds - case_time), event))
+    if not candidates:
+        return {}
+    event = min(candidates, key=lambda item: item[0])[1]
+    return {
+        "index_reference": event.get("reference"),
+        "window": event.get("window"),
+        "score": event.get("score"),
+        "margin": event.get("margin"),
+        "matched_words": event.get("matched_words"),
+        "confirmations": event.get("confirmations"),
+        "reason": event.get("reason"),
+    }
+
+
 def play_case(case: dict[str, Any], cases_path: Path, *, long: bool = False) -> None:
     audio_path = case_audio_path(case, cases_path)
     if not audio_path.exists():
@@ -243,6 +293,17 @@ def print_case(case: dict[str, Any], position: int, total: int, *, cases_path: P
     parser_text = str(payload.get("text") or "").strip()
     if parser_text and parser_text != str(case.get("vosk_text") or "").strip():
         print(f"parser_text: {parser_text}")
+    text_citation = accepted_text_citation_from_events(case, cases_path)
+    text_window = str(text_citation.get("window") or "").strip()
+    if text_window:
+        print(
+            "TEXT_ACCEPTED: "
+            f"score={text_citation.get('score')} "
+            f"margin={text_citation.get('margin')} "
+            f"words={text_citation.get('matched_words')} "
+            f"confirmations={text_citation.get('confirmations')}"
+        )
+        print(f"TEXT_ACCEPTED.window: {text_window}")
     reference_list = payload.get("reference_list") if isinstance(payload.get("reference_list"), list) else []
     if reference_list:
         print(f"recognized_list ({len(reference_list)}):")
@@ -577,6 +638,10 @@ def next_unreviewed_smart_slide(entries: list[SmartSlideEntry], start: int) -> i
 
 def normal_slide_updates(events_path: Path) -> list[dict[str, Any]]:
     """Recreate ordinary LiVerse slide changes omitted by SMART_SLIDE_SHADOW."""
+    # In the review browser, a four-verse announcement is already too long to
+    # print as one text block.  This is intentionally local to the replay
+    # timeline; the live Holyrics API keeps its historical five-verse rule.
+    browser_long_range_min_verses = 4
     updates: list[dict[str, Any]] = []
     replay_seconds = 0.0
     accumulated_list_refs: list[str] = []
@@ -627,12 +692,18 @@ def normal_slide_updates(events_path: Path) -> list[dict[str, Any]]:
         inferred_sequential_reading = (
             str(payload.get("source") or "") == "replay_inferred_sequential_text_reading"
         )
-        long_range = scripture_range(parsed_payload) is not None
+        long_range = scripture_range(
+            parsed_payload,
+            min_same_chapter_verses=browser_long_range_min_verses,
+        ) is not None
         if inferred_sequential_reading:
             # This is not an announced range.  By now text matching has proved
             # that the reader reached the final observed verse, so show that
-            # one verse immediately; the UPS will advance from it afterwards.
-            current = parse_live_reference(f"{parsed.book} {parsed.end_chapter or parsed.chapter}:{parsed.end_verse}")
+            # one current verse immediately; the UPS will advance from it
+            # afterwards.  The replay event may carry the start of the latest
+            # recognized fragment (for example 5 in a candidate 5-7).
+            display_verse = int(payload.get("sequential_display_verse") or parsed.end_verse)
+            current = parse_live_reference(f"{parsed.book} {parsed.end_chapter or parsed.chapter}:{display_verse}")
             if current is None:
                 continue
             element = {
@@ -666,6 +737,24 @@ def normal_slide_updates(events_path: Path) -> list[dict[str, Any]]:
     return updates
 
 
+def speech_updates(events_path: Path) -> list[dict[str, Any]]:
+    """Recreate the latest final ASR text for the browser diagnostics field."""
+    updates: list[dict[str, Any]] = []
+    for line_number, event in enumerate(load_jsonl(events_path), start=1):
+        if event.get("event") not in {"final_raw", "partial_raw"}:
+            continue
+        result = event.get("result") if isinstance(event.get("result"), dict) else {}
+        text = str(event.get("text") or result.get("text") or "").strip()
+        if not text:
+            continue
+        updates.append({
+            "event_id": f"{events_path.parent.name}:speech:{line_number}",
+            "replay_seconds": float_value(event.get("replay_seconds")),
+            "text": text,
+        })
+    return updates
+
+
 def diagnostic_events(events_path: Path, stop_seconds: float, radius: float = 12.0) -> list[dict[str, Any]]:
     """Return a compact, time-scoped snapshot useful for investigating a stopped replay."""
     result: list[dict[str, Any]] = []
@@ -690,6 +779,44 @@ def diagnostic_events(events_path: Path, stop_seconds: float, radius: float = 12
             "reason": str(event.get("reason") or ""),
         })
     return result
+
+
+def smart_slide_state_at_time(events_path: Path, stop_seconds: float) -> dict[str, Any]:
+    """Find the last UPS decision at/before Enter and the first one after it."""
+    before: dict[str, Any] | None = None
+    after: dict[str, Any] | None = None
+    replay_seconds = 0.0
+    for line_number, event in enumerate(load_jsonl(events_path), start=1):
+        if event.get("replay_seconds") is not None:
+            replay_seconds = float_value(event.get("replay_seconds"), replay_seconds)
+        if event.get("event") != "SMART_SLIDE_SHADOW":
+            continue
+        snapshot = {
+            "event_id": f"{events_path.parent.name}:smart_slide:{line_number}",
+            "replay_seconds": replay_seconds,
+            "action": str(event.get("action") or ""),
+            "reason": str(event.get("reason") or ""),
+            "passage": str(event.get("passage") or ""),
+            "active": event.get("active"),
+            "current_index": event.get("current_index"),
+            "target_index": event.get("target_index"),
+            "candidate": str(event.get("candidate") or ""),
+        }
+        if replay_seconds <= stop_seconds:
+            before = snapshot
+        elif after is None:
+            after = snapshot
+
+    before_is_active = bool(before) and (
+        bool(before.get("active"))
+        if before.get("active") is not None
+        else before.get("action") != "complete"
+    )
+    return {
+        "active_passage_at_stop": str(before.get("passage") or "") if before_is_active else "",
+        "decision_at_or_before_stop": before,
+        "first_decision_after_stop": after,
+    }
 
 
 class SmartSlideBrowserReview:
@@ -721,6 +848,39 @@ class SmartSlideBrowserReview:
             self.position = max(0, min(len(self.entries) - 1, self.position + delta))
         return self.state()
 
+    def _sequence_ids(self) -> list[int]:
+        return list(dict.fromkeys(entry.sequence_id for entry in self.entries))
+
+    def _sequence_audio_key(self, sequence_id: int) -> str:
+        entry = next(entry for entry in self.entries if entry.sequence_id == sequence_id)
+        return str(smart_slide_audio_path(entry).resolve())
+
+    def _browser_sequence_bounds(self, sequence_ids: list[int]) -> tuple[int, int]:
+        """Return adjacent logical sequences represented by one WAV playback."""
+        current_sequence = self.entries[self.position].sequence_id
+        current_index = sequence_ids.index(current_sequence)
+        audio_key = self._sequence_audio_key(current_sequence)
+        first = current_index
+        while first > 0 and self._sequence_audio_key(sequence_ids[first - 1]) == audio_key:
+            first -= 1
+        last = current_index
+        while last + 1 < len(sequence_ids) and self._sequence_audio_key(sequence_ids[last + 1]) == audio_key:
+            last += 1
+        return first, last
+
+    def move_sequence(self, delta: int) -> dict[str, Any]:
+        """Select the previous/next browser part, which may contain several ranges."""
+        with self.lock:
+            sequence_ids = self._sequence_ids()
+            first, last = self._browser_sequence_bounds(sequence_ids)
+            target_index = max(0, min(len(sequence_ids) - 1, (first - 1) if delta < 0 else (last + 1)))
+            target_sequence = sequence_ids[target_index]
+            self.position = next(
+                index for index, entry in enumerate(self.entries)
+                if entry.sequence_id == target_sequence
+            )
+        return self.timeline()
+
     def save_review(self, category: str, note: str) -> dict[str, Any]:
         categories = {value[0] for value in SMART_SLIDE_CATEGORIES.values()}
         if category not in categories:
@@ -748,8 +908,10 @@ class SmartSlideBrowserReview:
 
     def timeline(self) -> dict[str, Any]:
         with self.lock:
-            sequence_id = self.entries[self.position].sequence_id
-            sequence = [entry for entry in self.entries if entry.sequence_id == sequence_id]
+            sequence_ids = self._sequence_ids()
+            first_sequence_index, last_sequence_index = self._browser_sequence_bounds(sequence_ids)
+            playback_sequence_ids = set(sequence_ids[first_sequence_index:last_sequence_index + 1])
+            sequence = [entry for entry in self.entries if entry.sequence_id in playback_sequence_ids]
             tracks: list[dict[str, Any]] = []
             for entry in sequence:
                 audio_path = smart_slide_audio_path(entry)
@@ -770,14 +932,20 @@ class SmartSlideBrowserReview:
                 )
             for track in tracks:
                 updates: list[dict[str, Any]] = []
+                speech: list[dict[str, Any]] = []
                 for events_path_text in track.pop("events_paths"):
-                    updates.extend(normal_slide_updates(Path(events_path_text)))
+                    events_path = Path(events_path_text)
+                    updates.extend(normal_slide_updates(events_path))
+                    speech.extend(speech_updates(events_path))
                 track["display_updates"] = sorted(updates, key=lambda item: float_value(item.get("replay_seconds")))
+                track["speech_updates"] = sorted(speech, key=lambda item: float_value(item.get("replay_seconds")))
             return {
-                "sequence_id": sequence_id,
-                "sequence_number": sequence_id + 1,
-                "sequence_total": len({entry.sequence_id for entry in self.entries}),
-                "passage": str(sequence[0].event.get("passage") or "") if sequence else "",
+                "sequence_id": sequence_ids[first_sequence_index],
+                "sequence_number": first_sequence_index + 1,
+                "sequence_start_number": first_sequence_index + 1,
+                "sequence_end_number": last_sequence_index + 1,
+                "sequence_total": len(sequence_ids),
+                "passage": str(sequence[-1].event.get("passage") or "") if sequence else "",
                 "tracks": tracks,
                 "remaining": sum(1 for entry in self.entries if smart_slide_is_unreviewed(entry)),
             }
@@ -816,6 +984,9 @@ class SmartSlideBrowserReview:
                 raise ValueError("Решение УПС рядом с остановкой не найдено.")
             incident_path = entry.events_path.with_name("smart_slide_incidents.jsonl")
             evidence = diagnostic_events(entry.events_path, stop_seconds)
+            state_at_stop = smart_slide_state_at_time(entry.events_path, stop_seconds)
+            decision_before = state_at_stop["decision_at_or_before_stop"] or {}
+            decision_after = state_at_stop["first_decision_after_stop"] or {}
             incident_id = f"{entry.events_path.parent.name}:incident:{stop_seconds:.3f}"
             incident = {
                 "incident_id": incident_id,
@@ -825,11 +996,15 @@ class SmartSlideBrowserReview:
                 "audio": str(smart_slide_audio_path(entry).resolve()),
                 "operator_stop_seconds": round(stop_seconds, 3),
                 "displayed_ref": displayed_ref,
-                "active_passage": str(entry.event.get("passage") or ""),
-                "nearest_smart_slide_event_id": entry.event_id,
-                "nearest_smart_slide_seconds": float_value(entry.event.get("replay_seconds")),
-                "nearest_smart_slide_action": str(entry.event.get("action") or ""),
-                "nearest_smart_slide_reason": str(entry.event.get("reason") or ""),
+                "active_passage": state_at_stop["active_passage_at_stop"],
+                "decision_at_or_before_stop": decision_before,
+                "first_decision_after_stop": decision_after,
+                # Retain the old keys for readers of historical incident rows;
+                # new reports use the explicitly time-scoped fields above.
+                "nearest_smart_slide_event_id": str(decision_before.get("event_id") or ""),
+                "nearest_smart_slide_seconds": float_value(decision_before.get("replay_seconds")),
+                "nearest_smart_slide_action": str(decision_before.get("action") or ""),
+                "nearest_smart_slide_reason": str(decision_before.get("reason") or ""),
                 "browser_session_id": self.session_id,
                 "note": note,
                 "evidence": evidence,
@@ -845,20 +1020,27 @@ class SmartSlideBrowserReview:
             f"{item['ref'] or item['text'] or item['action'] or item['reason']}"
             for item in evidence
         ]
+        decision_before_line = (
+            f"last_decision_at_or_before_stop={decision_before.get('action')} "
+            f"at {float_value(decision_before.get('replay_seconds')):.3f}s "
+            f"reason={decision_before.get('reason') or 'не указано'}"
+            if decision_before else "До остановки ещё нет решения УПС."
+        )
+        decision_after_line = (
+            f"first_decision_after_stop={decision_after.get('action')} "
+            f"at {float_value(decision_after.get('replay_seconds')):.3f}s "
+            f"reason={decision_after.get('reason') or 'не указано'}"
+            if decision_after else "После остановки в журнале нет решения УПС."
+        )
         report = "\n".join([
             "Ошибка браузерной эмуляции УПС",
             f"log={incident['log']}",
             f"audio={incident['audio']}",
             f"timecode={int(minutes):02d}:{seconds:06.3f}",
             f"displayed_ref={displayed_ref or 'не указан'}",
-            f"active_passage={incident['active_passage']}",
-            (
-                f"nearest_decision={incident['nearest_smart_slide_action']} "
-                f"at {incident['nearest_smart_slide_seconds']:.3f}s"
-                if stop_seconds >= incident["nearest_smart_slide_seconds"]
-                else f"first_decision_after_stop={incident['nearest_smart_slide_action']} "
-                f"at {incident['nearest_smart_slide_seconds']:.3f}s"
-            ),
+            f"active_passage_at_stop={incident['active_passage'] or 'нет активного диапазона УПС'}",
+            decision_before_line,
+            decision_after_line,
             *(evidence_lines or ["  В ближайшем окне полезных событий нет."]),
         ])
         return {"ok": True, "incident_id": incident_id, "report": report}
@@ -897,19 +1079,37 @@ class SmartSlideBrowserReview:
         for number, incident in enumerate(incidents, start=1):
             stop_seconds = float_value(incident["operator_stop_seconds"])
             minutes, seconds = divmod(stop_seconds, 60)
-            decision_seconds = float_value(incident["nearest_smart_slide_seconds"])
-            decision_relation = (
-                f"первое решение после остановки: {incident['nearest_smart_slide_action']} в {decision_seconds:.3f} с"
-                if stop_seconds < decision_seconds
-                else f"ближайшее решение: {incident['nearest_smart_slide_action']} в {decision_seconds:.3f} с"
-            )
+            decision_before = incident.get("decision_at_or_before_stop") or {}
+            decision_after = incident.get("first_decision_after_stop") or {}
+            if not decision_before and not decision_after:
+                # Backward compatibility for reports created before this fix.
+                decision_before = {
+                    "action": incident.get("nearest_smart_slide_action"),
+                    "reason": incident.get("nearest_smart_slide_reason"),
+                    "replay_seconds": incident.get("nearest_smart_slide_seconds"),
+                }
+                if float_value(decision_before.get("replay_seconds")) > stop_seconds:
+                    decision_after, decision_before = decision_before, {}
+            decision_lines = [
+                (
+                    f"- Последнее решение на/до остановки: {decision_before.get('action')} "
+                    f"в {float_value(decision_before.get('replay_seconds')):.3f} с "
+                    f"({decision_before.get('reason') or 'причина не указана'})"
+                    if decision_before else "- До остановки ещё нет решения УПС."
+                ),
+                (
+                    f"- Первое решение после остановки: {decision_after.get('action')} "
+                    f"в {float_value(decision_after.get('replay_seconds')):.3f} с "
+                    f"({decision_after.get('reason') or 'причина не указана'})"
+                    if decision_after else "- После остановки в журнале нет решения УПС."
+                ),
+            ]
             lines.extend([
                 "",
                 f"## {number}. {int(minutes):02d}:{seconds:06.3f}",
                 f"- Экран: {incident['displayed_ref'] or 'не указан'}",
-                f"- Активный диапазон: {incident['active_passage'] or 'не указан'}",
-                f"- {decision_relation}",
-                f"- Основание: {incident['nearest_smart_slide_reason'] or 'не указано'}",
+                f"- Активный диапазон УПС на момент остановки: {incident.get('active_passage') or 'нет активного диапазона'}",
+                *decision_lines,
                 f"- Журнал: `{incident['log']}`",
             ])
             if incident["note"]:
@@ -922,16 +1122,22 @@ class SmartSlideBrowserReview:
     def complete_sequence(self, observed_event_ids: list[str]) -> dict[str, Any]:
         observed = {str(value) for value in observed_event_ids}
         with self.lock:
-            current_sequence = self.entries[self.position].sequence_id
+            sequence_ids = self._sequence_ids()
+            first_sequence_index, last_sequence_index = self._browser_sequence_bounds(sequence_ids)
+            playback_sequence_ids = set(sequence_ids[first_sequence_index:last_sequence_index + 1])
             for entry in self.entries:
-                if entry.sequence_id != current_sequence or entry.event_id not in observed:
+                if entry.sequence_id not in playback_sequence_ids or entry.event_id not in observed:
                     continue
                 if not smart_slide_is_unreviewed(entry):
                     continue
                 action = str(entry.event.get("action") or "")
                 category = "correct_transition" if action in SMART_SLIDE_DISPLAY_ACTIONS else "correct_hold"
                 update_smart_slide_review(entry, category)
-            next_position = next_unreviewed_smart_slide(self.entries, self.position + 1)
+            last_entry_position = max(
+                index for index, entry in enumerate(self.entries)
+                if entry.sequence_id in playback_sequence_ids
+            )
+            next_position = next_unreviewed_smart_slide(self.entries, last_entry_position + 1)
             if next_position < len(self.entries):
                 self.position = next_position
                 finished = False
@@ -1100,6 +1306,13 @@ def start_smart_slide_browser_review(entries: list[SmartSlideEntry], args: argpa
                 except (TypeError, ValueError):
                     delta = 0
                 self.send_json({"ok": True, "state": controller.move(-1 if delta < 0 else 1)})
+                return
+            if self.path == "/api/sequence":
+                try:
+                    delta = int(payload.get("delta") or 0)
+                except (TypeError, ValueError):
+                    delta = 0
+                self.send_json({"ok": True, "timeline": controller.move_sequence(-1 if delta < 0 else 1)})
                 return
             self.send_error(404)
 

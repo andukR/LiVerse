@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import wave
+from dataclasses import asdict
 from pathlib import Path
 
 
@@ -35,6 +36,7 @@ from bible_parser_core.sequence_advancer import (
 from bible_parser_core.sherpa_streaming import (
     DEFAULT_SHERPA_THREADS,
     SherpaReplayRecognizer,
+    estimate_recent_speech_rate,
     load_sherpa_recognizer,
     sherpa_result_to_vosk_result,
 )
@@ -235,6 +237,39 @@ def infer_replay_chapter_reading(payload: dict) -> dict | None:
     return add_slide_payload(inferred)
 
 
+def is_conflicting_psalm_chapter_inference(
+    payload: dict,
+    previous_parsed: dict | None,
+) -> bool:
+    """Reject a replay-only Psalm chapter inferred over a recent Psalm address.
+
+    Sherpa occasionally drops the leading ``сто`` and turns Psalm 125 into
+    Psalm 25 on the next announcement fragment.  Do not replace a recently
+    established three-digit Psalm with that smaller chapter; the text search
+    still has an opportunity to confirm the actual Psalm from its words.
+    """
+    if not isinstance(previous_parsed, dict):
+        return False
+    parsed = payload.get("parsed") if isinstance(payload.get("parsed"), dict) else {}
+    if str(payload.get("source") or "") != "parser":
+        return False
+    if parsed.get("book") != "Псалтирь" or previous_parsed.get("book") != "Псалтирь":
+        return False
+    try:
+        previous_chapter = int(previous_parsed.get("chapter") or 0)
+        chapter = int(parsed.get("chapter") or 0)
+    except (TypeError, ValueError):
+        return False
+    return (
+        previous_chapter >= 100
+        and 1 <= chapter < 100
+        and previous_parsed.get("start_verse") == 1
+        and previous_parsed.get("end_verse") == 1
+        and parsed.get("start_verse") == 1
+        and "псалом" in normalize_text(str(payload.get("text") or ""))
+    )
+
+
 def infer_replay_sequential_text_reading(
     payload: dict,
     replay_state: dict[str, object],
@@ -280,7 +315,15 @@ def infer_replay_sequential_text_reading(
         or end_verse <= previous_end
     ):
         return None
-    range_start = min(previous_start, start_verse)
+    announced = replay_state.get("announced_range")
+    announced_start = 0
+    if isinstance(announced, dict):
+        if (
+            str(announced.get("book") or "") == book
+            and int(announced.get("chapter") or 0) == chapter
+        ):
+            announced_start = int(announced.get("start_verse") or 0)
+    range_start = min(value for value in (previous_start, start_verse, announced_start) if value > 0)
     # The endpoint has not been announced.  Keep it open and grow the range
     # only when the following verses are actually recognized; guessing the
     # end of John 14 as verse 31 would mislead the congregation.
@@ -304,7 +347,12 @@ def infer_replay_sequential_text_reading(
     return add_slide_payload(inferred)
 
 
-def replay_smart_slide_state(payload: dict, slide_mode: str) -> dict | None:
+def replay_smart_slide_state(
+    payload: dict,
+    slide_mode: str,
+    *,
+    initially_visible: bool = False,
+) -> dict | None:
     """Build the same ordered slide bounds as a live Holyrics presentation."""
     range_payload = payload.get("slide") or payload.get("parsed") or payload
     max_verses = 1 if slide_mode == "one_verse" else DEFAULT_LONG_RANGE_SLIDE_MAX_VERSES
@@ -317,7 +365,164 @@ def replay_smart_slide_state(payload: dict, slide_mode: str) -> dict | None:
     state = scripture_range_reading_state(range_payload, slides)
     if state is not None:
         state["slide_mode"] = slide_mode
+        if initially_visible:
+            state["current_slide_visible"] = True
     return state
+
+
+def replay_unread_range_reference(
+    pipeline_payload: dict,
+    text: str,
+    active_passage: dict | None,
+) -> dict | None:
+    """Extract a newly announced range while replay is already following one.
+
+    The ordinary replay parser is intentionally paused during a known reading.
+    For this narrow replay-only check, accept only a parsed multi-verse address;
+    if ASR dropped the book name, retry with the active book, but only when the
+    spoken fragment explicitly names a chapter and a verse range in that same
+    chapter.
+    """
+    parsed = pipeline_payload.get("parsed") if isinstance(pipeline_payload, dict) else None
+    if not isinstance(parsed, dict):
+        parsed = None
+
+    def as_range_item(value: object) -> dict | None:
+        if not isinstance(value, dict):
+            return None
+        try:
+            start = int(value.get("start_verse") or 0)
+            end = int(value.get("end_verse") or start)
+        except (TypeError, ValueError):
+            return None
+        if not value.get("book") or not value.get("chapter") or end <= start:
+            return None
+        ref = str(value.get("ref") or "").strip()
+        if not ref:
+            return None
+        return {"ref": ref, "source_text": text}
+
+    item = as_range_item(parsed)
+    active_ref = str((active_passage or {}).get("ref") or "").strip()
+    if item and item.get("ref") != active_ref:
+        return item
+
+    # A few recorded range announcements lose the book name to ASR (for
+    # example, «иголевита»). Reuse the active book only when the chapter and
+    # both ends of a range are still explicit in the spoken words.
+    if not active_passage or not re.search(r"\bглав\w*\b", normalize_text(text)):
+        return None
+    if not re.search(r"\bстих\w*\b", normalize_text(text)):
+        return None
+    book = str(active_passage.get("book") or "").strip()
+    active_chapter = int(active_passage.get("chapter") or 0)
+    if not book or active_chapter <= 0:
+        return None
+    inferred = parse_live_reference(f"{book} {text}")
+    if inferred is None or inferred.book != book or inferred.chapter != active_chapter:
+        return None
+    if int(inferred.end_verse or inferred.start_verse) <= int(inferred.start_verse):
+        return None
+    return {"ref": inferred.ref, "source_text": text}
+
+
+def update_replay_unread_range_list(
+    replay_state: dict[str, object],
+    item: dict,
+    *,
+    reading_started: bool,
+) -> list[dict] | None:
+    """Start/extend a replay-only list when a new range precedes its reading."""
+    ref = str(item.get("ref") or "").strip()
+    if not ref or reading_started:
+        return None
+    listing = replay_state.get("range_list_mode")
+    if isinstance(listing, list):
+        known = {str(row.get("ref") or "") for row in listing if isinstance(row, dict)}
+        if ref not in known:
+            listing.append(dict(item))
+        return [dict(row) for row in listing if isinstance(row, dict)]
+
+    pending = replay_state.get("unread_range_candidate")
+    if not isinstance(pending, dict):
+        return None
+    previous_ref = str(pending.get("ref") or "").strip()
+    if not previous_ref or ref == previous_ref:
+        return None
+
+    previous = parse_live_reference(previous_ref)
+    current = parse_live_reference(ref)
+    previous_source = normalize_text(str(pending.get("source_text") or ""))
+    current_source = normalize_text(str(item.get("source_text") or ""))
+    if previous is not None and current is not None:
+        previous_chapter = bible_map().get(previous.book, {}).get(previous.chapter, {})
+        is_bare_full_chapter = (
+            previous.book == current.book
+            and previous.chapter == current.chapter
+            and previous.start_verse == 1
+            and previous.end_verse == max(previous_chapter, default=0)
+            and "стих" not in previous_source
+            and not re.search(r"\b(?:по|до)\b", previous_source)
+        )
+        is_explicit_narrower_range = (
+            (current.end_chapter or current.chapter) == previous.chapter
+            and current.end_verse > current.start_verse
+            and "стих" in current_source
+            and bool(re.search(r"\b(?:по|до)\b", current_source))
+            and (
+                current.start_verse > previous.start_verse
+                or current.end_verse < previous.end_verse
+            )
+        )
+        if is_bare_full_chapter and is_explicit_narrower_range:
+            # A whole-psalm/chapter title followed by its specific reading
+            # range is a refinement, not two independent references.
+            replay_state.pop("unread_range_candidate", None)
+            replay_state.pop("range_list_mode", None)
+            replay_state["range_refinement"] = dict(item)
+            return None
+
+    listing = [dict(pending), dict(item)]
+    replay_state["range_list_mode"] = listing
+    replay_state.pop("unread_range_candidate", None)
+    return [dict(row) for row in listing]
+
+
+def replay_reference_list_payload(references: list[dict], text: str) -> dict:
+    """Build the familiar large-font reference-list slide for replay review."""
+    return add_slide_payload({
+        "text": text,
+        "source": "parser_reference_list",
+        "matched": True,
+        "parsed": None,
+        "reference_list": [dict(item) for item in references],
+    })
+
+
+def replay_range_list_context(replay_state: dict[str, object]) -> dict | None:
+    """Use the first listed range as narrow context for a split next address."""
+    listing = replay_state.get("range_list_mode")
+    if not isinstance(listing, list) or not listing:
+        return None
+    first = next((item for item in listing if isinstance(item, dict)), None)
+    if first is None:
+        return None
+    parsed = parse_live_reference(str(first.get("ref") or ""))
+    if parsed is None:
+        return None
+    return {
+        "book": parsed.book,
+        "chapter": parsed.chapter,
+        "ref": parsed.ref,
+    }
+
+
+def sequential_resume_index(targets: list[dict], candidate_start: int) -> int:
+    """Return the first slide covered by the newly recognized range."""
+    for index, target in enumerate(targets):
+        if isinstance(target, dict) and int(target.get("start_verse") or 0) == candidate_start:
+            return index
+    return max(0, len(targets) - 1)
 
 
 def manual_smart_slide_state(
@@ -359,6 +564,11 @@ def manual_smart_slide_state(
 
 def apply_replay_smart_slide_decision(state: dict, decision: dict) -> bool:
     """Update only replay's virtual slide; return False when the range is complete."""
+    confirmation_state = decision.get("confirmation_state")
+    if confirmation_state == "required":
+        state["await_current_confirmation"] = True
+    elif confirmation_state == "confirmed":
+        state.pop("await_current_confirmation", None)
     if decision.get("action") == "complete":
         return False
     if decision.get("action") == "activate":
@@ -406,6 +616,7 @@ def handle_replay_smart_slide_partial(
     text_detector: ScriptureTextDetector | None,
     replay_state: dict[str, object],
     logger: JsonlLogger,
+    speech_rate_wps: float | None = None,
 ) -> None:
     """Advance replay's virtual slide from evolving Sherpa text."""
     state = replay_state.get("smart_slide_shadow")
@@ -425,6 +636,8 @@ def handle_replay_smart_slide_partial(
         "activate", "advance", "assisted_advance", "synchronize_forward",
         "assisted_synchronize_forward", "complete",
     }:
+        if decision.get("confirmation_state") == "confirmed":
+            apply_replay_smart_slide_decision(state, decision)
         return
     logger.write(
         "SMART_SLIDE_SHADOW",
@@ -435,6 +648,8 @@ def handle_replay_smart_slide_partial(
             "window": str(getattr(evidence, "window_text", "") or partial),
             "replay_seconds": replay_seconds,
             "recognition_result": "partial",
+            # Observational only for now: rate never triggers a slide change.
+            "speech_rate_wps": speech_rate_wps,
         },
     )
     if not apply_replay_smart_slide_decision(state, decision):
@@ -1953,7 +2168,11 @@ def replay_audio_file(
     if isinstance(manual_smart_slide, dict):
         replay_state["smart_slide_shadow"] = copy.deepcopy(manual_smart_slide)
     if args.asr_engine == "sherpa-0.54":
-        recognizer = SherpaReplayRecognizer(model, args.samplerate)
+        recognizer = SherpaReplayRecognizer(
+            model,
+            args.samplerate,
+            adaptive_segmentation=args.sherpa_adaptive_segmentation,
+        )
     else:
         recognizer_args = [model, args.samplerate]
         if grammar is not None:
@@ -1978,6 +2197,16 @@ def replay_audio_file(
             "model": str(args.sherpa_model if args.asr_engine == "sherpa-0.54" else args.model),
             "sherpa_threads": (
                 args.sherpa_threads if args.asr_engine == "sherpa-0.54" else None
+            ),
+            "sherpa_min_utterance_length": (
+                args.sherpa_min_utterance_length
+                if args.asr_engine == "sherpa-0.54"
+                else None
+            ),
+            "sherpa_adaptive_segmentation": (
+                args.sherpa_adaptive_segmentation
+                if args.asr_engine == "sherpa-0.54"
+                else None
             ),
             "asr_confidence": (
                 "derived_from_subword_probabilities"
@@ -2012,6 +2241,7 @@ def replay_audio_file(
     audio_bytes_seen = 0
     trigger_case_count = 0
     last_sherpa_partial = ""
+    last_sherpa_speech_rate: float | None = None
     try:
         for data in pcm_chunks(path, args.samplerate, args.chunk_bytes):
             if audio_log:
@@ -2020,7 +2250,13 @@ def replay_audio_file(
             replay_seconds = audio_bytes_seen / float(args.samplerate * 2)
             if args.asr_engine == "sherpa-0.54":
                 results = recognizer.accept_waveform(data, replay_seconds)
-                partial = "" if results else recognizer.partial_result()
+                if results:
+                    partial = ""
+                    last_sherpa_speech_rate = None
+                else:
+                    partial, last_sherpa_speech_rate = (
+                        recognizer.partial_result_with_speech_rate()
+                    )
                 if partial and partial != last_sherpa_partial:
                     handle_replay_smart_slide_partial(
                         partial,
@@ -2028,6 +2264,7 @@ def replay_audio_file(
                         text_detector,
                         replay_state,
                         logger,
+                        speech_rate_wps=last_sherpa_speech_rate,
                     )
                 last_sherpa_partial = partial
             elif recognizer.AcceptWaveform(data):
@@ -2095,12 +2332,23 @@ def handle_result(
     reading_list: list[dict],
 ) -> int:
     text = str(result.get("text") or "").strip()
-    logger.write("final_raw", {"result": result, "text": text, "replay_seconds": replay_seconds})
+    speech_rate_wps = estimate_recent_speech_rate(result)
+    logger.write(
+        "final_raw",
+        {
+            "result": result,
+            "text": text,
+            "replay_seconds": replay_seconds,
+            "speech_rate_wps": speech_rate_wps,
+        },
+    )
     if not text:
         return 0
 
     address_detection_enabled = args.citation_detection_mode != "text_only"
     long_passage = replay_state.get("long_passage")
+    previous_parsed = pipeline.last_parsed
+    unread_range_item = None
     if address_recognition_allowed(address_detection_enabled, bool(long_passage)):
         pipeline_payload = pipeline.process_text(
             text,
@@ -2109,11 +2357,53 @@ def handle_result(
             now_ms=int(replay_seconds * 1000),
         )
     else:
+        if address_detection_enabled and isinstance(long_passage, dict):
+            range_payload = pipeline.process_text(
+                text,
+                asr_result=result,
+                show_candidates=args.show_candidates,
+                now_ms=int(replay_seconds * 1000),
+            )
+            unread_range_item = replay_unread_range_reference(
+                range_payload, text, long_passage
+            )
         pipeline_payload = {
             "text": text,
             "matched": False,
             "parsed": None,
             "source": "text_only",
+        }
+
+    # Preserve the beginning of an explicitly announced range. Later text
+    # matches may start at verse 9 or 10, but must not rewrite an announced
+    # range such as 8-11 to begin at the first matched verse.
+    if pipeline_payload.get("matched") and str(pipeline_payload.get("source") or "") == "parser":
+        parsed_reference = pipeline_payload.get("parsed") if isinstance(pipeline_payload.get("parsed"), dict) else {}
+        if parsed_reference:
+            start = int(parsed_reference.get("start_verse") or 0)
+            end = int(parsed_reference.get("end_verse") or start)
+            if start > 0 and end > start:
+                replay_state["announced_range"] = dict(parsed_reference)
+            else:
+                replay_state.pop("announced_range", None)
+
+
+    if is_conflicting_psalm_chapter_inference(pipeline_payload, previous_parsed):
+        logger.write(
+            "REPLAY_SUPPRESSED_CONFLICTING_PSALM",
+            {
+                "previous_reference": (previous_parsed or {}).get("ref"),
+                "candidate_reference": (pipeline_payload.get("parsed") or {}).get("ref"),
+                "replay_seconds": replay_seconds,
+            },
+        )
+        pipeline.last_parsed = previous_parsed
+        pipeline_payload = {
+            **pipeline_payload,
+            "matched": False,
+            "parsed": None,
+            "source": "replay_suppressed_conflicting_psalm",
+            "replay_suppressed_reason": "conflicting_recent_psalm_chapter",
         }
 
     incomplete_reference = pipeline_payload.get("incomplete_reference")
@@ -2146,6 +2436,7 @@ def handle_result(
             incomplete_address_correction=(
                 replay_state.get("incomplete_reference") is not None
             ),
+            book_chapter_context=pipeline_payload.get("book_chapter_context"),
         )
         if replay_state.get("incomplete_reference") is not None:
             if text_decision.reason == "text_corrected_incomplete_address":
@@ -2186,10 +2477,10 @@ def handle_result(
         payload = text_citation_payload(text_decision, text)
     else:
         payload = add_slide_payload(pipeline_payload)
-    accumulate_reading_list(payload, reading_list)
-
     if (
         long_passage is None
+        and not replay_state.get("range_list_mode")
+        and unread_range_item is None
         and args.text_operator_hints
         and text_decision is not None
     ):
@@ -2236,21 +2527,122 @@ def handle_result(
                     else str(getattr(text_decision, "window_text", "") or "")
                 ),
                 "replay_seconds": replay_seconds,
+                # Diagnostic only. Text evidence remains the sole slide trigger.
+                "speech_rate_wps": speech_rate_wps,
             },
         )
         if not apply_replay_smart_slide_decision(smart_slide_shadow, shadow_decision):
             replay_state["smart_slide_shadow"] = None
+        if shadow_decision.get("action") in {
+            "activate", "advance", "assisted_advance",
+            "synchronize_forward", "assisted_synchronize_forward",
+            "complete",
+        }:
+            replay_state.pop("unread_range_candidate", None)
+
+    active_shadow = replay_state.get("smart_slide_shadow")
+    reading_started = bool(
+        not isinstance(active_shadow, dict)
+        or active_shadow.get("current_slide_visible")
+        or int(active_shadow.get("current_index") or 0) > 0
+    )
+    had_list_mode = isinstance(replay_state.get("range_list_mode"), list)
+    if unread_range_item is None and had_list_mode:
+        unread_range_item = replay_unread_range_reference(
+            pipeline_payload,
+            text,
+            replay_range_list_context(replay_state),
+        )
+    if unread_range_item is not None:
+        accumulated_ranges = update_replay_unread_range_list(
+            replay_state,
+            unread_range_item,
+            reading_started=reading_started and not had_list_mode,
+        )
+        range_refinement = replay_state.pop("range_refinement", None)
+        if isinstance(range_refinement, dict):
+            refined = parse_live_reference(str(range_refinement.get("ref") or ""))
+            if refined is not None:
+                refined_payload = {
+                    "text": text,
+                    "source": "parser_repeated_chapter_range_correction",
+                    "matched": True,
+                    "parsed": asdict(refined),
+                    "reference_list": [],
+                }
+                pipeline_payload = refined_payload
+                payload = add_slide_payload(refined_payload)
+                pipeline.last_parsed = refined
+                replay_state["announced_range"] = asdict(refined)
+                replay_state["long_passage"] = None
+                replay_state["smart_slide_shadow"] = None
+                replay_state.pop("unread_range_candidate", None)
+                replay_state.pop("range_list_mode", None)
+                long_passage = None
+                if text_detector is not None:
+                    text_detector.clear()
+                pipeline.context_range = None
+                pipeline.context_current_chapter = None
+                unread_range_item = None
+                accumulated_ranges = None
+        if accumulated_ranges:
+            if not had_list_mode:
+                replay_state["long_passage"] = None
+                replay_state["smart_slide_shadow"] = None
+                replay_state.pop("unread_range_candidate", None)
+                if text_detector is not None:
+                    text_detector.clear()
+                pipeline.context_range = None
+                pipeline.context_current_chapter = None
+            payload = replay_reference_list_payload(accumulated_ranges, text)
+    if had_list_mode and unread_range_item is None:
+        parsed_now = pipeline_payload.get("parsed") if isinstance(pipeline_payload, dict) else None
+        if (
+            text_decision is not None and text_decision.accepted
+        ) or (
+            isinstance(parsed_now, dict)
+            and int(parsed_now.get("end_verse") or 0)
+            <= int(parsed_now.get("start_verse") or 0)
+        ):
+            replay_state.pop("range_list_mode", None)
 
     inferred_chapter_reading = infer_replay_chapter_reading(payload)
-    if inferred_chapter_reading is not None:
+    if inferred_chapter_reading is not None and not replay_state.get("range_list_mode"):
         payload = inferred_chapter_reading
     inferred_sequential_reading = None
-    if long_passage is None and inferred_chapter_reading is None:
+    if (
+        long_passage is None
+        and inferred_chapter_reading is None
+        and not replay_state.get("range_list_mode")
+    ):
         inferred_sequential_reading = infer_replay_sequential_text_reading(
             payload, replay_state, replay_seconds
         )
         if inferred_sequential_reading is not None:
+            # The inferred range may combine overlapping accepted windows,
+            # e.g. 11-12 followed by 12-14.  Start at the earliest confirmed
+            # verse in that combined range, not at the newer window's start;
+            # otherwise the first verse after the overlap is skipped.
+            parsed_range = inferred_sequential_reading.get("parsed") or {}
+            first_confirmed_verse = int(parsed_range.get("start_verse") or 0)
+            if first_confirmed_verse:
+                inferred_sequential_reading["sequential_display_verse"] = first_confirmed_verse
             payload = inferred_sequential_reading
+    accumulate_reading_list(payload, reading_list)
+    # Keep the evidence that caused TEXT_ACCEPTED even when a later replay
+    # inference replaces the display payload (for example, sequential reading).
+    # The ordinary annotator uses this to show the actual ASR search window.
+    if text_decision is not None and text_decision.accepted:
+        candidate = getattr(text_decision, "top_candidate", None)
+        payload["text_citation"] = {
+            "index_reference": str(getattr(candidate, "reference", "") or ""),
+            "window": str(getattr(text_decision, "window_text", "") or ""),
+            "score": round(float(text_decision.score), 3),
+            "margin": round(float(text_decision.margin), 3),
+            "matched_words": int(text_decision.matched_words),
+            "confirmations": int(text_decision.confirmations),
+            "reason": str(text_decision.reason or ""),
+        }
     accepted_passage = replay_long_passage(payload)
     if (
         text_detector is not None
@@ -2268,6 +2660,9 @@ def handle_result(
             replay_state["smart_slide_shadow"] = replay_smart_slide_state(
                 payload,
                 args.long_range_slide_mode,
+                # At this point the browser shows the address of the range,
+                # not the first verse's text slide.
+                initially_visible=False,
             )
             if inferred_sequential_reading is not None:
                 smart_slide_shadow = replay_state.get("smart_slide_shadow")
@@ -2275,11 +2670,54 @@ def handle_result(
                     smart_slide_shadow["open_ended"] = True
                     targets = smart_slide_shadow.get("targets")
                     if isinstance(targets, list) and targets:
-                        # Earlier text has already established the current
-                        # verse.  Start there, rather than flashing a title or
-                        # replaying verses the congregation just heard.
-                        smart_slide_shadow["current_index"] = len(targets) - 1
+                        # Earlier text has already established the beginning
+                        # of the current candidate range.  Resume at that
+                        # verse, so a candidate such as 5-7 advances through
+                        # verse 6 instead of jumping straight to verse 7.
+                        parsed_range = inferred_sequential_reading.get("parsed") or {}
+                        first_confirmed_verse = int(parsed_range.get("start_verse") or 0)
+                        smart_slide_shadow["current_index"] = sequential_resume_index(
+                            targets, first_confirmed_verse
+                        )
                         smart_slide_shadow["current_slide_visible"] = True
+                        # The text decision that created this open-ended
+                        # sequence was evaluated before the shadow state
+                        # existed. Re-evaluate it now so the just-finished
+                        # verse can immediately hand off to the next slide.
+                        if text_decision is not None:
+                            initial_decision, initial_evidence = decide_sequence_progress_from_text(
+                                smart_slide_shadow,
+                                text_decision,
+                                lambda current: text_detector.evaluate_known_sequence(
+                                    current, replay_seconds
+                                ),
+                            )
+                            initial_decision = defer_open_ended_replay_completion(
+                                smart_slide_shadow, initial_decision
+                            )
+                            logger.write(
+                                "SMART_SLIDE_SHADOW",
+                                {
+                                    **initial_decision,
+                                    "passage": str(smart_slide_shadow.get("ref") or ""),
+                                    "slide_mode": str(smart_slide_shadow.get("slide_mode") or ""),
+                                    "window": str(getattr(initial_evidence, "window_text", "") or text),
+                                    "replay_seconds": replay_seconds,
+                                    "speech_rate_wps": speech_rate_wps,
+                                },
+                            )
+                            apply_replay_smart_slide_decision(
+                                smart_slide_shadow, initial_decision
+                            )
+            elif not replay_state.get("range_list_mode"):
+                parsed_range = payload.get("parsed") if isinstance(payload.get("parsed"), dict) else {}
+                start_verse = int(parsed_range.get("start_verse") or 0)
+                end_verse = int(parsed_range.get("end_verse") or start_verse)
+                if start_verse > 0 and end_verse > start_verse:
+                    replay_state["unread_range_candidate"] = {
+                        "ref": str(parsed_range.get("ref") or accepted_passage.get("ref") or ""),
+                        "source_text": text,
+                    }
             logger.write(
                 "REPLAY_CONTEXT_RANGE_SELECTED",
                 {"passage": accepted_passage, "replay_seconds": replay_seconds},
@@ -2443,6 +2881,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sherpa-model", type=Path, default=DEFAULT_SHERPA_MODEL_PATH)
     parser.add_argument("--sherpa-threads", type=int, default=DEFAULT_SHERPA_THREADS)
+    parser.add_argument(
+        "--sherpa-min-utterance-length",
+        type=float,
+        default=10.0,
+        help="Replay-only Sherpa endpoint setting in seconds (default: 10).",
+    )
+    parser.add_argument(
+        "--sherpa-adaptive-segmentation",
+        action="store_true",
+        help=(
+            "In replay, force Sherpa utterance boundaries every 3-10 seconds "
+            "based on recent words per second."
+        ),
+    )
     parser.add_argument("--bible", type=Path, default=DEFAULT_BIBLE)
     parser.add_argument("--samplerate", type=int, default=16000)
     parser.add_argument("--chunk-bytes", type=int, default=8000)
@@ -2679,6 +3131,7 @@ def main() -> int:
             args.sherpa_model,
             sample_rate=args.samplerate,
             num_threads=args.sherpa_threads,
+            min_utterance_length=args.sherpa_min_utterance_length,
         )
     else:
         SetLogLevel(args.vosk_log_level)

@@ -129,6 +129,7 @@ def check_windows_release_update(
         "installer_size": installer_size,
         "sha256": expected_hash.lower(),
         "release_url": str(release.get("html_url") or ""),
+        "release_notes": str(release.get("body") or "").strip(),
     }
 
 
@@ -228,8 +229,11 @@ def download_windows_release_installer(
 
 
 def launch_windows_release_installer(installer: Path) -> None:
-    """Start the verified interactive installer and return immediately."""
+    """Start the verified installer without opening a second wizard window."""
     if not installer.is_file() or installer.suffix.lower() != ".exe":
         raise ReleaseUpdateError(f"Установщик не найден: {installer}")
-    subprocess.Popen([str(installer)], cwd=str(installer.parent), close_fds=True)
-
+    subprocess.Popen(
+        [str(installer), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"],
+        cwd=str(installer.parent),
+        close_fds=True,
+    )

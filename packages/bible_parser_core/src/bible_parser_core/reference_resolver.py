@@ -16,6 +16,7 @@ from bible_parser_core.parser import (
     compact_range,
     normalize_text,
     ref_candidates,
+    _unanchored_person_name_book_candidate,
 )
 
 
@@ -278,6 +279,8 @@ def resolve_reference_candidates(
 
     for book_candidate in books:
         for ref_candidate in ref_candidates(normalized, book_candidate.book, bible):
+            if _unanchored_person_name_book_candidate(book_candidate, ref_candidate, normalized):
+                continue
             ref = _reference_text(book_candidate.book, ref_candidate)
             if not ref:
                 continue

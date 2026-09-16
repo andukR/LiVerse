@@ -103,6 +103,7 @@ def decide_sequence_advance(
         return {**base, "action": "ignore", "reason": "automatic_backward_move_forbidden"}
 
     strong = bool(accepted or reason == "pending_confirmation")
+    awaiting_current_confirmation = bool(state.get("await_current_confirmation"))
     assisted = bool(
         speech_continues
         and reason in ASSISTED_REASONS
@@ -125,6 +126,19 @@ def decide_sequence_advance(
     reaches_current_boundary = candidate_start <= target_end <= candidate_end
     ending_overlap_words = int(_value(candidate, "ending_overlap_words", 0) or 0)
 
+    # An assisted move can be based on a short/weak tail from the previous
+    # verse. Do not let another weak candidate immediately cascade to the
+    # following slide: first require a strong match for the verse now shown.
+    # This is evidence-gated rather than time-gated, so a clear next-verse
+    # match may still synchronize immediately.
+    if awaiting_current_confirmation and not strong:
+        if candidate_index in {current_index, current_index + 1}:
+            return {
+                **base,
+                "action": "keep",
+                "reason": "await_current_element_confirmation",
+            }
+
     if candidate_index == current_index:
         # A long range is announced first, so its first verse is not yet
         # necessarily visible.  Do not wait for the end of that verse: a
@@ -136,39 +150,63 @@ def decide_sequence_advance(
             and int(matched_words) >= INITIAL_SLIDE_MIN_MATCHED_WORDS
             and (strong or assisted)
         ):
-            return {
+            activated = {
                 **base,
                 "action": "activate",
                 "reason": (
                     "strong_initial_element" if strong else "assisted_initial_element"
                 ),
             }
+            if strong:
+                activated["confirmation_state"] = "confirmed"
+            return activated
         if not reaches_current_boundary:
-            return {**base, "action": "keep", "reason": "inside_current_element"}
+            return {
+                **base,
+                "action": "keep",
+                **({"confirmation_state": "confirmed"} if strong else {}),
+                "reason": "inside_current_element",
+            }
         if ending_overlap_words < 2:
-            return {**base, "action": "keep", "reason": "current_end_not_heard"}
+            return {
+                **base,
+                "action": "keep",
+                **({"confirmation_state": "confirmed"} if strong else {}),
+                "reason": "current_end_not_heard",
+            }
         if not (strong or assisted):
             return {**base, "action": "keep", "reason": "current_boundary_not_confident"}
         if current_index == len(targets) - 1:
             return {
                 **base,
                 "action": "complete",
+                "confirmation_state": "confirmed" if strong else "required",
                 "reason": "strong_final_boundary" if strong else "assisted_final_boundary",
             }
-        # Finishing verse N is not proof that verse N+1 will be read.  A
-        # preacher can stop a declared range and begin explaining the text.
-        # Keep N visible until there is direct evidence for the next element;
-        # then the next branch synchronizes forward without a premature slide.
+        # Once the end of the current verse is clearly heard, prefer showing
+        # the next known verse immediately.  In live reading it is less
+        # harmful to briefly show an unread next verse than to leave the
+        # congregation on a verse that has already been read.  The ending
+        # overlap and confidence checks above still prevent weak/partial
+        # matches from triggering this transition.
         return {
             **base,
-            "action": "keep",
-            "reason": "await_next_element_after_boundary",
+            "action": "advance" if strong else "assisted_advance",
+            "confirmation_state": "confirmed" if strong else "required",
+            "target_index": current_index + 1,
+            "target_element": dict(targets[current_index + 1]),
+            "reason": (
+                "strong_current_boundary_auto_next"
+                if strong
+                else "assisted_current_boundary_auto_next"
+            ),
         }
 
     if candidate_index == current_index + 1 and (strong or assisted):
         return {
             **base,
             "action": "synchronize_forward" if strong else "assisted_synchronize_forward",
+            "confirmation_state": "confirmed" if strong else "required",
             "target_index": candidate_index,
             "target_element": dict(targets[candidate_index]),
             "reason": (
@@ -182,11 +220,16 @@ def decide_sequence_advance(
             ),
         }
     if candidate_index > current_index + 1 and strong:
+        # A single recognition window may contain enough text from a later
+        # verse to identify it directly.  Do not jump over intermediate
+        # slides: show exactly one next verse and let the next recognition
+        # window confirm/advance it.
         return {
             **base,
             "action": "synchronize_forward",
-            "target_index": candidate_index,
-            "target_element": dict(targets[candidate_index]),
+            "confirmation_state": "confirmed",
+            "target_index": current_index + 1,
+            "target_element": dict(targets[current_index + 1]),
             "reason": "strong_later_element",
         }
     return {**base, "action": "ignore", "reason": "weak_distant_element"}
@@ -238,9 +281,9 @@ def decide_sequence_progress_from_text(
     global_decision: Any,
     sequence_evaluator: Callable[[Mapping[str, object]], Any],
     *,
-    max_steps: int = 3,
+    max_steps: int = 1,
 ) -> tuple[dict[str, object], Any]:
-    """Combine consecutive evidence from one speech window into one move."""
+    """Process one speech window and move by at most one slide."""
     working_state = dict(state) if isinstance(state, Mapping) else {}
     original_index = int(working_state.get("current_index") or 0)
     steps: list[dict[str, object]] = []

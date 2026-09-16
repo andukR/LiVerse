@@ -324,7 +324,17 @@ class BibleTextSearcher:
         substring_bonus = 1.0 if query_text and query_text in verse_text else 0.0
         ending_overlap_words = 0
         for size in range(min(3, len(verse), len(query)), 1, -1):
-            if tuple(verse[-size:]) in _ngrams(query, size):
+            suffix = tuple(verse[-size:])
+            # A repeated tail from the previous recognition window is not
+            # evidence that the current verse has ended.  Accept the suffix
+            # only when its latest occurrence reaches the end of the window
+            # (with at most two trailing ASR words).
+            latest_start = max(
+                (index for index in range(len(query) - size + 1)
+                 if tuple(query[index:index + size]) == suffix),
+                default=-1,
+            )
+            if latest_start >= 0 and latest_start + size >= len(query) - 2:
                 ending_overlap_words = size
                 break
         score = 100.0 * (

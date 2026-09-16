@@ -127,7 +127,52 @@ def sherpa_result_to_vosk_result(result: object, *, time_offset: float = 0.0) ->
     return {"text": text, "result": words}
 
 
-def load_sherpa_recognizer(model_path: Path, *, sample_rate: int, num_threads: int) -> object:
+def estimate_recent_speech_rate(result: object, *, window_words: int = 6) -> float | None:
+    """Estimate recent words/second from Sherpa token timestamps.
+
+    Partial Sherpa hypotheses can revise their tail, so this deliberately uses
+    only a short recent window and returns no estimate until three word starts
+    are available.
+    """
+    if isinstance(result, dict) and isinstance(result.get("result"), list):
+        timed = result["result"]
+    else:
+        timed = sherpa_result_to_vosk_result(result).get("result", [])
+    starts = [float(word["start"]) for word in timed[-max(3, int(window_words)):]]
+    if len(starts) < 3:
+        return None
+    elapsed = starts[-1] - starts[0]
+    if elapsed < 0.4:
+        return None
+    rate = (len(starts) - 1) / elapsed
+    if not math.isfinite(rate) or rate <= 0.0:
+        return None
+    return round(rate, 3)
+
+
+def adaptive_sherpa_segment_seconds(
+    speech_rate_wps: float | None,
+    *,
+    target_words: float = 10.0,
+    minimum_seconds: float = 3.0,
+    maximum_seconds: float = 10.0,
+) -> float:
+    """Choose a replay segment length that aims for a similar word count."""
+    if speech_rate_wps is None or not math.isfinite(float(speech_rate_wps)) or speech_rate_wps <= 0:
+        return float(maximum_seconds)
+    raw_seconds = float(target_words) / float(speech_rate_wps)
+    bounded = max(float(minimum_seconds), min(float(maximum_seconds), raw_seconds))
+    # Audio arrives in 250 ms chunks; quantize the threshold to that cadence.
+    return round(bounded * 4.0) / 4.0
+
+
+def load_sherpa_recognizer(
+    model_path: Path,
+    *,
+    sample_rate: int,
+    num_threads: int,
+    min_utterance_length: float = 10.0,
+) -> object:
     required = {
         "encoder": model_path / "am-onnx" / "encoder.onnx",
         "decoder": model_path / "am-onnx" / "decoder.onnx",
@@ -161,7 +206,7 @@ def load_sherpa_recognizer(model_path: Path, *, sample_rate: int, num_threads: i
         enable_endpoint_detection=True,
         rule1_min_trailing_silence=2.4,
         rule2_min_trailing_silence=0.8,
-        rule3_min_utterance_length=10.0,
+        rule3_min_utterance_length=max(0.0, float(min_utterance_length)),
     )
 
 
@@ -208,11 +253,43 @@ class SherpaStreamingRecognizer:
 class SherpaReplayRecognizer:
     """Adapter used by saved-audio replay."""
 
-    def __init__(self, recognizer: object, sample_rate: int) -> None:
+    def __init__(
+        self,
+        recognizer: object,
+        sample_rate: int,
+        *,
+        adaptive_segmentation: bool = False,
+    ) -> None:
         self.recognizer = recognizer
         self.sample_rate = sample_rate
         self.stream = recognizer.create_stream()
         self.time_offset = 0.0
+        self.segment_start_seconds = 0.0
+        self.adaptive_segmentation = adaptive_segmentation
+        self.speech_rate_wps: float | None = None
+        self.last_partial_raw_result: object | None = None
+
+    def _finish_segment(self, replay_seconds: float, *, reason: str) -> list[dict]:
+        if reason == "adaptive_interval":
+            self.stream.input_finished()
+            while self.recognizer.is_ready(self.stream):
+                self.recognizer.decode_stream(self.stream)
+        raw_result = self.recognizer.get_result_all(self.stream)
+        result = sherpa_result_to_vosk_result(
+            raw_result,
+            time_offset=self.time_offset,
+        )
+        self.recognizer.reset(self.stream)
+        segment_duration = max(0.0, replay_seconds - self.segment_start_seconds)
+        self.time_offset = replay_seconds
+        self.segment_start_seconds = replay_seconds
+        self.speech_rate_wps = None
+        self.last_partial_raw_result = None
+        if result["text"]:
+            result["segmentation_reason"] = reason
+            result["segment_duration_seconds"] = round(segment_duration, 3)
+            return [result]
+        return []
 
     def accept_waveform(self, data: bytes, replay_seconds: float) -> list[dict]:
         import numpy as np
@@ -221,20 +298,33 @@ class SherpaReplayRecognizer:
         self.stream.accept_waveform(self.sample_rate, samples)
         while self.recognizer.is_ready(self.stream):
             self.recognizer.decode_stream(self.stream)
-        if not self.recognizer.is_endpoint(self.stream):
+        if self.recognizer.is_endpoint(self.stream):
+            return self._finish_segment(replay_seconds, reason="sherpa_endpoint")
+        if not self.adaptive_segmentation:
             return []
-        result = sherpa_result_to_vosk_result(
-            self.recognizer.get_result_all(self.stream),
-            time_offset=self.time_offset,
-        )
-        self.recognizer.reset(self.stream)
-        self.time_offset = replay_seconds
-        return [result] if result["text"] else []
+        raw_result = self.recognizer.get_result_all(self.stream)
+        self.last_partial_raw_result = raw_result
+        measured_rate = estimate_recent_speech_rate(raw_result)
+        if measured_rate is not None:
+            self.speech_rate_wps = measured_rate
+        segment_limit = adaptive_sherpa_segment_seconds(self.speech_rate_wps)
+        if replay_seconds - self.segment_start_seconds >= segment_limit:
+            return self._finish_segment(replay_seconds, reason="adaptive_interval")
+        return []
 
     def partial_result(self) -> str:
         """Return the current non-final text without resetting the stream."""
         raw_result = self.recognizer.get_result_all(self.stream)
         return str(getattr(raw_result, "text", "") or "").strip()
+
+    def partial_result_with_speech_rate(self) -> tuple[str, float | None]:
+        """Return current partial text and a local recent speech-rate estimate."""
+        raw_result = self.last_partial_raw_result
+        if raw_result is None:
+            raw_result = self.recognizer.get_result_all(self.stream)
+        text = str(getattr(raw_result, "text", "") or "").strip()
+        rate = estimate_recent_speech_rate(raw_result)
+        return text, rate if rate is not None else self.speech_rate_wps
 
     def final_results(self) -> list[dict]:
         import numpy as np
