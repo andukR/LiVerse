@@ -42,6 +42,7 @@ from bible_parser_core.sherpa_streaming import (
 )
 from bible_parser_core.text_citation_detector import (
     ScriptureTextDetector,
+    StreamingVerseAligner,
 )
 from bible_parser_core.verse_text_search import CANONICAL_BOOK_NAMES_BY_ID
 from tools.holyrics import (
@@ -166,7 +167,18 @@ SEQUENTIAL_TEXT_READING_MAX_GAP_SECONDS = 20.0
 
 def replay_long_passage(payload: dict) -> dict | None:
     """Represent a long passage that the replay assumes the operator accepted."""
-    minimum_verses = 2 if payload.get("replay_inferred_sequential_text_reading") else DEFAULT_LONG_RANGE_MIN_VERSES
+    # A confirmed text-search range may be the only reliable initial signal
+    # (the spoken address can be absent or unusable).  Keep two-verse ranges
+    # eligible so the UPS sequence starts at its first verse instead of
+    # waiting for a later candidate and beginning in the middle.
+    minimum_verses = (
+        2
+        if (
+            payload.get("replay_inferred_sequential_text_reading")
+            or payload.get("source") == "text_citation"
+        )
+        else DEFAULT_LONG_RANGE_MIN_VERSES
+    )
     selected = scripture_range(
         payload.get("parsed") or {},
         min_same_chapter_verses=minimum_verses,
@@ -356,7 +368,14 @@ def replay_smart_slide_state(
     """Build the same ordered slide bounds as a live Holyrics presentation."""
     range_payload = payload.get("slide") or payload.get("parsed") or payload
     max_verses = 1 if slide_mode == "one_verse" else DEFAULT_LONG_RANGE_SLIDE_MAX_VERSES
-    minimum_verses = 2 if payload.get("replay_inferred_sequential_text_reading") else DEFAULT_LONG_RANGE_MIN_VERSES
+    minimum_verses = (
+        2
+        if (
+            payload.get("replay_inferred_sequential_text_reading")
+            or payload.get("source") == "text_citation"
+        )
+        else DEFAULT_LONG_RANGE_MIN_VERSES
+    )
     slides = scripture_range_quick_presentation_slides(
         range_payload,
         max_verses=max_verses,
@@ -368,6 +387,39 @@ def replay_smart_slide_state(
         if initially_visible:
             state["current_slide_visible"] = True
     return state
+
+
+def replay_smart_slide_reading_started(state: dict | None) -> bool:
+    """Whether the replay has activated a verse, rather than only an address."""
+    if not isinstance(state, dict):
+        return False
+    return bool(state.get("current_slide_visible") or int(state.get("current_index") or 0) > 0)
+
+
+def replay_one_verse_text_citation_slide(payload: dict) -> dict:
+    """Keep a text-derived range as context but display only its first verse."""
+    parsed = payload.get("parsed") if isinstance(payload.get("parsed"), dict) else None
+    slide = payload.get("slide") if isinstance(payload.get("slide"), dict) else None
+    if not parsed or not slide:
+        return payload
+    try:
+        start = int(parsed.get("start_verse") or 0)
+        end = int(parsed.get("end_verse") or start)
+        chapter = int(parsed.get("chapter") or 0)
+    except (TypeError, ValueError):
+        return payload
+    if not parsed.get("book") or chapter <= 0 or start <= 0 or end <= start:
+        return payload
+    first = parse_live_reference(f"{parsed['book']} {chapter}:{start}")
+    if first is None:
+        return payload
+    slide["ref"] = first.ref
+    slide["verse"] = first.verse_text
+    slide["start_verse"] = start
+    slide["end_verse"] = start
+    slide["end_chapter"] = chapter
+    slide["text_range_context"] = parsed.get("ref")
+    return payload
 
 
 def replay_unread_range_reference(
@@ -576,6 +628,8 @@ def apply_replay_smart_slide_decision(state: dict, decision: dict) -> bool:
     target_index = decision.get("target_index")
     if isinstance(target_index, int):
         state["current_index"] = target_index
+    if decision.get("reason") == "strong_later_element_skip":
+        state["recovered_element_pending"] = True
     return True
 
 
@@ -610,6 +664,107 @@ def defer_open_ended_replay_completion(state: dict, decision: dict) -> dict:
     return deferred
 
 
+def log_replay_streaming_alignment(
+    text: str,
+    replay_seconds: float,
+    text_detector: ScriptureTextDetector | None,
+    replay_state: dict[str, object],
+    logger: JsonlLogger,
+    *,
+    recognition_result: str,
+    controls_slide: bool = False,
+) -> object | None:
+    """Write streaming alignment and optionally drive replay's virtual slide."""
+    state = replay_state.get("smart_slide_shadow")
+    if not isinstance(state, dict) or text_detector is None or not text.strip():
+        return None
+    aligner = replay_state.get("streaming_verse_aligner")
+    if not isinstance(aligner, StreamingVerseAligner):
+        aligner = StreamingVerseAligner(text_detector.searcher)
+        replay_state["streaming_verse_aligner"] = aligner
+    state_identity = id(state)
+    if replay_state.get("streaming_alignment_state_id") != state_identity:
+        aligner.clear()
+        replay_state["streaming_alignment_state_id"] = state_identity
+    if recognition_result == "final":
+        alignment = aligner.observe_final(state, text)
+    else:
+        alignment = aligner.observe_partial(state, text)
+    if alignment is None:
+        return None
+    logger.write(
+        "STREAMING_VERSE_ALIGNMENT",
+        {
+            **asdict(alignment),
+            "passage": str(state.get("ref") or ""),
+            "legacy_current_index": int(state.get("current_index") or 0),
+            "recognition_result": recognition_result,
+            "replay_seconds": replay_seconds,
+            "controls_slide": controls_slide,
+        },
+    )
+    if controls_slide:
+        current_index = int(state.get("current_index") or 0)
+        targets = [item for item in state.get("targets") or [] if isinstance(item, dict)]
+        decision = None
+        if not state.get("current_slide_visible") and alignment.would_activate:
+            decision = {
+                "active": True,
+                "action": "activate",
+                "action_label": "показать первый стих",
+                "will_transition": True,
+                "current_index": current_index,
+                "current_element": (
+                    dict(targets[current_index]) if current_index < len(targets) else None
+                ),
+                "target_index": current_index,
+                "target_element": (
+                    dict(targets[current_index]) if current_index < len(targets) else None
+                ),
+                "candidate": alignment.current_ref,
+                "reason": "streaming_initial_element",
+                "evidence_source": "streaming_alignment",
+            }
+        elif (
+            alignment.would_advance
+            and isinstance(alignment.proposed_index, int)
+            and alignment.proposed_index > current_index
+        ):
+            decision = {
+                "active": True,
+                "action": "advance",
+                "action_label": "перейти на следующий слайд",
+                "will_transition": True,
+                "current_index": current_index,
+                "current_element": (
+                    dict(targets[current_index]) if current_index < len(targets) else None
+                ),
+                "target_index": alignment.proposed_index,
+                "target_element": (
+                    dict(targets[alignment.proposed_index])
+                    if alignment.proposed_index < len(targets)
+                    else None
+                ),
+                "candidate": alignment.next_ref,
+                "reason": f"streaming_{alignment.transition_evidence}",
+                "evidence_source": "streaming_alignment",
+            }
+        if decision is not None:
+            logger.write(
+                "SMART_SLIDE_SHADOW",
+                {
+                    **decision,
+                    "passage": str(state.get("ref") or ""),
+                    "slide_mode": str(state.get("slide_mode") or ""),
+                    "window": alignment.observed_text,
+                    "replay_seconds": replay_seconds,
+                    "recognition_result": recognition_result,
+                },
+            )
+            apply_replay_smart_slide_decision(state, decision)
+    return alignment
+
+
 def handle_replay_smart_slide_partial(
     partial: str,
     replay_seconds: float,
@@ -617,10 +772,23 @@ def handle_replay_smart_slide_partial(
     replay_state: dict[str, object],
     logger: JsonlLogger,
     speech_rate_wps: float | None = None,
+    *,
+    streaming_alignment_controls_slide: bool = False,
 ) -> None:
     """Advance replay's virtual slide from evolving Sherpa text."""
     state = replay_state.get("smart_slide_shadow")
     if state is None or text_detector is None:
+        return
+    log_replay_streaming_alignment(
+        partial,
+        replay_seconds,
+        text_detector,
+        replay_state,
+        logger,
+        recognition_result="partial",
+        controls_slide=streaming_alignment_controls_slide,
+    )
+    if streaming_alignment_controls_slide:
         return
     decision, evidence = decide_sequence_progress_from_text(
         state,
@@ -639,10 +807,14 @@ def handle_replay_smart_slide_partial(
         if decision.get("confirmation_state") == "confirmed":
             apply_replay_smart_slide_decision(state, decision)
         return
+    boundary_diagnostic = text_detector.estimate_known_sequence_boundaries(
+        state, str(getattr(evidence, "window_text", "") or partial)
+    )
     logger.write(
         "SMART_SLIDE_SHADOW",
         {
             **decision,
+            **boundary_diagnostic,
             "passage": str(state.get("ref") or ""),
             "slide_mode": str(state.get("slide_mode") or ""),
             "window": str(getattr(evidence, "window_text", "") or partial),
@@ -2220,6 +2392,7 @@ def replay_audio_file(
             "citation_detection_mode": args.citation_detection_mode,
             "text_operator_hints": bool(args.text_operator_hints),
             "long_range_slide_mode": args.long_range_slide_mode,
+            "smart_slide_streaming_alignment": args.smart_slide_streaming_alignment,
             "text_detection_db": str(args.text_detection_db) if text_searcher is not None else None,
             "vosk_buffer_parts": args.vosk_buffer_parts,
             "audio": "audio.wav" if audio_path else "",
@@ -2249,6 +2422,26 @@ def replay_audio_file(
             audio_bytes_seen += len(data)
             replay_seconds = audio_bytes_seen / float(args.samplerate * 2)
             if args.asr_engine == "sherpa-0.54":
+                if args.sherpa_adaptive_segmentation:
+                    shadow = replay_state.get("smart_slide_shadow")
+                    if isinstance(shadow, dict):
+                        targets = shadow.get("targets") or []
+                        current_index = int(shadow.get("current_index") or 0)
+                        if replay_smart_slide_reading_started(shadow):
+                            current = targets[current_index] if current_index < len(targets) else {}
+                            following = (
+                                targets[current_index + 1]
+                                if current_index + 1 < len(targets)
+                                else {}
+                            )
+                            # Before the first verse is activated, keep the
+                            # ordinary Sherpa window so an address and its
+                            # final ordinal are not split apart.  The
+                            # boundary-aware window is useful only while
+                            # reading already advances through verses.
+                            recognizer.set_boundary_word_target(
+                                current.get("text"), following.get("text")
+                            )
                 results = recognizer.accept_waveform(data, replay_seconds)
                 if results:
                     partial = ""
@@ -2265,6 +2458,9 @@ def replay_audio_file(
                         replay_state,
                         logger,
                         speech_rate_wps=last_sherpa_speech_rate,
+                        streaming_alignment_controls_slide=(
+                            args.smart_slide_streaming_alignment
+                        ),
                     )
                 last_sherpa_partial = partial
             elif recognizer.AcceptWaveform(data):
@@ -2345,6 +2541,16 @@ def handle_result(
     if not text:
         return 0
 
+    streaming_alignment_logged = log_replay_streaming_alignment(
+        text,
+        replay_seconds,
+        text_detector,
+        replay_state,
+        logger,
+        recognition_result="final",
+        controls_slide=args.smart_slide_streaming_alignment,
+    )
+
     address_detection_enabled = args.citation_detection_mode != "text_only"
     long_passage = replay_state.get("long_passage")
     previous_parsed = pipeline.last_parsed
@@ -2415,20 +2621,29 @@ def handle_result(
         )
 
     text_detection_for_high_risk_address = False
+    parsed_address = pipeline_payload.get("parsed") if isinstance(pipeline_payload, dict) else None
+    same_fragment_range_text = bool(
+        pipeline_payload.get("matched")
+        and isinstance(parsed_address, dict)
+        and int(parsed_address.get("end_verse") or 0) > int(parsed_address.get("start_verse") or 0)
+        and len(normalize_text(text).split()) >= 6
+    )
     if text_detector is not None and pipeline_payload.get("matched"):
         explicit_ref = str((pipeline_payload.get("parsed") or {}).get("ref") or "")
         # A high-risk spoken address may have lost a range boundary.  Keep the
         # displayed verse in the duplicate guard, but let the following Bible
         # text immediately widen or correct it when the evidence is stronger.
         text_detection_for_high_risk_address = pipeline_payload.get("risk_level") == "high"
-        if text_detection_for_high_risk_address:
+        if text_detection_for_high_risk_address or same_fragment_range_text:
             text_detector.mark_shown(explicit_ref, replay_seconds)
         else:
             text_detector.suppress_after_address(explicit_ref, replay_seconds)
 
     text_decision = None
     if text_detector is not None and (
-        not pipeline_payload.get("matched") or text_detection_for_high_risk_address
+        not pipeline_payload.get("matched")
+        or text_detection_for_high_risk_address
+        or same_fragment_range_text
     ):
         text_decision = text_detector.process_fragment(
             text,
@@ -2475,6 +2690,8 @@ def handle_result(
         payload = add_slide_payload(pipeline_payload)
     elif text_decision is not None and text_decision.accepted:
         payload = text_citation_payload(text_decision, text)
+        if args.long_range_slide_mode == "one_verse":
+            payload = replay_one_verse_text_citation_slide(payload)
     else:
         payload = add_slide_payload(pipeline_payload)
     if (
@@ -2505,6 +2722,7 @@ def handle_result(
         smart_slide_shadow is not None
         and text_detector is not None
         and text_decision is not None
+        and not args.smart_slide_streaming_alignment
     ):
         shadow_decision, sequence_decision = decide_sequence_progress_from_text(
             smart_slide_shadow,
@@ -2515,12 +2733,23 @@ def handle_result(
             smart_slide_shadow,
             shadow_decision,
         )
+        boundary_diagnostic = text_detector.estimate_known_sequence_boundaries(
+            smart_slide_shadow,
+            str(
+                sequence_decision.window_text
+                if sequence_decision is not None
+                else getattr(text_decision, "window_text", "")
+                or ""
+            ),
+        )
         logger.write(
             "SMART_SLIDE_SHADOW",
             {
                 **shadow_decision,
+                **boundary_diagnostic,
                 "passage": str(smart_slide_shadow.get("ref") or ""),
                 "slide_mode": str(smart_slide_shadow.get("slide_mode") or ""),
+                "manual_context": bool(smart_slide_shadow.get("manual_context")),
                 "window": (
                     sequence_decision.window_text
                     if shadow_decision.get("evidence_source") == "sequence_scoped"
@@ -2618,7 +2847,7 @@ def handle_result(
         inferred_sequential_reading = infer_replay_sequential_text_reading(
             payload, replay_state, replay_seconds
         )
-        if inferred_sequential_reading is not None:
+    if inferred_sequential_reading is not None:
             # The inferred range may combine overlapping accepted windows,
             # e.g. 11-12 followed by 12-14.  Start at the earliest confirmed
             # verse in that combined range, not at the newer window's start;
@@ -2628,6 +2857,15 @@ def handle_result(
             if first_confirmed_verse:
                 inferred_sequential_reading["sequential_display_verse"] = first_confirmed_verse
             payload = inferred_sequential_reading
+    if (
+        args.long_range_slide_mode == "one_verse"
+        and str(payload.get("source") or "")
+        in {"text_citation", "replay_inferred_sequential_text_reading"}
+    ):
+        # The active-range branch can replace the original text-citation
+        # payload with an inferred multi-verse payload.  Keep the display
+        # contract (one verse per slide) after that replacement as well.
+        payload = replay_one_verse_text_citation_slide(payload)
     accumulate_reading_list(payload, reading_list)
     # Keep the evidence that caused TEXT_ACCEPTED even when a later replay
     # inference replaces the display payload (for example, sequential reading).
@@ -2645,25 +2883,45 @@ def handle_result(
         }
     accepted_passage = replay_long_passage(payload)
     if (
+        accepted_passage is not None
+        and payload.get("source") == "text_citation"
+        and int(accepted_passage.get("end_verse") or 0)
+        > int(accepted_passage.get("start_verse") or 0)
+    ):
+        # A text-derived range is an initial observation, not necessarily the
+        # speaker's final boundary.  Keep it open so later accepted verses
+        # extend the same UPS sequence instead of freezing it at 23–24.
+        accepted_passage["open_ended"] = True
+    if (
         text_detector is not None
         and accepted_passage is not None
         and (
             pipeline_payload.get("matched")
             or bool((payload.get("text_citation") or {}).get("announced_range_expanded"))
             or inferred_sequential_reading is not None
+            # A text-only range can be the first reliable evidence of the
+            # passage.  Let it initialise the UPS shadow immediately instead
+            # of waiting for a later verse and starting in the middle.
+            or (text_decision is not None and text_decision.accepted)
         )
     ):
         if pipeline.set_context_range(payload.get("slide")):
             if inferred_sequential_reading is not None:
                 accepted_passage["open_ended"] = True
             replay_state["long_passage"] = accepted_passage
-            replay_state["smart_slide_shadow"] = replay_smart_slide_state(
-                payload,
-                args.long_range_slide_mode,
-                # At this point the browser shows the address of the range,
-                # not the first verse's text slide.
-                initially_visible=False,
+            existing_shadow = replay_state.get("smart_slide_shadow")
+            manual_shadow_active = bool(
+                isinstance(existing_shadow, dict)
+                and existing_shadow.get("manual_context")
             )
+            if not manual_shadow_active:
+                replay_state["smart_slide_shadow"] = replay_smart_slide_state(
+                    payload,
+                    args.long_range_slide_mode,
+                    # At this point the browser shows the address of the range,
+                    # not the first verse's text slide.
+                    initially_visible=False,
+                )
             if inferred_sequential_reading is not None:
                 smart_slide_shadow = replay_state.get("smart_slide_shadow")
                 if isinstance(smart_slide_shadow, dict):
@@ -2684,7 +2942,10 @@ def handle_result(
                         # sequence was evaluated before the shadow state
                         # existed. Re-evaluate it now so the just-finished
                         # verse can immediately hand off to the next slide.
-                        if text_decision is not None:
+                        if (
+                            text_decision is not None
+                            and not args.smart_slide_streaming_alignment
+                        ):
                             initial_decision, initial_evidence = decide_sequence_progress_from_text(
                                 smart_slide_shadow,
                                 text_decision,
@@ -2695,12 +2956,18 @@ def handle_result(
                             initial_decision = defer_open_ended_replay_completion(
                                 smart_slide_shadow, initial_decision
                             )
+                            boundary_diagnostic = text_detector.estimate_known_sequence_boundaries(
+                                smart_slide_shadow,
+                                str(getattr(initial_evidence, "window_text", "") or text),
+                            )
                             logger.write(
                                 "SMART_SLIDE_SHADOW",
                                 {
                                     **initial_decision,
+                                    **boundary_diagnostic,
                                     "passage": str(smart_slide_shadow.get("ref") or ""),
                                     "slide_mode": str(smart_slide_shadow.get("slide_mode") or ""),
+                                    "manual_context": bool(smart_slide_shadow.get("manual_context")),
                                     "window": str(getattr(initial_evidence, "window_text", "") or text),
                                     "replay_seconds": replay_seconds,
                                     "speech_rate_wps": speech_rate_wps,
@@ -2709,6 +2976,39 @@ def handle_result(
                             apply_replay_smart_slide_decision(
                                 smart_slide_shadow, initial_decision
                             )
+            elif (
+                text_decision is not None
+                and isinstance(smart_slide_shadow, dict)
+                and not args.smart_slide_streaming_alignment
+            ):
+                # Address and reading can occur in one ASR final.  Re-evaluate
+                # the newly created sequence immediately so its first verse is
+                # shown without waiting for another final result.
+                initial_decision, initial_evidence = decide_sequence_progress_from_text(
+                    smart_slide_shadow,
+                    text_decision,
+                    lambda current: text_detector.evaluate_known_sequence(
+                        current, replay_seconds
+                    ),
+                )
+                boundary_diagnostic = text_detector.estimate_known_sequence_boundaries(
+                    smart_slide_shadow,
+                    str(getattr(initial_evidence, "window_text", "") or text),
+                )
+                logger.write(
+                    "SMART_SLIDE_SHADOW",
+                    {
+                        **initial_decision,
+                        **boundary_diagnostic,
+                        "passage": str(smart_slide_shadow.get("ref") or ""),
+                        "slide_mode": str(smart_slide_shadow.get("slide_mode") or ""),
+                        "manual_context": bool(smart_slide_shadow.get("manual_context")),
+                        "window": str(getattr(initial_evidence, "window_text", "") or text),
+                        "replay_seconds": replay_seconds,
+                        "speech_rate_wps": speech_rate_wps,
+                    },
+                )
+                apply_replay_smart_slide_decision(smart_slide_shadow, initial_decision)
             elif not replay_state.get("range_list_mode"):
                 parsed_range = payload.get("parsed") if isinstance(payload.get("parsed"), dict) else {}
                 start_verse = int(parsed_range.get("start_verse") or 0)
@@ -2732,6 +3032,19 @@ def handle_result(
                     "REPLAY_INFERRED_SEQUENTIAL_TEXT_READING_SELECTED",
                     {"passage": accepted_passage, "replay_seconds": replay_seconds},
                 )
+    if not streaming_alignment_logged:
+        # The same final ASR fragment may contain both the spoken range and
+        # the first words of its reading.  If that fragment created the UPS
+        # state, make it visible to the diagnostic aligner immediately.
+        log_replay_streaming_alignment(
+            text,
+            replay_seconds,
+            text_detector,
+            replay_state,
+            logger,
+            recognition_result="final",
+            controls_slide=args.smart_slide_streaming_alignment,
+        )
     replay_operator_hint = (
         str((payload.get("slide") or {}).get("source") or "") == "text_operator_hint"
     )
@@ -2918,6 +3231,14 @@ def parse_args() -> argparse.Namespace:
         help="Slide layout whose automatic transitions SMART_SLIDE_SHADOW evaluates.",
     )
     parser.add_argument(
+        "--smart-slide-streaming-alignment",
+        action="store_true",
+        help=(
+            "Replay-only experiment: let ordered partial-word alignment drive "
+            "the virtual one-verse SMART_SLIDE_SHADOW sequence."
+        ),
+    )
+    parser.add_argument(
         "--text-operator-hints",
         action="store_true",
         help="Record web-operator proposals for useful weak text matches; never send them as slides.",
@@ -2950,6 +3271,21 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.smart_slide_streaming_alignment:
+        if args.asr_engine != "sherpa-0.54":
+            raise SystemExit(
+                "--smart-slide-streaming-alignment требует --asr-engine sherpa-0.54."
+            )
+        if args.long_range_slide_mode != "one_verse":
+            raise SystemExit(
+                "--smart-slide-streaming-alignment требует "
+                "--long-range-slide-mode one_verse."
+            )
+        if args.citation_detection_mode == "address_only":
+            raise SystemExit(
+                "--smart-slide-streaming-alignment требует текстовый поиск, например "
+                "--citation-detection-mode hybrid_confirm."
+            )
     if args.smart_slide_passage:
         try:
             args._smart_slide_context = manual_smart_slide_state(

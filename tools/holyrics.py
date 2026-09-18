@@ -27,6 +27,10 @@ DEFAULT_CROSS_CHAPTER_SLIDE_MAX_CHARS = 760
 DEFAULT_CROSS_CHAPTER_SLIDE_MAX_VERSES = 9
 DEFAULT_LONG_RANGE_SLIDE_MAX_CHARS = 620
 DEFAULT_LONG_RANGE_SLIDE_MAX_VERSES = 7
+# Holyrics may acknowledge ShowQuickPresentation before GetCurrentPresentation
+# starts returning the new quick presentation.  During this short interval the
+# previous sermon-plan presentation is stale state, not a manual operator move.
+SCRIPTURE_RANGE_STARTUP_SYNC_GRACE_SECONDS = 1.5
 # Keep the live Holyrics threshold unchanged.  The browser review timeline has
 # its own slightly wider rule for four-verse announcements.
 DEFAULT_LONG_RANGE_MIN_VERSES = 5
@@ -1631,8 +1635,13 @@ def scripture_range_reading_state(payload: dict, slides: list[dict]) -> dict | N
         "ref": ref,
         "book": book,
         "book_id": book_id,
+        "started_at_monotonic": time.monotonic(),
         "current_index": 0,
         "current_slide_visible": False,
+        # A strong text match may identify a later verse when the speaker
+        # skips verses or the ASR misses them.  The sequence advancer uses
+        # this only with strict score/margin/word thresholds.
+        "allow_distant_skip": True,
         "targets": targets,
     }
 
@@ -1665,6 +1674,15 @@ def sync_scripture_range_reading(args: Any) -> dict:
     if isinstance(sermon_plan, dict):
         sermon_plan_id = str(sermon_plan.get("text_id") or sermon_plan.get("id") or "").strip()
     if current_type == "text" and sermon_plan_id and current_text_id == sermon_plan_id:
+        started_at = state.get("started_at_monotonic")
+        if isinstance(started_at, (int, float)):
+            startup_age = max(0.0, time.monotonic() - float(started_at))
+            if startup_age < SCRIPTURE_RANGE_STARTUP_SYNC_GRACE_SECONDS:
+                return {
+                    "active": True,
+                    "reason": "waiting_for_quick_presentation",
+                    "startup_age": startup_age,
+                }
         try:
             slide_index = max(0, int(current.get("slide_number") or 1) - 1)
         except (TypeError, ValueError):

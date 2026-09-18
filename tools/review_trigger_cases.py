@@ -608,6 +608,8 @@ def smart_slide_browser_payload(entry: SmartSlideEntry, position: int, total: in
         "total": total,
         "event_id": entry.event_id,
         "passage": str(event.get("passage") or ""),
+        "slide_mode": str(event.get("slide_mode") or ""),
+        "manual_context": bool(event.get("manual_context")),
         "replay_seconds": float_value(event.get("replay_seconds")),
         "action": str(event.get("action") or ""),
         "action_label": SMART_SLIDE_ACTION_LABELS.get(str(event.get("action") or ""), ""),
@@ -733,6 +735,12 @@ def normal_slide_updates(events_path: Path) -> list[dict[str, Any]]:
             "kind": kind,
             "vosk_text": str(event.get("vosk_text") or ""),
             "source": str(payload.get("source") or ""),
+            # Only parser/context results prove that the preacher explicitly
+            # named another address.  Text-search ranges are evidence for the
+            # active UPS sequence and must not take display ownership from it.
+            "explicit_address": str(payload.get("source") or "") in {
+                "parser", "context_range",
+            },
         })
     return updates
 
@@ -937,6 +945,58 @@ class SmartSlideBrowserReview:
                     events_path = Path(events_path_text)
                     updates.extend(normal_slide_updates(events_path))
                     speech.extend(speech_updates(events_path))
+                # Once the one-verse UPS shadow is active, an ordinary LV
+                # display update must not overwrite its current single-verse
+                # slide.  The live Holyrics path has one owner for the
+                # display; the browser replay reconstructs both streams.
+                # This also covers sequential-reading updates (which may
+                # carry an older verse).  An explicitly spoken new address is
+                # different: live LV would send it to Holyrics, so replay must
+                # show it too without deleting the saved UPS sequence.
+                manual_one_verse = any(
+                    decision.get("slide_mode") == "one_verse"
+                    and decision.get("manual_context")
+                    for decision in track["decisions"]
+                )
+                one_verse_activation = min(
+                    (
+                        float_value(decision.get("replay_seconds"))
+                        for decision in track["decisions"]
+                        if decision.get("slide_mode") == "one_verse"
+                        and decision.get("action") == "activate"
+                    ),
+                    default=None,
+                )
+                if manual_one_verse:
+                    # An explicitly supplied UPS passage is the owner of the
+                    # browser display from the beginning.  The ordinary LV
+                    # parser may still recognise the same spoken address as
+                    # a narrower range (for example 3:1-7); retain that
+                    # evidence in events, but never let it overwrite the
+                    # manually selected 3:1-18 timeline.
+                    # Keep the ordinary LV address until UPS produces its
+                    # first actual display decision.  This is important when
+                    # the address and the beginning of reading are separated
+                    # by a pause: the address must remain visible naturally,
+                    # without fabricating a browser-only title event.
+                    if one_verse_activation is not None:
+                        updates = [
+                            update
+                            for update in updates
+                            if (
+                                float_value(update.get("replay_seconds")) < one_verse_activation
+                                or bool(update.get("explicit_address"))
+                            )
+                        ]
+                elif one_verse_activation is not None:
+                    updates = [
+                        update
+                        for update in updates
+                        if (
+                            float_value(update.get("replay_seconds")) < one_verse_activation
+                            or bool(update.get("explicit_address"))
+                        )
+                    ]
                 track["display_updates"] = sorted(updates, key=lambda item: float_value(item.get("replay_seconds")))
                 track["speech_updates"] = sorted(speech, key=lambda item: float_value(item.get("replay_seconds")))
             return {
@@ -1222,7 +1282,14 @@ def start_smart_slide_browser_review(entries: list[SmartSlideEntry], args: argpa
                     block = stream.read(min(64 * 1024, remaining))
                     if not block:
                         break
-                    self.wfile.write(block)
+                    try:
+                        self.wfile.write(block)
+                    except (BrokenPipeError, ConnectionResetError):
+                        # The browser may cancel a range request when the
+                        # operator changes the selected event or closes the
+                        # page. This is normal client behaviour, not a replay
+                        # failure.
+                        return
                     remaining -= len(block)
 
         def do_GET(self) -> None:

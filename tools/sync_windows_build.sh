@@ -455,7 +455,9 @@ if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
 }
 
 $checked = 0
-foreach ($line in Get-Content -LiteralPath $manifest) {
+# The Linux build host writes this manifest as UTF-8.  Explicit encoding keeps
+# Cyrillic paths intact in Windows PowerShell, whose legacy default is ANSI.
+foreach ($line in Get-Content -LiteralPath $manifest -Encoding UTF8) {
     if ($line -notmatch '^([0-9a-fA-F]{64})  (.+)$') {
         throw "Invalid manifest line: $line"
     }

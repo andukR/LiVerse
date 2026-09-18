@@ -166,6 +166,21 @@ def adaptive_sherpa_segment_seconds(
     return round(bounded * 4.0) / 4.0
 
 
+def boundary_window_target_words(
+    current_word_count: int,
+    next_word_count: int,
+    *,
+    minimum_words: int = 6,
+    maximum_words: int = 12,
+) -> int:
+    """Choose a small word budget around one current-to-next verse boundary."""
+    current = max(0, int(current_word_count))
+    following = max(0, int(next_word_count))
+    current_tail = min(4, max(2, current // 5)) if current else 2
+    next_head = min(5, max(2, following // 3)) if following else 2
+    return max(minimum_words, min(maximum_words, current_tail + next_head + 2))
+
+
 def load_sherpa_recognizer(
     model_path: Path,
     *,
@@ -268,8 +283,24 @@ class SherpaReplayRecognizer:
         self.adaptive_segmentation = adaptive_segmentation
         self.speech_rate_wps: float | None = None
         self.last_partial_raw_result: object | None = None
+        self.boundary_target_words: float = 10.0
 
-    def _finish_segment(self, replay_seconds: float, *, reason: str) -> list[dict]:
+    def set_boundary_word_target(self, current_text: str | None, next_text: str | None) -> None:
+        """Set the replay-only word budget for the current adjacent boundary."""
+        current_count = len(str(current_text or "").split())
+        next_count = len(str(next_text or "").split())
+        self.boundary_target_words = float(
+            boundary_window_target_words(current_count, next_count)
+        )
+
+    def _finish_segment(
+        self,
+        replay_seconds: float,
+        *,
+        reason: str,
+        speech_rate_wps: float | None = None,
+        adaptive_limit_seconds: float | None = None,
+    ) -> list[dict]:
         if reason == "adaptive_interval":
             self.stream.input_finished()
             while self.recognizer.is_ready(self.stream):
@@ -288,6 +319,9 @@ class SherpaReplayRecognizer:
         if result["text"]:
             result["segmentation_reason"] = reason
             result["segment_duration_seconds"] = round(segment_duration, 3)
+            result["speech_rate_wps"] = speech_rate_wps
+            result["adaptive_limit_seconds"] = adaptive_limit_seconds
+            result["boundary_target_words"] = self.boundary_target_words
             return [result]
         return []
 
@@ -298,18 +332,37 @@ class SherpaReplayRecognizer:
         self.stream.accept_waveform(self.sample_rate, samples)
         while self.recognizer.is_ready(self.stream):
             self.recognizer.decode_stream(self.stream)
+        adaptive_limit = None
+        if self.adaptive_segmentation:
+            raw_result = self.recognizer.get_result_all(self.stream)
+            self.last_partial_raw_result = raw_result
+            measured_rate = estimate_recent_speech_rate(raw_result)
+            if measured_rate is not None:
+                self.speech_rate_wps = measured_rate
+            adaptive_limit = adaptive_sherpa_segment_seconds(
+                self.speech_rate_wps,
+                target_words=self.boundary_target_words,
+            )
         if self.recognizer.is_endpoint(self.stream):
-            return self._finish_segment(replay_seconds, reason="sherpa_endpoint")
+            return self._finish_segment(
+                replay_seconds,
+                reason="sherpa_endpoint",
+                speech_rate_wps=self.speech_rate_wps,
+                adaptive_limit_seconds=adaptive_limit,
+            )
         if not self.adaptive_segmentation:
             return []
-        raw_result = self.recognizer.get_result_all(self.stream)
-        self.last_partial_raw_result = raw_result
-        measured_rate = estimate_recent_speech_rate(raw_result)
-        if measured_rate is not None:
-            self.speech_rate_wps = measured_rate
-        segment_limit = adaptive_sherpa_segment_seconds(self.speech_rate_wps)
+        segment_limit = adaptive_limit or adaptive_sherpa_segment_seconds(
+            self.speech_rate_wps,
+            target_words=self.boundary_target_words,
+        )
         if replay_seconds - self.segment_start_seconds >= segment_limit:
-            return self._finish_segment(replay_seconds, reason="adaptive_interval")
+            return self._finish_segment(
+                replay_seconds,
+                reason="adaptive_interval",
+                speech_rate_wps=self.speech_rate_wps,
+                adaptive_limit_seconds=segment_limit,
+            )
         return []
 
     def partial_result(self) -> str:

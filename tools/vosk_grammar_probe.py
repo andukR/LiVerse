@@ -71,6 +71,7 @@ from bible_parser_core.sherpa_streaming import (
 from bible_parser_core.bible_text_search import BibleTextSearcher
 from bible_parser_core.text_citation_detector import (
     ScriptureTextDetector,
+    StreamingVerseAligner,
     TextCitationDecision,
     TextDetectionConfig,
 )
@@ -266,6 +267,9 @@ def save_startup_settings(args: argparse.Namespace) -> None:
         "holyrics_quick_minutes": float(getattr(args, "holyrics_quick_minutes", 0.0) or 0.0),
         "long_range_slide_mode": str(getattr(args, "long_range_slide_mode", "compact") or "compact"),
         "long_range_operator_hints": bool(getattr(args, "long_range_operator_hints", False)),
+        "smart_slide_streaming_control": bool(
+            getattr(args, "smart_slide_streaming_control", False)
+        ),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2742,6 +2746,160 @@ def list_audio_devices() -> int:
     return 0
 
 
+def log_live_streaming_alignment(
+    args: argparse.Namespace,
+    text: str,
+    text_searcher: BibleTextSearcher | None,
+    logger: JsonlLogger,
+    *,
+    recognition_result: str,
+    recognition_time: float,
+    text_detector: ScriptureTextDetector | None = None,
+) -> object | None:
+    """Log live streaming position and optionally apply its explicit opt-in transition."""
+    controls_slide = bool(getattr(args, "smart_slide_streaming_control", False))
+    if (
+        not (
+            getattr(args, "smart_slide_streaming_shadow", False)
+            or controls_slide
+        )
+        or text_searcher is None
+        or not text.strip()
+    ):
+        return None
+    state = getattr(args, "_holyrics_scripture_range_reading", None)
+    if not isinstance(state, dict):
+        return None
+    aligner = getattr(args, "_live_streaming_verse_aligner", None)
+    if not isinstance(aligner, StreamingVerseAligner):
+        aligner = StreamingVerseAligner(text_searcher)
+        setattr(args, "_live_streaming_verse_aligner", aligner)
+    state_identity = id(state)
+    if getattr(args, "_live_streaming_alignment_state_id", None) != state_identity:
+        aligner.clear()
+        setattr(args, "_live_streaming_alignment_state_id", state_identity)
+    elif controls_slide and aligner.current_index != int(state.get("current_index") or 0):
+        # A keyboard/manual Holyrics move remains authoritative.  The next
+        # streaming comparison starts from the externally confirmed slide and
+        # must not reuse evidence accumulated for the previous position.
+        aligner.synchronize_current_index(
+            int(state.get("current_index") or 0),
+            clear_history=True,
+        )
+    alignment_state = dict(state)
+    alignment_state["slide_mode"] = str(
+        getattr(args, "long_range_slide_mode", "compact") or "compact"
+    )
+    if recognition_result == "final":
+        alignment = aligner.observe_final(alignment_state, text)
+    else:
+        alignment = aligner.observe_partial(alignment_state, text)
+    if alignment is None:
+        return None
+    logger.write(
+        "STREAMING_VERSE_ALIGNMENT",
+        {
+            **vars(alignment),
+            "passage": str(state.get("ref") or ""),
+            "legacy_current_index": int(state.get("current_index") or 0),
+            "recognition_result": recognition_result,
+            "recognition_time": round(float(recognition_time), 3),
+            "controls_slide": controls_slide,
+            "mode": "live_control" if controls_slide else "live_shadow",
+        },
+    )
+    targets = list(state.get("targets") or [])
+    current_index = int(state.get("current_index") or 0)
+    if (
+        controls_slide
+        and recognition_result == "final"
+        and alignment.status == "current_ending"
+        and alignment.would_activate
+        and targets
+        and current_index == len(targets) - 1
+    ):
+        target = targets[current_index]
+        completion = handle_scripture_range_reading_match(
+            args,
+            argparse.Namespace(
+                book_id=int(state.get("book_id") or 0),
+                chapter=int(target.get("chapter") or 0),
+                start_verse=int(target.get("verse") or 0),
+                end_verse=int(target.get("verse") or 0),
+            ),
+        )
+        completed = bool(completion.get("completed"))
+        if completed:
+            aligner.clear()
+            if text_detector is not None:
+                # The address may have been shown longer ago than the normal
+                # duplicate cooldown. Refresh it at completion so the final
+                # ASR fragment cannot reopen the just-finished last verse.
+                text_detector.mark_shown(
+                    str(state.get("ref") or ""),
+                    recognition_time,
+                )
+                text_detector.clear()
+        logger.write(
+            "STREAMING_SLIDE_CONTROL",
+            {
+                "ok": completed,
+                "reason": str(completion.get("reason") or ""),
+                "action": "complete_range",
+                "completed": completed,
+                "restored_sermon_plan": bool(
+                    completion.get("restored_sermon_plan")
+                ),
+                "passage": str(state.get("ref") or ""),
+                "current_index": current_index,
+                "target_index": None,
+                "current_ref": alignment.current_ref,
+                "target_ref": None,
+                "transition_evidence": alignment.transition_evidence,
+                "recognition_result": recognition_result,
+                "recognition_time": round(float(recognition_time), 3),
+            },
+        )
+        return alignment
+    if (
+        controls_slide
+        and alignment.would_advance
+        and isinstance(alignment.proposed_index, int)
+        and alignment.proposed_index > int(state.get("current_index") or 0)
+    ):
+        previous_index = int(state.get("current_index") or 0)
+        ok, reason = apply_scripture_range_operator_hint(
+            args,
+            "apply",
+            {
+                "current_index": previous_index,
+                "target_index": alignment.proposed_index,
+            },
+        )
+        if not ok:
+            synchronized_index = int(state.get("current_index") or previous_index)
+            aligner.synchronize_current_index(
+                synchronized_index,
+                clear_history=synchronized_index != previous_index,
+            )
+        logger.write(
+            "STREAMING_SLIDE_CONTROL",
+            {
+                "ok": ok,
+                "reason": reason,
+                "passage": str(state.get("ref") or ""),
+                "current_index": previous_index,
+                "target_index": alignment.proposed_index,
+                "current_ref": alignment.current_ref,
+                "target_ref": alignment.next_ref,
+                "transition_evidence": alignment.transition_evidence,
+                "recognition_result": recognition_result,
+                "recognition_time": round(float(recognition_time), 3),
+            },
+        )
+    return alignment
+
+
 def run_microphone(args: argparse.Namespace) -> int:
     import sounddevice as sd
 
@@ -2805,6 +2963,8 @@ def run_microphone(args: argparse.Namespace) -> int:
             ) else None,
             "holyrics_target": describe_holyrics_target(args),
             "holyrics_quick_minutes": args.holyrics_quick_minutes,
+            "smart_slide_streaming_shadow": bool(args.smart_slide_streaming_shadow),
+            "smart_slide_streaming_control": bool(args.smart_slide_streaming_control),
             "grammar": None if grammar is None else grammar_diagnostics(grammar),
         }
     )
@@ -3100,6 +3260,7 @@ def run_microphone(args: argparse.Namespace) -> int:
         try:
             with stream:
                 last_audio_level_at = 0.0
+                last_streaming_partial = ""
                 while True:
                     stop_action = consume_stop_request(args.stop_file)
                     if stop_action:
@@ -3121,6 +3282,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                     if recognizer.AcceptWaveform(data):
                         result = json.loads(recognizer.Result())
                         text = result.get("text", "").strip()
+                        last_streaming_partial = ""
                         final_audio_stats = dict(audio_stats)
                         audio_stats["chunks"] = 0
                         audio_stats["peak"] = 0
@@ -3141,6 +3303,15 @@ def run_microphone(args: argparse.Namespace) -> int:
                                     if text_detector is not None:
                                         text_detector.clear()
                             long_passage_reading = scripture_range_reading_active(args)
+                            log_live_streaming_alignment(
+                                args,
+                                text,
+                                text_searcher,
+                                logger,
+                                recognition_result="final",
+                                recognition_time=recognition_time,
+                                text_detector=text_detector,
+                            )
                             if citation_recognition_paused(args, long_passage_reading):
                                 pipeline.text_buffer.clear()
                                 if text_detector is not None:
@@ -3436,6 +3607,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                             if (
                                 long_passage_reading
                                 and not getattr(args, "long_range_operator_hints", False)
+                                and not getattr(args, "smart_slide_streaming_control", False)
                                 and text_decision_ready_for_scripture_range(text_decision)
                             ):
                                 range_reading_action = handle_scripture_range_reading_match(
@@ -3624,6 +3796,17 @@ def run_microphone(args: argparse.Namespace) -> int:
                         partial_result = json.loads(recognizer.PartialResult())
                         partial = partial_result.get("partial", "")
                         if partial:
+                            if partial != last_streaming_partial:
+                                log_live_streaming_alignment(
+                                    args,
+                                    partial,
+                                    text_searcher,
+                                    logger,
+                                    recognition_result="partial",
+                                    recognition_time=time.monotonic(),
+                                    text_detector=text_detector,
+                                )
+                                last_streaming_partial = partial
                             if args.log_partials:
                                 logger.write("partial", {"result": partial_result, "partial": partial})
                             if args.debug_console:
@@ -3875,6 +4058,33 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--smart-slide-streaming-shadow",
+        action="store_true",
+        help=(
+            "Log experimental streaming verse alignment for a live one-verse range; "
+            "never let it control Holyrics."
+        ),
+    )
+    streaming_control_group = parser.add_mutually_exclusive_group()
+    streaming_control_group.add_argument(
+        "--smart-slide-streaming-control",
+        dest="smart_slide_streaming_control",
+        action="store_true",
+        help=(
+            "Let streaming verse alignment control live Holyrics; "
+            "the legacy automatic range advancer is disabled for that run."
+        ),
+    )
+    streaming_control_group.add_argument(
+        "--no-smart-slide-streaming-control",
+        dest="smart_slide_streaming_control",
+        action="store_false",
+        help=(
+            "Disable streaming verse alignment control and use the legacy automatic "
+            "range advancer."
+        ),
+    )
+    parser.add_argument(
         "--text-operator-hints",
         action="store_true",
         help=(
@@ -3882,8 +4092,29 @@ def main() -> int:
             "the match is never shown automatically."
         ),
     )
-    parser.set_defaults(session_summary_popup=True, log_audio=True)
+    parser.set_defaults(
+        session_summary_popup=True,
+        log_audio=True,
+        smart_slide_streaming_control=False,
+    )
     args = parser.parse_args()
+    if args.smart_slide_streaming_shadow and args.smart_slide_streaming_control:
+        parser.error(
+            "--smart-slide-streaming-shadow и --smart-slide-streaming-control "
+            "нельзя включать одновременно"
+        )
+    if args.smart_slide_streaming_shadow or args.smart_slide_streaming_control:
+        if args.asr_engine != "sherpa-0.54":
+            parser.error("потоковый УПС требует --asr-engine sherpa-0.54")
+        if args.long_range_slide_mode != "one_verse":
+            parser.error(
+                "потоковый УПС требует --long-range-slide-mode one_verse"
+            )
+        if args.citation_detection_mode == "address_only":
+            parser.error(
+                "потоковый УПС требует текстовый поиск, например "
+                "--citation-detection-mode hybrid_confirm"
+            )
     if (args.popup_anchor_x is None) != (args.popup_anchor_y is None):
         parser.error("--popup-anchor-x and --popup-anchor-y must be used together")
     global _POPUP_MONITOR_ANCHOR

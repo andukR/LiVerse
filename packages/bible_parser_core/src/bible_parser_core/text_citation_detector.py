@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, replace
+from difflib import SequenceMatcher
 from time import perf_counter
 from typing import Callable, Iterable, Mapping
 
@@ -181,6 +182,306 @@ class SlidingSpeechBuffer:
             suffix = tokens[-size:]
             windows.append(SpeechWindow(size=size, text=" ".join(suffix), tokens=suffix))
         return windows
+
+
+@dataclass(frozen=True)
+class StreamingVerseAlignment:
+    """Diagnostic position of a continuous ASR stream near a verse boundary."""
+
+    status: str
+    current_index: int
+    proposed_index: int | None
+    would_activate: bool
+    would_advance: bool
+    current_ref: str
+    next_ref: str | None
+    stable_words: int
+    partial_words: int
+    aligned_pairs: int
+    current_matches: int
+    current_content_matches: int
+    current_content_size: int
+    next_matches: int
+    next_content_matches: int
+    next_content_size: int
+    current_tail_hits: int
+    current_tail_size: int
+    next_head_hits: int
+    next_head_size: int
+    current_end_score: float
+    next_start_score: float
+    transition_evidence: str
+    observed_text: str
+
+
+class StreamingVerseAligner:
+    """Align evolving ASR words with the current and following verse in order.
+
+    Final ASR fragments form the stable history.  The current partial
+    hypothesis is evaluated on top of that history, but is not committed: a
+    later Sherpa revision therefore cannot duplicate or permanently corrupt
+    the stream.  This class is intentionally diagnostic until replay evidence
+    establishes safe transition thresholds.
+    """
+
+    def __init__(
+        self,
+        searcher: BibleTextSearcher,
+        *,
+        history_words: int = 32,
+        boundary_words: int = 4,
+    ) -> None:
+        self.searcher = searcher
+        self.history_words = max(12, int(history_words))
+        self.boundary_words = max(2, int(boundary_words))
+        self._final_tokens: deque[str] = deque(maxlen=self.history_words)
+        self._current_index: int | None = None
+
+    def clear(self) -> None:
+        self._final_tokens.clear()
+        self._current_index = None
+
+    @property
+    def current_index(self) -> int | None:
+        return self._current_index
+
+    def synchronize_current_index(
+        self,
+        current_index: int,
+        *,
+        clear_history: bool = False,
+    ) -> None:
+        """Follow a confirmed external/manual slide position.
+
+        A manual move may invalidate words accumulated for the old slide.  In
+        that case the caller can discard them so they cannot immediately undo
+        the operator's correction.
+        """
+        if clear_history:
+            self._final_tokens.clear()
+        self._current_index = max(0, int(current_index))
+
+    def observe_partial(
+        self,
+        state: Mapping[str, object] | None,
+        text: str,
+    ) -> StreamingVerseAlignment | None:
+        return self._observe(state, text, commit=False)
+
+    def observe_final(
+        self,
+        state: Mapping[str, object] | None,
+        text: str,
+    ) -> StreamingVerseAlignment | None:
+        result = self._observe(state, text, commit=True)
+        self._final_tokens.extend(normalize_bible_text(text))
+        return result
+
+    def _observe(
+        self,
+        state: Mapping[str, object] | None,
+        text: str,
+        *,
+        commit: bool,
+    ) -> StreamingVerseAlignment | None:
+        if not isinstance(state, Mapping):
+            return None
+        targets = [item for item in state.get("targets") or [] if isinstance(item, Mapping)]
+        if not targets or str(state.get("slide_mode") or "") != "one_verse":
+            return None
+        if self._current_index is None:
+            self._current_index = max(
+                0,
+                min(int(state.get("current_index") or 0), len(targets) - 1),
+            )
+        current_index = max(0, min(self._current_index, len(targets) - 1))
+        current = targets[current_index]
+        following = targets[current_index + 1] if current_index + 1 < len(targets) else None
+        current_text = str(current.get("text") or "").strip()
+        next_text = str((following or {}).get("text") or "").strip()
+        if not current_text:
+            return None
+
+        partial_tokens = normalize_bible_text(text)
+        observed_tokens = list(self._final_tokens) + partial_tokens
+        observed_tokens = observed_tokens[-self.history_words :]
+        observed_text = " ".join(observed_tokens)
+        observed = self.searcher.normalize_lemmas(observed_text)
+        current_lemmas = self.searcher.normalize_lemmas(current_text)
+        next_lemmas = self.searcher.normalize_lemmas(next_text) if next_text else []
+        reference = current_lemmas + next_lemmas
+        pairs = self._local_alignment(observed, reference)
+        boundary = len(current_lemmas)
+        current_positions = {ref for _obs, ref in pairs if ref < boundary}
+        next_positions = {ref - boundary for _obs, ref in pairs if ref >= boundary}
+        current_content = {
+            index for index, lemma in enumerate(current_lemmas)
+            if lemma not in COMMON_SPEECH_LEMMAS
+        }
+        if not current_content:
+            current_content = set(range(len(current_lemmas)))
+        current_tail = self._content_boundary_positions(current_lemmas, tail=True)
+        next_head = self._content_boundary_positions(next_lemmas, tail=False)
+        next_content = {
+            index for index, lemma in enumerate(next_lemmas)
+            if lemma not in COMMON_SPEECH_LEMMAS
+        }
+        if not next_content:
+            next_content = set(range(len(next_lemmas)))
+        current_tail_hits = len(current_positions & current_tail)
+        current_content_matches = len(current_positions & current_content)
+        next_head_hits = len(next_positions & next_head)
+        next_content_matches = len(next_positions & next_content)
+        current_end_score = self._coverage(current_tail_hits, len(current_tail))
+        next_start_score = self._coverage(next_head_hits, len(next_head))
+
+        next_body_required = min(5, max(3, (len(next_content) + 2) // 3))
+        next_head_started = bool(
+            following is not None
+            and next_head_hits >= min(2, len(next_head))
+            and next_start_score >= 0.5
+        )
+        next_body_started = bool(
+            following is not None
+            and current_end_score >= 0.5
+            and next_content_matches >= next_body_required
+        )
+        if next_head_started or next_body_started:
+            status = "next_started"
+            transition_evidence = (
+                "next_head" if next_head_started else "next_body_after_current_end"
+            )
+        elif current_tail_hits >= min(2, len(current_tail)) and current_end_score >= 0.5:
+            status = "current_ending"
+            transition_evidence = "current_tail"
+        elif current_positions:
+            status = "tracking_current"
+            transition_evidence = "current_body"
+        else:
+            status = "uncertain"
+            transition_evidence = "none"
+        proposed_index = current_index + 1 if status == "next_started" else None
+        activation_required = min(5, max(2, len(current_content)))
+        would_activate = current_content_matches >= activation_required
+        result = StreamingVerseAlignment(
+            status=status,
+            current_index=current_index,
+            proposed_index=proposed_index,
+            would_activate=would_activate,
+            would_advance=proposed_index is not None,
+            current_ref=self._target_ref(state, current),
+            next_ref=self._target_ref(state, following) if following is not None else None,
+            stable_words=len(self._final_tokens) + (len(partial_tokens) if commit else 0),
+            partial_words=0 if commit else len(partial_tokens),
+            aligned_pairs=len(pairs),
+            current_matches=len(current_positions),
+            current_content_matches=current_content_matches,
+            current_content_size=len(current_content),
+            next_matches=len(next_positions),
+            next_content_matches=next_content_matches,
+            next_content_size=len(next_content),
+            current_tail_hits=current_tail_hits,
+            current_tail_size=len(current_tail),
+            next_head_hits=next_head_hits,
+            next_head_size=len(next_head),
+            current_end_score=round(current_end_score, 3),
+            next_start_score=round(next_start_score, 3),
+            transition_evidence=transition_evidence,
+            observed_text=observed_text,
+        )
+        if proposed_index is not None:
+            self._current_index = proposed_index
+        return result
+
+    def _content_boundary_positions(self, lemmas: list[str], *, tail: bool) -> set[int]:
+        positions = [
+            index for index, lemma in enumerate(lemmas)
+            if lemma not in COMMON_SPEECH_LEMMAS
+        ]
+        if not positions:
+            positions = list(range(len(lemmas)))
+        selected = positions[-self.boundary_words :] if tail else positions[: self.boundary_words]
+        return set(selected)
+
+    @staticmethod
+    def _coverage(hits: int, size: int) -> float:
+        return hits / size if size else 0.0
+
+    @staticmethod
+    def _target_ref(state: Mapping[str, object], target: Mapping[str, object] | None) -> str:
+        if target is None:
+            return ""
+        explicit = str(target.get("ref") or "").strip()
+        if explicit:
+            return explicit
+        chapter = int(target.get("start_chapter", target.get("chapter")) or 0)
+        verse = int(target.get("start_verse", target.get("verse")) or 0)
+        return f"{str(state.get('book') or '').strip()} {chapter}:{verse}".strip()
+
+    @classmethod
+    def _word_score(cls, observed: str, reference: str) -> float:
+        if observed == reference:
+            return 1.5 if reference in COMMON_SPEECH_LEMMAS else 3.0
+        if (
+            observed in COMMON_SPEECH_LEMMAS
+            or reference in COMMON_SPEECH_LEMMAS
+            or min(len(observed), len(reference)) < 5
+        ):
+            return -2.0
+        similarity = SequenceMatcher(None, observed, reference).ratio()
+        if similarity >= 0.82:
+            return 1.8
+        if similarity >= 0.72 and min(len(observed), len(reference)) >= 7:
+            return 0.8
+        return -2.0
+
+    @classmethod
+    def _local_alignment(
+        cls,
+        observed: list[str],
+        reference: list[str],
+    ) -> list[tuple[int, int]]:
+        """Return ordered positive word matches using Smith-Waterman alignment."""
+        if not observed or not reference:
+            return []
+        gap = -1.2
+        scores = [[0.0] * (len(reference) + 1) for _ in range(len(observed) + 1)]
+        moves = [[0] * (len(reference) + 1) for _ in range(len(observed) + 1)]
+        best_score = 0.0
+        best_cell = (0, 0)
+        for row, observed_word in enumerate(observed, start=1):
+            for column, reference_word in enumerate(reference, start=1):
+                word_score = cls._word_score(observed_word, reference_word)
+                options = (
+                    0.0,
+                    scores[row - 1][column - 1] + word_score,
+                    scores[row - 1][column] + gap,
+                    scores[row][column - 1] + gap,
+                )
+                score = max(options)
+                scores[row][column] = score
+                moves[row][column] = options.index(score)
+                if score > best_score:
+                    best_score = score
+                    best_cell = (row, column)
+
+        pairs: list[tuple[int, int]] = []
+        row, column = best_cell
+        while row > 0 and column > 0 and scores[row][column] > 0:
+            move = moves[row][column]
+            if move == 1:
+                if cls._word_score(observed[row - 1], reference[column - 1]) > 0:
+                    pairs.append((row - 1, column - 1))
+                row -= 1
+                column -= 1
+            elif move == 2:
+                row -= 1
+            elif move == 3:
+                column -= 1
+            else:
+                break
+        pairs.reverse()
+        return pairs
 
 
 class ScriptureTextDetector:
@@ -440,6 +741,69 @@ class ScriptureTextDetector:
         ]
         return self._evaluate_known_sequence_windows(state, windows, now)
 
+    def estimate_known_sequence_boundaries(
+        self,
+        state: Mapping[str, object] | None,
+        window_text: str,
+    ) -> dict[str, object]:
+        """Estimate how many verse boundaries a diagnostic window spans.
+
+        This is observational only: it does not participate in slide
+        decisions.  Every known verse in the active passage is searched so a
+        window containing a current verse and two later verses can be exposed
+        in replay diagnostics instead of being mistaken for a one-boundary
+        window merely because normal UPS search examines only nearby targets.
+        """
+        if not isinstance(state, Mapping) or not str(window_text or '').strip():
+            return {"boundary_count_estimate": 0, "candidate_indices": [], "candidate_refs": []}
+        targets = [item for item in state.get("targets") or [] if isinstance(item, Mapping)]
+        book_id = int(state.get("book_id") or 0)
+        if not targets or book_id <= 0:
+            return {"boundary_count_estimate": 0, "candidate_indices": [], "candidate_refs": []}
+        ranges = [(
+            book_id,
+            int(target.get("start_chapter", target.get("chapter")) or 0),
+            int(target.get("start_verse", target.get("verse")) or 0),
+            int(target.get("chapter") or 0),
+            int(target.get("verse") or 0),
+        ) for target in targets]
+        _lemmas, results = self.searcher.search_within_ranges(
+            str(window_text), ranges, limit=len(ranges)
+        )
+        candidate_indices: set[int] = set()
+        for result in results:
+            matched_words = len(result.matched_lemmas)
+            if not (
+                (result.score >= 60.0 and matched_words >= 2)
+                or (result.score >= 75.0 and matched_words >= 1)
+            ):
+                continue
+            for index, target in enumerate(targets):
+                if (
+                    result.book_id == book_id
+                    and result.chapter == int(target.get("start_chapter", target.get("chapter")) or 0)
+                    and result.start_verse == int(target.get("start_verse", target.get("verse")) or 0)
+                ):
+                    candidate_indices.add(index)
+                    break
+        ordered_indices = sorted(candidate_indices)
+        book_name = CANONICAL_BOOK_NAMES_BY_ID.get(book_id, str(book_id))
+        return {
+            "boundary_count_estimate": (
+                max(0, ordered_indices[-1] - ordered_indices[0])
+                if ordered_indices else 0
+            ),
+            "candidate_indices": ordered_indices,
+            "candidate_refs": [
+                str(targets[index].get("ref") or (
+                    f"{book_name} "
+                    f"{int(targets[index].get('start_chapter', targets[index].get('chapter')) or 0)}:"
+                    f"{int(targets[index].get('start_verse', targets[index].get('verse')) or 0)}"
+                ))
+                for index in ordered_indices
+            ],
+        }
+
     def _evaluate_known_sequence_windows(
         self,
         state: Mapping[str, object] | None,
@@ -583,6 +947,22 @@ class ScriptureTextDetector:
             and top.bigram_overlap >= 60.0
             and top.trigram_overlap >= 45.0
         )
+        # Sherpa may distort the verse boundary words while retaining a rich,
+        # unambiguous run of Bible text.  For a range candidate, that evidence
+        # is sufficient to start the sequence instead of waiting until a
+        # later verse raises the score and causes a late activation.  The
+        # higher content/margin gates keep this narrower than ordinary
+        # single-verse acceptance.
+        rich_range = (
+            top.end_verse > top.start_verse
+            and top.score >= max(0.0, self.config.acceptance_score - 12.0)
+            and margin >= self.config.minimum_margin + 6.0
+            and matched_words >= self.config.minimum_matched_content_words + 5
+            and (
+                top.bigram_overlap > 0
+                or top.ordered_similarity >= 70.0
+            )
+        )
         continuation = (
             shown_relation == "next"
             and top.score >= self.config.acceptance_score
@@ -612,13 +992,13 @@ class ScriptureTextDetector:
                 ),
                 confirmations=1, top=top, second=second,
             )
-        if immediate or exact_phrase or exact_short_verse or strong_range:
+        if immediate or exact_phrase or exact_short_verse or strong_range or rich_range:
             return self._decision(
                 accepted=True, reference=top.reference, score=top.score, margin=margin,
                 matched_words=matched_words, window_text=window_text,
                 reason=(
                     "immediate_strong_range_match"
-                    if strong_range and not immediate
+                    if (strong_range or rich_range) and not immediate
                     else (
                         "immediate_exact_short_verse_match"
                         if exact_short_verse

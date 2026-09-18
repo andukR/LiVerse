@@ -251,6 +251,7 @@ class GuiConfig:
     quick_seconds: float = 5.0
     long_range_slide_mode: str = "compact"
     long_range_operator_hints: bool = False
+    smart_slide_streaming_control: bool = True
     text_operator_hints: bool = False
     open_operator_qr: bool = True
     auto_hide: bool = True
@@ -372,6 +373,9 @@ def load_gui_config() -> GuiConfig:
         quick_seconds=quick_seconds,
         long_range_slide_mode=long_range_slide_mode,
         long_range_operator_hints=bool(settings.get("long_range_operator_hints", False)),
+        smart_slide_streaming_control=bool(
+            settings.get("smart_slide_streaming_control", True)
+        ),
         text_operator_hints=bool(settings.get("text_operator_hints", False)),
         open_operator_qr=bool(settings.get("open_operator_qr", True)),
         auto_hide=bool(settings.get("gui_auto_hide", True)),
@@ -397,6 +401,7 @@ def save_gui_config(config: GuiConfig) -> None:
         holyrics_quick_minutes=config.quick_seconds / 60.0,
         long_range_slide_mode=config.long_range_slide_mode,
         long_range_operator_hints=config.long_range_operator_hints,
+        smart_slide_streaming_control=config.smart_slide_streaming_control,
         text_operator_hints=config.text_operator_hints,
     )
     save_startup_settings(args)
@@ -442,6 +447,14 @@ def engine_command(
     ])
     if config.long_range_operator_hints:
         command.append("--long-range-operator-hints")
+    if (
+        config.smart_slide_streaming_control
+        and config.long_range_slide_mode == "one_verse"
+        and config.citation_detection_mode != "address_only"
+    ):
+        command.append("--smart-slide-streaming-control")
+    else:
+        command.append("--no-smart-slide-streaming-control")
     if config.text_operator_hints:
         command.append("--text-operator-hints")
     if config.run_mode == "semi_auto":
@@ -564,6 +577,9 @@ class LiVerseGui:
         )
         self.long_range_operator_hints_var = tk.BooleanVar(
             value=self.config.long_range_operator_hints
+        )
+        self.smart_slide_streaming_control_var = tk.BooleanVar(
+            value=self.config.smart_slide_streaming_control
         )
         self.text_operator_hints_var = tk.BooleanVar(value=self.config.text_operator_hints)
         self.token_var = tk.StringVar(value=self.config.holyrics_token)
@@ -763,6 +779,12 @@ class LiVerseGui:
             self.settings_tab,
             text="Подсказывать оператору, не перелистывая автоматически",
             variable=self.long_range_operator_hints_var,
+        ).grid(row=row, column=1, sticky="w", pady=(0, 7))
+        row += 1
+        ttk.Checkbutton(
+            self.settings_tab,
+            text="Потоковый УПС для чтения стих за стихом (рекомендуется)",
+            variable=self.smart_slide_streaming_control_var,
         ).grid(row=row, column=1, sticky="w", pady=(0, 7))
         row += 1
         ttk.Checkbutton(
@@ -1082,6 +1104,9 @@ class LiVerseGui:
                 "compact",
             ),
             long_range_operator_hints=bool(self.long_range_operator_hints_var.get()),
+            smart_slide_streaming_control=bool(
+                self.smart_slide_streaming_control_var.get()
+            ),
             text_operator_hints=bool(self.text_operator_hints_var.get()),
             open_operator_qr=bool(self.open_qr_var.get()),
             auto_hide=bool(self.auto_hide_var.get()),

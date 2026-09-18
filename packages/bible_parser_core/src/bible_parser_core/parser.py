@@ -362,6 +362,8 @@ ASR_REPLACEMENTS = (
     (r"\bеклисяст[а-я]*\b", "екклесиаст"),
     (r"\bклесяст[а-я]*\b", "екклесиаст"),
     (r"\bи\s+клесяст[а-я]*\b", "екклесиаст"),
+    # Observed Sherpa distortion: «Екклесиаст» -> «плясят».
+    (r"\bплясят\b", "екклесиаст"),
     (r"\bбытья\b", "бытия"),
     (r"\bизход\b", "исход"),
     (r"\b([1234])\s+мега\s+царств\b", r"\1 книга царств"),
@@ -446,6 +448,10 @@ ASR_REPLACEMENTS = (
     # Sherpa can insert «она» after «Иван/Иоанн говорит». In an address
     # followed by «глава» this is a false fragment, not the book Иона.
     (r"\bиван\s+говорит\s+она(?=\s+(?:\d+|перв\w*|втор\w*|трет\w*|четверт\w*|пят\w*|шест\w*|седьм\w*|восьм\w*|девят\w*|десят\w*)\s+глав)", "иоанн говорит"),
+    # Sherpa may hear «Иоанн» as «и она».  The chapter marker and following
+    # verse marker make this an address; ordinary «и она ...» speech stays
+    # untouched.
+    (r"\bи\s+она(?=\s+(?:\d+|перв\w*|втор\w*|трет\w*|четверт\w*|пят\w*|шест\w*|седьм\w*|восьм\w*|девят\w*|десят\w*)\s+(?:глав|грала))", "иоанн"),
     # Rodnik replay: "первое послание Иоанна" -> "первое познание ана".
     # The required following chapter keeps ordinary talk about knowledge out.
     (
@@ -565,6 +571,8 @@ ASR_REPLACEMENTS = (
     (r"\b(открыть|откройте|открываем|откроем)[^0-9а-яa-z]+при\s+(\d+\s+глав[аеуы])\b", r"\1 притчи \2"),
     (r"\bглавус\b", "глава"),
     (r"\bглавоз\b", "глава"),
+    # Sherpa can hear «глава» as «грала» in a Bible address.
+    (r"\bграла\b", "глава"),
     (r"\b(\d+)\s+голова\b", r"\1 глава"),
     (r"\bглавы\b", "глава"),
     (r"\bглаве\b", "глава"),
@@ -715,6 +723,53 @@ TRUNCATED_FEMININE_CHAPTER_ORDINAL_RE = re.compile(
     + "|".join(sorted(TRUNCATED_FEMININE_CHAPTER_ORDINALS, key=len, reverse=True))
     + r")\s+(глав\w*)\b"
 )
+# Sherpa may fuse a feminine chapter ordinal with the omitted word ``глава``
+# and return a masculine-looking ``-ого`` form, e.g. ``двадцать первоего``.
+# Keep this repair tied to a following verse marker so ordinary genitive
+# ordinals are not rewritten globally.
+FUSED_FEMININE_CHAPTER_ORDINALS = {
+    "первоего": 1,
+    "второего": 2,
+    "третьего": 3,
+    "четвертого": 4,
+    "пятого": 5,
+    "шестого": 6,
+    "седьмого": 7,
+    "восьмого": 8,
+    "девятого": 9,
+    "десятого": 10,
+    "одиннадцатого": 11,
+    "двенадцатого": 12,
+    "тринадцатого": 13,
+    "четырнадцатого": 14,
+    "пятнадцатого": 15,
+    "шестнадцатого": 16,
+    "семнадцатого": 17,
+    "восемнадцатого": 18,
+    "девятнадцатого": 19,
+    "двадцатого": 20,
+    "тридцатого": 30,
+    "сорокового": 40,
+    "пятидесятого": 50,
+    "шестидесятого": 60,
+    "семидесятого": 70,
+    "восьмидесятого": 80,
+    "девяностого": 90,
+    "сотого": 100,
+}
+FUSED_FEMININE_CHAPTER_ORDINAL_RE = re.compile(
+    r"\b(?:(двадцать|тридцать|сорок|пятьдесят|шестьдесят|"
+    r"семьдесят|восемьдесят|девяносто)\s+)?("
+    + "|".join(sorted(FUSED_FEMININE_CHAPTER_ORDINALS, key=len, reverse=True))
+    + r")(?:\s+)(?=(?:\d+|[а-я]+)\s+стих\w*\b)"
+)
+# A preceding genitive ordinal is a strong sign that the current ordinal is a
+# range boundary (``восемнадцатого третьего стих``), not a fused chapter
+# number.  Keep this set separate so the repair cannot alter existing range
+# recovery rules.
+GENITIVE_ORDINAL_WORDS = {
+    word for word in ORDINALS if word.endswith(("ого", "его", "ьего"))
+}
 THOUSAND_NOISE_VERSE_RANGE_RE = re.compile(
     r"\b(?P<chapter>\d{1,3})\s+глав\w*\s+"
     r"(?P<prefix>с\s+)?(?P<start>\d{1,3})\s+1000\s+(?P<end>\d{1,3})\s+стих\w*\b"
@@ -743,6 +798,36 @@ def replace_truncated_genitive_range_start(match: re.Match[str]) -> str:
 
 def replace_truncated_feminine_chapter_ordinal(match: re.Match[str]) -> str:
     return f"{TRUNCATED_FEMININE_CHAPTER_ORDINALS[match.group(1)]} {match.group(2)}"
+
+
+def replace_fused_feminine_chapter_ordinal(match: re.Match[str]) -> str:
+    # If a chapter was already stated earlier in the same utterance, a
+    # following ``пятого/девятого ... стих`` is normally a verse number (or a
+    # range boundary), not a second fused chapter.  Preserve it and let the
+    # existing chapter-context logic handle the fragment.
+    if re.search(r"\bглав\w*\b", match.string[: match.start()]):
+        return match.group(0)
+    preceding = match.string[: match.start()].rstrip().split()
+    if preceding and (
+        preceding[-1].isdigit()
+        or preceding[-1] in GENITIVE_ORDINAL_WORDS
+        or preceding[-1] in ORDINALS
+    ):
+        return match.group(0)
+    tens = {
+        "двадцать": 20,
+        "тридцать": 30,
+        "сорок": 40,
+        "пятьдесят": 50,
+        "шестьдесят": 60,
+        "семьдесят": 70,
+        "восемьдесят": 80,
+        "девяносто": 90,
+    }
+    value = FUSED_FEMININE_CHAPTER_ORDINALS[match.group(2)]
+    if match.group(1):
+        value += tens[match.group(1)]
+    return f"{value} глава "
 
 
 def replace_thousand_noise_verse_range(match: re.Match[str]) -> str:
@@ -795,6 +880,10 @@ def normalize_text(text: str) -> str:
     )
     normalized = TRUNCATED_FEMININE_CHAPTER_ORDINAL_RE.sub(
         replace_truncated_feminine_chapter_ordinal,
+        normalized,
+    )
+    normalized = FUSED_FEMININE_CHAPTER_ORDINAL_RE.sub(
+        replace_fused_feminine_chapter_ordinal,
         normalized,
     )
     # Sherpa can cut the ending off an ordinal such as "двадцать пятый".

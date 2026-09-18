@@ -6,12 +6,14 @@ import argparse
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from bible_parser_core.bible_text_search import BibleTextSearchResult
 from bible_parser_core.parser import DEFAULT_BIBLE
 from bible_parser_core.text_citation_detector import (
     ScriptureTextDetector,
     SlidingSpeechBuffer,
+    StreamingVerseAligner,
     TextDetectionConfig,
 )
 
@@ -96,6 +98,391 @@ class SlidingSpeechBufferTest(unittest.TestCase):
     def test_invalid_window_configuration_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             SlidingSpeechBuffer(buffer_words=5, window_sizes=(7,), min_words=5)
+
+
+class IdentityLemmaSearcher:
+    def normalize_lemmas(self, text: str) -> list[str]:
+        return text.casefold().replace("ё", "е").split()
+
+
+class StreamingVerseAlignerTest(unittest.TestCase):
+    @staticmethod
+    def state() -> dict:
+        return {
+            "ref": "Тест 1:1-2",
+            "book": "Тест",
+            "book_id": 1,
+            "slide_mode": "one_verse",
+            "current_index": 0,
+            "targets": [
+                {
+                    "start_chapter": 1,
+                    "start_verse": 1,
+                    "chapter": 1,
+                    "verse": 1,
+                    "text": "начало первого стиха милость истина правда вечная",
+                },
+                {
+                    "start_chapter": 1,
+                    "start_verse": 2,
+                    "chapter": 1,
+                    "verse": 2,
+                    "text": "следующий стих приносит мир сердцам людей",
+                },
+                {
+                    "start_chapter": 1,
+                    "start_verse": 3,
+                    "chapter": 1,
+                    "verse": 3,
+                    "text": "третий стих продолжает чтение добрыми словами",
+                },
+            ],
+        }
+
+    def test_detects_current_tail_and_start_of_next_verse_in_order(self) -> None:
+        aligner = StreamingVerseAligner(IdentityLemmaSearcher())
+
+        result = aligner.observe_partial(
+            self.state(),
+            "милость истина правда вечная следующий стих приносит мир",
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual("next_started", result.status)
+        self.assertEqual(4, result.current_tail_hits)
+        self.assertEqual(4, result.next_head_hits)
+        self.assertEqual("Тест 1:1", result.current_ref)
+        self.assertEqual("Тест 1:2", result.next_ref)
+        self.assertTrue(result.would_advance)
+        self.assertEqual(1, result.proposed_index)
+
+    def test_diagnostic_cursor_advances_without_legacy_slide_state(self) -> None:
+        aligner = StreamingVerseAligner(IdentityLemmaSearcher())
+        state = self.state()
+        first = aligner.observe_partial(
+            state,
+            "милость истина правда вечная следующий стих приносит мир",
+        )
+
+        second = aligner.observe_partial(
+            state,
+            "сердцам людей третий стих продолжает чтение",
+        )
+
+        assert first is not None and second is not None
+        self.assertEqual(0, state["current_index"])
+        self.assertEqual("Тест 1:2", second.current_ref)
+        self.assertEqual("Тест 1:3", second.next_ref)
+        self.assertEqual("next_started", second.status)
+        self.assertEqual(2, second.proposed_index)
+
+    def test_tolerates_one_distortion_omission_and_inserted_word(self) -> None:
+        aligner = StreamingVerseAligner(IdentityLemmaSearcher())
+
+        result = aligner.observe_partial(
+            self.state(),
+            "милостю лишнее правда вечная следующий приносит мир",
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual("next_started", result.status)
+        self.assertGreaterEqual(result.current_tail_hits, 2)
+        self.assertGreaterEqual(result.next_head_hits, 3)
+
+    def test_strong_next_body_recovers_when_its_first_words_are_distorted(self) -> None:
+        aligner = StreamingVerseAligner(IdentityLemmaSearcher())
+        state = self.state()
+        state["targets"][1]["text"] = (
+            "поврежденное начало далее любовь радость мир сердцам людей"
+        )
+
+        result = aligner.observe_partial(
+            state,
+            "милость истина правда вечная любовь радость мир сердцам людей",
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual("next_started", result.status)
+        self.assertEqual("next_body_after_current_end", result.transition_evidence)
+        self.assertEqual(1, result.next_head_hits)
+        self.assertGreaterEqual(result.next_content_matches, 5)
+
+    def test_revised_partial_is_not_committed_to_stable_history(self) -> None:
+        aligner = StreamingVerseAligner(IdentityLemmaSearcher())
+        aligner.observe_partial(self.state(), "милость истина")
+
+        revised = aligner.observe_partial(self.state(), "совсем другая фраза")
+        committed = aligner.observe_final(self.state(), "милость истина правда вечная")
+        continued = aligner.observe_partial(self.state(), "следующий стих приносит мир")
+
+        assert revised is not None and committed is not None and continued is not None
+        self.assertEqual(0, revised.stable_words)
+        self.assertNotIn("милость", revised.observed_text)
+        self.assertEqual(4, committed.stable_words)
+        self.assertEqual("next_started", continued.status)
+
+    def test_manual_synchronization_can_discard_old_speech_history(self) -> None:
+        aligner = StreamingVerseAligner(IdentityLemmaSearcher())
+        state = self.state()
+        aligner.observe_final(state, "начало первого стиха милость истина")
+
+        aligner.synchronize_current_index(1, clear_history=True)
+        result = aligner.observe_partial(state, "следующий стих приносит мир")
+
+        assert result is not None
+        self.assertEqual(0, result.stable_words)
+        self.assertEqual(1, aligner.current_index)
+
+    def test_unrelated_commentary_does_not_report_boundary(self) -> None:
+        aligner = StreamingVerseAligner(IdentityLemmaSearcher())
+
+        result = aligner.observe_partial(
+            self.state(),
+            "откройте пожалуйста ваши библии сегодня",
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual("uncertain", result.status)
+        self.assertEqual(0, result.next_head_hits)
+
+    def test_replay_opt_in_activates_and_advances_virtual_slide(self) -> None:
+        from tools.replay_audio_files import log_replay_streaming_alignment
+
+        class CollectingLogger:
+            def __init__(self) -> None:
+                self.events: list[tuple[str, dict]] = []
+
+            def write(self, event: str, payload: dict) -> None:
+                self.events.append((event, payload))
+
+        state = self.state()
+        state["current_slide_visible"] = False
+        replay_state: dict[str, object] = {"smart_slide_shadow": state}
+        logger = CollectingLogger()
+        detector = SimpleNamespace(searcher=IdentityLemmaSearcher())
+
+        log_replay_streaming_alignment(
+            "начало первого стиха милость истина правда вечная",
+            1.0,
+            detector,
+            replay_state,
+            logger,
+            recognition_result="partial",
+            controls_slide=True,
+        )
+        log_replay_streaming_alignment(
+            "милость истина правда вечная следующий стих приносит мир",
+            2.0,
+            detector,
+            replay_state,
+            logger,
+            recognition_result="partial",
+            controls_slide=True,
+        )
+
+        self.assertTrue(state["current_slide_visible"])
+        self.assertEqual(1, state["current_index"])
+        decisions = [payload for event, payload in logger.events if event == "SMART_SLIDE_SHADOW"]
+        self.assertEqual(["activate", "advance"], [item["action"] for item in decisions])
+        self.assertEqual("streaming_initial_element", decisions[0]["reason"])
+        self.assertEqual("streaming_next_head", decisions[1]["reason"])
+        self.assertEqual(1, decisions[0]["current_element"]["verse"])
+        self.assertEqual(2, decisions[1]["target_element"]["verse"])
+
+    def test_live_shadow_logs_signal_without_changing_holyrics_state(self) -> None:
+        from tools.vosk_grammar_probe import log_live_streaming_alignment
+
+        class CollectingLogger:
+            def __init__(self) -> None:
+                self.events: list[tuple[str, dict]] = []
+
+            def write(self, event: str, payload: dict) -> None:
+                self.events.append((event, payload))
+
+        state = self.state()
+        state.pop("slide_mode")
+        args = SimpleNamespace(
+            smart_slide_streaming_shadow=True,
+            long_range_slide_mode="one_verse",
+            _holyrics_scripture_range_reading=state,
+        )
+        logger = CollectingLogger()
+
+        alignment = log_live_streaming_alignment(
+            args,
+            "милость истина правда вечная следующий стих приносит мир",
+            IdentityLemmaSearcher(),
+            logger,
+            recognition_result="partial",
+            recognition_time=12.5,
+        )
+
+        self.assertIsNotNone(alignment)
+        self.assertEqual(0, state["current_index"])
+        event, payload = logger.events[-1]
+        self.assertEqual("STREAMING_VERSE_ALIGNMENT", event)
+        self.assertEqual("live_shadow", payload["mode"])
+        self.assertFalse(payload["controls_slide"])
+        self.assertTrue(payload["would_advance"])
+
+    def test_live_control_applies_streaming_transition_once(self) -> None:
+        from tools.vosk_grammar_probe import log_live_streaming_alignment
+
+        class CollectingLogger:
+            def __init__(self) -> None:
+                self.events: list[tuple[str, dict]] = []
+
+            def write(self, event: str, payload: dict) -> None:
+                self.events.append((event, payload))
+
+        state = self.state()
+        state.pop("slide_mode")
+        args = SimpleNamespace(
+            smart_slide_streaming_shadow=False,
+            smart_slide_streaming_control=True,
+            long_range_slide_mode="one_verse",
+            _holyrics_scripture_range_reading=state,
+        )
+        logger = CollectingLogger()
+
+        def apply_transition(_args, action: str, hint: dict) -> tuple[bool, str]:
+            self.assertEqual("apply", action)
+            state["current_index"] = hint["target_index"]
+            return True, "ok"
+
+        with patch(
+            "tools.vosk_grammar_probe.apply_scripture_range_operator_hint",
+            side_effect=apply_transition,
+        ) as apply_mock:
+            alignment = log_live_streaming_alignment(
+                args,
+                "милость истина правда вечная следующий стих приносит мир",
+                IdentityLemmaSearcher(),
+                logger,
+                recognition_result="partial",
+                recognition_time=20.0,
+            )
+
+        self.assertIsNotNone(alignment)
+        self.assertEqual(1, state["current_index"])
+        apply_mock.assert_called_once()
+        control = [payload for event, payload in logger.events if event == "STREAMING_SLIDE_CONTROL"]
+        self.assertEqual(1, len(control))
+        self.assertTrue(control[0]["ok"])
+        self.assertEqual("Тест 1:2", control[0]["target_ref"])
+
+    def test_live_control_retries_after_holyrics_transition_failure(self) -> None:
+        from tools.vosk_grammar_probe import log_live_streaming_alignment
+
+        class CollectingLogger:
+            def write(self, _event: str, _payload: dict) -> None:
+                pass
+
+        state = self.state()
+        state.pop("slide_mode")
+        args = SimpleNamespace(
+            smart_slide_streaming_shadow=False,
+            smart_slide_streaming_control=True,
+            long_range_slide_mode="one_verse",
+            _holyrics_scripture_range_reading=state,
+        )
+        text = "милость истина правда вечная следующий стих приносит мир"
+
+        with patch(
+            "tools.vosk_grammar_probe.apply_scripture_range_operator_hint",
+            return_value=(False, "temporary_failure"),
+        ) as apply_mock:
+            first = log_live_streaming_alignment(
+                args, text, IdentityLemmaSearcher(), CollectingLogger(),
+                recognition_result="partial", recognition_time=20.0,
+            )
+            second = log_live_streaming_alignment(
+                args, text, IdentityLemmaSearcher(), CollectingLogger(),
+                recognition_result="partial", recognition_time=20.5,
+            )
+
+        assert first is not None and second is not None
+        self.assertEqual(0, state["current_index"])
+        self.assertEqual(1, first.proposed_index)
+        self.assertEqual(1, second.proposed_index)
+        self.assertEqual(2, apply_mock.call_count)
+
+    def test_live_control_restores_sermon_plan_after_final_verse_ending(self) -> None:
+        from tools.vosk_grammar_probe import log_live_streaming_alignment
+
+        class CollectingLogger:
+            def __init__(self) -> None:
+                self.events: list[tuple[str, dict]] = []
+
+            def write(self, event: str, payload: dict) -> None:
+                self.events.append((event, payload))
+
+        state = self.state()
+        state.pop("slide_mode")
+        state["current_index"] = 2
+        args = SimpleNamespace(
+            smart_slide_streaming_shadow=False,
+            smart_slide_streaming_control=True,
+            long_range_slide_mode="one_verse",
+            _holyrics_scripture_range_reading=state,
+        )
+        logger = CollectingLogger()
+
+        class RecordingDetector:
+            def __init__(self) -> None:
+                self.shown: list[tuple[str, float]] = []
+                self.cleared = False
+
+            def mark_shown(self, reference: str, now: float) -> None:
+                self.shown.append((reference, now))
+
+            def clear(self) -> None:
+                self.cleared = True
+
+        detector = RecordingDetector()
+
+        def complete_range(_args, candidate):
+            self.assertEqual(1, candidate.book_id)
+            self.assertEqual(3, candidate.start_verse)
+            args._holyrics_scripture_range_reading = None
+            return {
+                "completed": True,
+                "restored_sermon_plan": True,
+                "reason": "sermon_plan_restore_verified",
+            }
+
+        with patch(
+            "tools.vosk_grammar_probe.handle_scripture_range_reading_match",
+            side_effect=complete_range,
+        ) as complete_mock:
+            alignment = log_live_streaming_alignment(
+                args,
+                "третий стих продолжает чтение добрыми словами",
+                IdentityLemmaSearcher(),
+                logger,
+                recognition_result="final",
+                recognition_time=30.0,
+                text_detector=detector,
+            )
+
+        assert alignment is not None
+        self.assertEqual("current_ending", alignment.status)
+        complete_mock.assert_called_once()
+        control = [
+            payload
+            for event, payload in logger.events
+            if event == "STREAMING_SLIDE_CONTROL"
+        ]
+        self.assertEqual(1, len(control))
+        self.assertEqual("complete_range", control[0]["action"])
+        self.assertTrue(control[0]["completed"])
+        self.assertTrue(control[0]["restored_sermon_plan"])
+        self.assertEqual([("Тест 1:1-2", 30.0)], detector.shown)
+        self.assertTrue(detector.cleared)
 
 
 class ScriptureTextDetectorTest(unittest.TestCase):
@@ -441,6 +828,61 @@ class ScriptureTextDetectorTest(unittest.TestCase):
         self.assertTrue(decision.accepted)
         self.assertEqual("Пс. 22:1-2", decision.reference)
         self.assertEqual("immediate_strong_range_match", decision.reason)
+
+    def test_rich_range_match_starts_sequence_despite_distorted_boundary_words(self) -> None:
+        verse_range = hit(
+            "1Кор. 11:23-24", 59.445,
+            matched=("господь", "исус", "взять", "хлеб", "возблагодарить", "преломить", "сказать", "принять"),
+            ordered=78.0,
+            bigram=28.0,
+            trigram=12.0,
+            book_id=46,
+            chapter=11,
+            verse=23,
+            end_verse=24,
+        )
+        class MatchingSearcher:
+            def search(self, _text: str, **_unused: object):
+                return list(verse_range.matched_lemmas), [verse_range]
+
+        detector = ScriptureTextDetector(
+            MatchingSearcher(),
+            self.config(window_sizes=(17,)),
+        )
+
+        decision = detector.process_fragment(
+            "господь иисус всю нож которую предан был взял хлеб и возблагодарил "
+            "приломил и сказал примите идите сеть",
+            now=0.0,
+        )
+
+        self.assertTrue(decision.accepted)
+        self.assertEqual("1Кор. 11:23-24", decision.reference)
+        self.assertEqual("immediate_strong_range_match", decision.reason)
+
+    def test_sequence_boundary_diagnostic_counts_distant_candidates(self) -> None:
+        first = hit("Кол. 3:1", 72.0, matched=("слово", "бог"), book_id=51, chapter=3, verse=1)
+        third = hit("Кол. 3:3", 68.0, matched=("жизнь", "бог"), book_id=51, chapter=3, verse=3)
+
+        class RangeSearcher:
+            def search_within_ranges(self, _text: str, _ranges: object, *, limit: int):
+                return ["слово", "бог"], [first, third]
+
+        detector = ScriptureTextDetector(RangeSearcher(), self.config())
+        diagnostic = detector.estimate_known_sequence_boundaries(
+            {
+                "book_id": 51,
+                "targets": [
+                    {"chapter": 3, "verse": 1, "start_verse": 1},
+                    {"chapter": 3, "verse": 2, "start_verse": 2},
+                    {"chapter": 3, "verse": 3, "start_verse": 3},
+                ],
+            },
+            "слово бог жизнь бог",
+        )
+
+        self.assertEqual(2, diagnostic["boundary_count_estimate"])
+        self.assertEqual([0, 2], diagnostic["candidate_indices"])
 
     def test_broader_three_verse_range_wins_over_stronger_contained_suffix(self) -> None:
         short_range = hit(
@@ -1514,6 +1956,91 @@ class TextCitationIntegrationTest(unittest.TestCase):
         self.assertEqual(72.5, update["replay_seconds"])
         self.assertIn("всякий", update["element"]["text"].lower())
 
+    def test_browser_timeline_does_not_overwrite_one_verse_ups_with_range(self) -> None:
+        from tools.review_trigger_cases import SmartSlideBrowserReview, collect_smart_slide_entries
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run = Path(temporary) / "20260917_133753_351337"
+            run.mkdir()
+            events = [
+                {"event": "SMART_SLIDE_SHADOW", "passage": "1 Коринфянам 11:23-30",
+                 "slide_mode": "one_verse", "action": "activate", "replay_seconds": 4.0,
+                 "current_index": 0, "current_element": {"verse": 23}},
+                {"event": "parsed", "replay_seconds": 6.76,
+                 "payload": {"ref": "1 Коринфянам 11:23-24", "source": "text_citation"},
+                 "output": {"replay": {"sent": True}}},
+            ]
+            (run / "events.jsonl").write_text(
+                "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events), encoding="utf-8"
+            )
+            entries = collect_smart_slide_entries([run / "events.jsonl"])
+            timeline = SmartSlideBrowserReview(entries, no_resume=False).timeline()
+
+        self.assertEqual([], timeline["tracks"][0]["display_updates"])
+
+    def test_browser_timeline_shows_explicit_new_range_after_ups_activation(self) -> None:
+        from tools.review_trigger_cases import SmartSlideBrowserReview, collect_smart_slide_entries
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run = Path(temporary) / "20260918_172617_015275"
+            run.mkdir()
+            events = [
+                {"event": "SMART_SLIDE_SHADOW", "passage": "Колоссянам 3:1-18",
+                 "slide_mode": "one_verse", "manual_context": True,
+                 "action": "activate", "replay_seconds": 40.0,
+                 "current_index": 0, "current_element": {"verse": 1}},
+                {"event": "SMART_SLIDE_SHADOW", "passage": "Колоссянам 3:1-18",
+                 "slide_mode": "one_verse", "manual_context": True,
+                 "action": "advance", "replay_seconds": 180.0,
+                 "current_index": 15, "target_index": 16,
+                 "current_element": {"verse": 16}, "target_element": {"verse": 17}},
+                {"event": "parsed", "replay_seconds": 203.25,
+                 "vosk_text": "первый третий стих",
+                 "payload": {"ref": "Колоссянам 3:1-3", "source": "context_range"},
+                 "output": {"replay": {"sent": True}}},
+            ]
+            (run / "events.jsonl").write_text(
+                "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events),
+                encoding="utf-8",
+            )
+            entries = collect_smart_slide_entries([run / "events.jsonl"])
+            timeline = SmartSlideBrowserReview(entries, no_resume=False).timeline()
+
+        updates = timeline["tracks"][0]["display_updates"]
+        self.assertEqual(1, len(updates))
+        self.assertEqual("Колоссянам 3:1-3", updates[0]["ref"])
+        self.assertTrue(updates[0]["explicit_address"])
+
+    def test_browser_timeline_manual_ups_owns_display_before_activation(self) -> None:
+        from tools.review_trigger_cases import SmartSlideBrowserReview, collect_smart_slide_entries
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run = Path(temporary) / "20260918_122719_127115"
+            run.mkdir()
+            events = [
+                {"event": "SMART_SLIDE_SHADOW", "passage": "Колоссянам 3:1-18",
+                 "slide_mode": "one_verse", "manual_context": True,
+                 "action": "keep", "replay_seconds": 3.0, "current_index": 0,
+                 "current_element": {"verse": 1}},
+                {"event": "parsed", "replay_seconds": 25.75,
+                 "payload": {"ref": "Колоссянам 3:1-7", "source": "parser"},
+                 "output": {"replay": {"sent": True}}},
+                {"event": "SMART_SLIDE_SHADOW", "passage": "Колоссянам 3:1-18",
+                 "slide_mode": "one_verse", "manual_context": True,
+                 "action": "activate", "replay_seconds": 47.5, "current_index": 0,
+                 "current_element": {"verse": 1}},
+            ]
+            (run / "events.jsonl").write_text(
+                "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events),
+                encoding="utf-8",
+            )
+            entries = collect_smart_slide_entries([run / "events.jsonl"])
+            timeline = SmartSlideBrowserReview(entries, no_resume=False).timeline()
+
+        updates = timeline["tracks"][0]["display_updates"]
+        self.assertEqual(1, len(updates))
+        self.assertEqual("Колоссянам 3:1-7", updates[0]["ref"])
+
     def test_browser_timeline_shows_only_address_when_long_range_is_announced(self) -> None:
         from tools.review_trigger_cases import normal_slide_updates
 
@@ -2018,13 +2545,18 @@ class TextCitationIntegrationTest(unittest.TestCase):
         self.assertEqual(4.0, estimate_recent_speech_rate(result))
 
     def test_adaptive_sherpa_segment_length_tracks_pace_with_three_to_ten_second_bounds(self) -> None:
-        from bible_parser_core.sherpa_streaming import adaptive_sherpa_segment_seconds
+        from bible_parser_core.sherpa_streaming import (
+            adaptive_sherpa_segment_seconds,
+            boundary_window_target_words,
+        )
 
         self.assertEqual(10.0, adaptive_sherpa_segment_seconds(None))
         self.assertEqual(3.25, adaptive_sherpa_segment_seconds(3.0))
         self.assertEqual(5.0, adaptive_sherpa_segment_seconds(2.0))
         self.assertEqual(10.0, adaptive_sherpa_segment_seconds(0.5))
         self.assertEqual(3.0, adaptive_sherpa_segment_seconds(8.0))
+        self.assertEqual(10, boundary_window_target_words(24, 12))
+        self.assertEqual(6, boundary_window_target_words(5, 4))
 
     def test_adaptive_sherpa_replay_finishes_and_resets_at_calculated_boundary(self) -> None:
         from bible_parser_core.sherpa_streaming import SherpaReplayRecognizer
@@ -2079,6 +2611,9 @@ class TextCitationIntegrationTest(unittest.TestCase):
         self.assertEqual(1, len(results))
         self.assertEqual("adaptive_interval", results[0]["segmentation_reason"])
         self.assertEqual(10.0, results[0]["segment_duration_seconds"])
+        self.assertEqual(1.0, results[0]["speech_rate_wps"])
+        self.assertEqual(10.0, results[0]["adaptive_limit_seconds"])
+        self.assertEqual(10.0, results[0]["boundary_target_words"])
         self.assertEqual(1, recognizer.reset_calls)
         self.assertFalse(recognizer.stream.finished)
 
@@ -2438,10 +2973,32 @@ class TextCitationIntegrationTest(unittest.TestCase):
         self.assertIsNotNone(inferred)
         self.assertEqual("Филиппийцам 1:8-11", inferred["parsed"]["ref"])
 
+    def test_text_citation_range_uses_only_first_verse_on_one_verse_slide(self) -> None:
+        from tools.replay_audio_files import replay_one_verse_text_citation_slide
+
+        payload = {
+            "parsed": {
+                "book": "1 Коринфянам", "chapter": 11,
+                "start_verse": 23, "end_verse": 24,
+                "ref": "1 Коринфянам 11:23-24",
+            },
+            "slide": {
+                "ref": "1 Коринфянам 11:23-24",
+                "verse": "текст двух стихов",
+            },
+        }
+
+        result = replay_one_verse_text_citation_slide(payload)
+
+        self.assertEqual("1 Коринфянам 11:23", result["slide"]["ref"])
+        self.assertNotEqual("текст двух стихов", result["slide"]["verse"])
+        self.assertEqual("1 Коринфянам 11:23-24", result["slide"]["text_range_context"])
+
     def test_replay_smart_slide_shadow_advances_after_current_boundary(self) -> None:
         from bible_parser_core.sequence_advancer import decide_sequence_advance
         from tools.replay_audio_files import (
             apply_replay_smart_slide_decision,
+            replay_smart_slide_reading_started,
             replay_smart_slide_state,
         )
 
@@ -2454,6 +3011,7 @@ class TextCitationIntegrationTest(unittest.TestCase):
         self.assertIsNotNone(state)
         self.assertEqual(9, len(state["targets"]))
         self.assertFalse(state["current_slide_visible"])
+        self.assertFalse(replay_smart_slide_reading_started(state))
 
         visible_state = replay_smart_slide_state({
             "parsed": {
@@ -2477,6 +3035,7 @@ class TextCitationIntegrationTest(unittest.TestCase):
         self.assertEqual("activate", activation["action"])
         self.assertTrue(apply_replay_smart_slide_decision(state, activation))
         self.assertTrue(state["current_slide_visible"])
+        self.assertTrue(replay_smart_slide_reading_started(state))
 
         decision = decide_sequence_advance(
             state,

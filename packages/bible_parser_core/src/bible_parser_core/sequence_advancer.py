@@ -12,6 +12,18 @@ INITIAL_SLIDE_MIN_MATCHED_WORDS = 3
 NEARBY_SHORT_MIN_SCORE = ASSISTED_MIN_SCORE
 NEARBY_SHORT_MIN_MARGIN = ASSISTED_MIN_MARGIN
 NEARBY_SHORT_MIN_MATCHED_WORDS = 2
+# After a weak/assisted move, do not let a short continuation of the same ASR
+# tail immediately advance the newly shown verse.  Five content words is still
+# below the normal strong-match evidence, but is enough to distinguish a fresh
+# verse ending from the two-to-four-word tail that caused the assisted move.
+ASSISTED_CURRENT_CONFIRMATION_MIN_MATCHED_WORDS = 5
+# While waiting for a fresh confirmation after a synchronization, allow a
+# robust local match of the immediately following verse to recover from a
+# detector result that was not promoted to TEXT_ACCEPTED. This never applies
+# to a distant candidate.
+AWAITING_ADJACENT_NEXT_MIN_SCORE = 60.0
+AWAITING_ADJACENT_NEXT_MIN_MARGIN = 30.0
+AWAITING_ADJACENT_NEXT_MIN_MATCHED_WORDS = 5
 ASSISTED_REASONS = {
     "candidate_ready",
     "margin_below_threshold",
@@ -126,13 +138,48 @@ def decide_sequence_advance(
     reaches_current_boundary = candidate_start <= target_end <= candidate_end
     ending_overlap_words = int(_value(candidate, "ending_overlap_words", 0) or 0)
 
+    # A distant recovery identifies a later verse, but the same recognition
+    # window often continues to contain that verse.  Do not interpret its
+    # repeated words as the end of the newly selected slide.
+    if state.get("recovered_element_pending"):
+        if candidate_index == current_index:
+            return {
+                **base,
+                "action": "keep",
+                "reason": "await_recovered_element_confirmation",
+            }
+        if candidate_index > current_index:
+            if isinstance(state, dict):
+                state.pop("recovered_element_pending", None)
+
     # An assisted move can be based on a short/weak tail from the previous
     # verse. Do not let another weak candidate immediately cascade to the
     # following slide: first require a strong match for the verse now shown.
     # This is evidence-gated rather than time-gated, so a clear next-verse
     # match may still synchronize immediately.
-    if awaiting_current_confirmation and not strong:
+    awaiting_adjacent_next_recovery = bool(
+        awaiting_current_confirmation
+        and candidate_index == current_index + 1
+        and speech_continues
+        and reason in ASSISTED_REASONS
+        and float(score) >= AWAITING_ADJACENT_NEXT_MIN_SCORE
+        and float(margin) >= AWAITING_ADJACENT_NEXT_MIN_MARGIN
+        and int(matched_words) >= AWAITING_ADJACENT_NEXT_MIN_MATCHED_WORDS
+    )
+    if awaiting_current_confirmation and not strong and not awaiting_adjacent_next_recovery:
         if candidate_index in {current_index, current_index + 1}:
+            return {
+                **base,
+                "action": "keep",
+                "reason": "await_current_element_confirmation",
+            }
+    if awaiting_current_confirmation and candidate_index == current_index and strong:
+        # A strong result can still be only the completed tail of the same
+        # recognition window that triggered an assisted transition.  Require
+        # a little more fresh content before advancing again; a strong match
+        # of the *next* element remains allowed below and can synchronize
+        # without waiting for a short current verse to finish twice.
+        if int(matched_words) < ASSISTED_CURRENT_CONFIRMATION_MIN_MATCHED_WORDS:
             return {
                 **base,
                 "action": "keep",
@@ -206,7 +253,12 @@ def decide_sequence_advance(
         return {
             **base,
             "action": "synchronize_forward" if strong else "assisted_synchronize_forward",
-            "confirmation_state": "confirmed" if strong else "required",
+            # A next-verse match identifies the slide to show, but the same
+            # recognition window may immediately contain the end of that
+            # verse.  Require a fresh confirmation before that tail can move
+            # on again; this prevents a strong-next cascade as well as an
+            # assisted cascade.
+            "confirmation_state": "required",
             "target_index": candidate_index,
             "target_element": dict(targets[candidate_index]),
             "reason": (
@@ -219,7 +271,31 @@ def decide_sequence_advance(
                 )
             ),
         }
-    if candidate_index > current_index + 1 and strong:
+    distant_recovery = bool(
+        state.get("allow_distant_skip")
+        and candidate_index > current_index + 1
+        and float(score) >= 80.0
+        and float(margin) >= 30.0
+        and int(matched_words) >= 5
+        and (accepted or reason == "duplicate_cooldown")
+    )
+    if candidate_index > current_index + 1 and (strong or distant_recovery):
+        if distant_recovery:
+            if isinstance(state, dict):
+                state["recovered_element_pending"] = True
+            return {
+                **base,
+                "action": "synchronize_forward",
+                # A skipped-verse recovery identifies the new current slide,
+                # but does not prove that its ending was heard.  Require a
+                # fresh confirmation so a repeated fragment of the same
+                # verse cannot immediately advance to the next unread slide.
+                "confirmation_state": "required",
+                "target_index": candidate_index,
+                "target_element": dict(targets[candidate_index]),
+                "skipped_indices": list(range(current_index + 1, candidate_index)),
+                "reason": "strong_later_element_skip",
+            }
         # A single recognition window may contain enough text from a later
         # verse to identify it directly.  Do not jump over intermediate
         # slides: show exactly one next verse and let the next recognition

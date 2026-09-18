@@ -20,11 +20,17 @@ class SequenceAdvancerTest(unittest.TestCase):
         }
 
     @staticmethod
-    def candidate(verse: int, *, book_id: int = 19, ending_overlap_words: int = 0):
+    def candidate(
+        verse: int,
+        *,
+        book_id: int = 19,
+        chapter: int = 72,
+        ending_overlap_words: int = 0,
+    ):
         return SimpleNamespace(
             reference=f"Пс. 72:{verse}",
             book_id=book_id,
-            chapter=72,
+            chapter=chapter,
             start_verse=verse,
             end_verse=verse,
             ending_overlap_words=ending_overlap_words,
@@ -144,6 +150,113 @@ class SequenceAdvancerTest(unittest.TestCase):
         )
         self.assertEqual("assisted_synchronize_forward", next_verse["action"])
 
+    def test_short_strong_tail_cannot_cascade_after_assisted_advance(self) -> None:
+        state = {
+            "book_id": 21,
+            "current_index": 1,
+            "await_current_confirmation": True,
+            "targets": [
+                {"start_chapter": 4, "start_verse": verse, "chapter": 4, "verse": verse}
+                for verse in range(3, 7)
+            ],
+        }
+
+        # This is a strong-looking result for the verse just shown, but it is
+        # still only a short tail of the same recognition window.
+        short_tail = decide_sequence_advance(
+            state,
+            self.candidate(4, book_id=21, chapter=4, ending_overlap_words=2),
+            accepted=True,
+            reason="immediate_strong_match",
+            score=96.0,
+            margin=60.0,
+            matched_words=4,
+        )
+        self.assertEqual("keep", short_tail["action"])
+        self.assertEqual("await_current_element_confirmation", short_tail["reason"])
+
+        fresh_end = decide_sequence_advance(
+            state,
+            self.candidate(4, book_id=21, chapter=4, ending_overlap_words=2),
+            accepted=True,
+            reason="immediate_strong_match",
+            score=96.0,
+            margin=60.0,
+            matched_words=5,
+        )
+        self.assertEqual("advance", fresh_end["action"])
+        self.assertEqual(2, fresh_end["target_index"])
+
+    def test_short_strong_tail_cannot_cascade_after_strong_next_sync(self) -> None:
+        state = {
+            "book_id": 21,
+            "current_index": 1,
+            "targets": [
+                {"start_chapter": 4, "start_verse": verse, "chapter": 4, "verse": verse}
+                for verse in range(3, 7)
+            ],
+        }
+        synced = decide_sequence_advance(
+            state,
+            self.candidate(5, book_id=21, chapter=4),
+            accepted=True,
+            reason="immediate_strong_match",
+            score=96.0,
+            margin=60.0,
+            matched_words=6,
+        )
+        self.assertEqual("synchronize_forward", synced["action"])
+        self.assertEqual("required", synced["confirmation_state"])
+
+        state["current_index"] = synced["target_index"]
+        state["await_current_confirmation"] = True
+        short_tail = decide_sequence_advance(
+            state,
+            self.candidate(5, book_id=21, chapter=4, ending_overlap_words=2),
+            accepted=True,
+            reason="immediate_strong_match",
+            score=96.0,
+            margin=60.0,
+            matched_words=4,
+        )
+        self.assertEqual("keep", short_tail["action"])
+        self.assertEqual("await_current_element_confirmation", short_tail["reason"])
+
+    def test_strong_local_next_match_can_recover_while_confirmation_is_pending(self) -> None:
+        state = {
+            "book_id": 21,
+            "current_index": 1,
+            "await_current_confirmation": True,
+            "targets": [
+                {"start_chapter": 4, "start_verse": verse, "chapter": 4, "verse": verse}
+                for verse in range(3, 7)
+            ],
+        }
+        recovery = decide_sequence_advance(
+            state,
+            self.candidate(5, book_id=21, chapter=4),
+            accepted=False,
+            reason="score_below_threshold",
+            score=62.599,
+            margin=47.074,
+            matched_words=8,
+        )
+        self.assertEqual("assisted_synchronize_forward", recovery["action"])
+        self.assertEqual(2, recovery["target_index"])
+        self.assertEqual("required", recovery["confirmation_state"])
+
+        weak_recovery = decide_sequence_advance(
+            state,
+            self.candidate(5, book_id=21, chapter=4),
+            accepted=False,
+            reason="score_below_threshold",
+            score=62.599,
+            margin=47.074,
+            matched_words=4,
+        )
+        self.assertEqual("keep", weak_recovery["action"])
+        self.assertEqual("await_current_element_confirmation", weak_recovery["reason"])
+
     def test_two_words_may_advance_only_with_strong_nearby_evidence(self) -> None:
         accepted = decide_sequence_advance(
             self.state,
@@ -205,6 +318,51 @@ class SequenceAdvancerTest(unittest.TestCase):
         self.assertEqual("synchronize_forward", forward["action"])
         self.assertEqual("ignore", backward["action"])
         self.assertEqual("automatic_backward_move_forbidden", backward["reason"])
+
+    def test_active_range_can_recover_strong_later_verse_after_skipped_text(self) -> None:
+        state = {**self.state, "allow_distant_skip": True}
+        decision = decide_sequence_advance(
+            state,
+            self.candidate(11),
+            accepted=False,
+            reason="duplicate_cooldown",
+            score=91.0,
+            margin=59.0,
+            matched_words=7,
+        )
+
+        self.assertEqual("synchronize_forward", decision["action"])
+        self.assertEqual("strong_later_element_skip", decision["reason"])
+        self.assertEqual(5, decision["target_index"])
+        self.assertEqual([2, 3, 4], decision["skipped_indices"])
+        self.assertEqual("required", decision["confirmation_state"])
+
+        state["current_index"] = decision["target_index"]
+        state["await_current_confirmation"] = True
+        repeated = decide_sequence_advance(
+            state,
+            self.candidate(11),
+            accepted=False,
+            reason="duplicate_cooldown",
+            score=91.0,
+            margin=59.0,
+            matched_words=7,
+        )
+        self.assertEqual("keep", repeated["action"])
+        self.assertEqual("await_recovered_element_confirmation", repeated["reason"])
+
+        state["recovered_element_pending"] = True
+        repeated_after_recovery = decide_sequence_advance(
+            state,
+            self.candidate(11),
+            accepted=True,
+            reason="immediate_strong_match",
+            score=94.0,
+            margin=40.0,
+            matched_words=5,
+        )
+        self.assertEqual("keep", repeated_after_recovery["action"])
+        self.assertEqual("await_recovered_element_confirmation", repeated_after_recovery["reason"])
 
     def test_candidate_from_other_book_is_ignored(self) -> None:
         decision = decide_sequence_advance(

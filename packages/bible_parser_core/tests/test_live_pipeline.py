@@ -57,6 +57,7 @@ class LiveReferencePipelineTest(unittest.TestCase):
             quick_seconds=5,
             long_range_slide_mode="one_verse",
             long_range_operator_hints=True,
+            smart_slide_streaming_control=True,
             text_operator_hints=True,
             open_operator_qr=False,
             text_detection_db=Path("bible_index.db"),
@@ -78,6 +79,8 @@ class LiveReferencePipelineTest(unittest.TestCase):
             command[command.index("--long-range-slide-mode") + 1],
         )
         self.assertIn("--long-range-operator-hints", command)
+        self.assertIn("--smart-slide-streaming-control", command)
+        self.assertNotIn("--no-smart-slide-streaming-control", command)
         self.assertIn("--text-operator-hints", command)
         self.assertEqual("640", command[command.index("--popup-anchor-x") + 1])
         self.assertEqual("360", command[command.index("--popup-anchor-y") + 1])
@@ -102,6 +105,21 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertIn(str(database_path), command)
         self.assertIn("--stop-file", command)
         self.assertIn("--no-open-operator-qr", command)
+        self.assertIn("--no-smart-slide-streaming-control", command)
+
+    def test_gui_can_disable_streaming_slide_control_for_legacy_fallback(self):
+        from tools.liverse_gui import GuiConfig, engine_command
+
+        command = engine_command(
+            GuiConfig(
+                citation_detection_mode="hybrid_confirm",
+                long_range_slide_mode="one_verse",
+                smart_slide_streaming_control=False,
+            )
+        )
+
+        self.assertIn("--no-smart-slide-streaming-control", command)
+        self.assertNotIn("--smart-slide-streaming-control", command)
 
     def test_microphone_indicator_uses_decibel_scale(self):
         from tools.vosk_grammar_probe import audio_level_percent
@@ -474,6 +492,7 @@ class LiveReferencePipelineTest(unittest.TestCase):
             holyrics_theme="",
             holyrics_quick_minutes=5 / 60,
             long_range_slide_mode="one_verse",
+            smart_slide_streaming_control=True,
         )
         restored_args = SimpleNamespace(
             approval_ui="web",
@@ -494,6 +513,7 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertEqual("Microphone (USB2.0 Device)", restored_args.device_name)
         self.assertEqual("one_verse", restored_args.long_range_slide_mode)
+        self.assertTrue(settings["smart_slide_streaming_control"])
 
     def test_audio_input_candidates_prefer_stable_name_over_indexes(self):
         from tools.vosk_grammar_probe import audio_input_candidate_indices
@@ -3904,6 +3924,55 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertEqual(2, plan["current_index"])
         self.assertEqual(3, plan["next_index"])
 
+    def test_stale_sermon_plan_is_ignored_while_long_range_opens(self):
+        plan = {"type": "text", "text_id": "sermon-plan", "current_index": 0}
+        args = SimpleNamespace(
+            holyrics_url="http://127.0.0.1:8091",
+            _holyrics_sermon_plan_presentation=plan,
+            _holyrics_scripture_range_reading={
+                "started_at_monotonic": 100.0,
+                "current_index": 0,
+                "targets": [{"verse": 14}, {"verse": 15}],
+            },
+        )
+        with (
+            patch(
+                "tools.holyrics.get_holyrics_current_presentation",
+                return_value={"type": "text", "text_id": "sermon-plan", "slide_number": 3},
+            ),
+            patch("tools.holyrics.time.monotonic", return_value=100.2),
+        ):
+            result = sync_scripture_range_reading(args)
+
+        self.assertTrue(result["active"])
+        self.assertEqual("waiting_for_quick_presentation", result["reason"])
+        self.assertTrue(scripture_range_reading_active(args))
+        self.assertEqual(0, plan["current_index"])
+
+    def test_sermon_plan_restore_after_startup_grace_ends_long_range_mode(self):
+        plan = {"type": "text", "text_id": "sermon-plan", "current_index": 0}
+        args = SimpleNamespace(
+            holyrics_url="http://127.0.0.1:8091",
+            _holyrics_sermon_plan_presentation=plan,
+            _holyrics_scripture_range_reading={
+                "started_at_monotonic": 100.0,
+                "current_index": 0,
+                "targets": [{"verse": 14}, {"verse": 15}],
+            },
+        )
+        with (
+            patch(
+                "tools.holyrics.get_holyrics_current_presentation",
+                return_value={"type": "text", "text_id": "sermon-plan", "slide_number": 3},
+            ),
+            patch("tools.holyrics.time.monotonic", return_value=102.0),
+        ):
+            result = sync_scripture_range_reading(args)
+
+        self.assertTrue(result["manual_restore"])
+        self.assertEqual("sermon_plan_restored_manually", result["reason"])
+        self.assertFalse(scripture_range_reading_active(args))
+
     def test_final_long_range_verse_restores_current_sermon_plan_slide(self):
         presentation = {
             "type": "text",
@@ -4053,6 +4122,40 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertEqual(
             "возьмого 3 стих",
             normalize_text("возьмого три стих"),
+        )
+
+    def test_fused_feminine_chapter_forms_restore_compound_chapter(self):
+        for text, expected in (
+            ("откровение двадцать первоего шестой стих", "Откровение 21:6"),
+            ("матфей второего первый стих", "Матфей 2:1"),
+            ("исаия пятого шестой стих", "Исаия 5:6"),
+            ("матфей двадцать третьего шестой стих", "Матфей 23:6"),
+        ):
+            with self.subTest(text=text):
+                result = LiveReferencePipeline().process_text(text)
+                self.assertEqual(expected, result.get("parsed", {}).get("ref"))
+
+        self.assertNotIn("глава", normalize_text("обычная пятого раза"))
+
+    def test_i_ona_before_chapter_is_john_but_ordinary_phrase_is_unchanged(self):
+        result = LiveReferencePipeline().process_text(
+            "и она пятнадцатая глава с четвертого по шестой стих"
+        )
+        self.assertEqual("Иоанн 15:4-6", result.get("parsed", {}).get("ref"))
+        self.assertNotIn("иоанн", normalize_text("и она пришла домой"))
+
+    def test_grala_distortion_restores_chapter_marker(self):
+        result = LiveReferencePipeline().process_text(
+            "и она пятнадцатая грала четвертой пятой стих"
+        )
+        self.assertEqual("Иоанн 15:4-5", result.get("parsed", {}).get("ref"))
+
+    def test_plyasyat_distortion_restores_ecclesiastes_range(self):
+        result = LiveReferencePipeline().process_text(
+            "плясят пятая глава девятой пятнадцатый стих"
+        )
+        self.assertEqual(
+            "Екклесиаст 5:9-15", result.get("parsed", {}).get("ref")
         )
 
     def test_thousand_noise_between_verse_bounds_becomes_range(self):

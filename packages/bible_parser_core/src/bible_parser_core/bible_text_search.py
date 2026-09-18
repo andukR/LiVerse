@@ -137,6 +137,10 @@ class BibleTextSearcher:
         self._lemma_cache[token] = lemma
         return lemma
 
+    def normalize_lemmas(self, text: str) -> list[str]:
+        """Normalize recognized or Bible text with the searcher's morphology."""
+        return [self._lemma(token) for token in normalize_bible_text(text)]
+
     def _candidate_ids(self, lemmas: list[str], limit: int) -> tuple[list[int], dict[str, int]]:
         unique = list(dict.fromkeys(lemmas))
         if not unique:

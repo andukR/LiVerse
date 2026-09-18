@@ -82,5 +82,10 @@ Sherpa официально поддерживает завершение вхо
 - `packages/bible_parser_core/tests/test_text_citation_detector.py` — тесты оценки
   темпа, расчёта интервала и принудительного сброса потока.
 
+В replay-событиях `SMART_SLIDE_SHADOW` диагностически записываются
+`boundary_count_estimate`, `candidate_indices` и `candidate_refs`. Это оценка
+того, сколько границ могли попасть в текстовое окно; она не участвует в выборе
+слайда и не является доказательством точного выравнивания речи.
+
 Воспроизводящий запуск теста: добавить `--sherpa-adaptive-segmentation` к
 обычной команде `tools/replay_audio_files.py` с `--asr-engine sherpa-0.54`.
