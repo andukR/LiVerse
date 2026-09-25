@@ -595,11 +595,12 @@ class ScriptureTextDetector:
                 ),
             )
         else:
+            accepted_candidates = [item for item in evaluated if item.accepted]
             ready_candidates = [
                 item for item in evaluated if item.reason == "candidate_ready"
             ]
             best = max(
-                ready_candidates or evaluated,
+                accepted_candidates or ready_candidates or evaluated,
                 key=lambda item: (
                     item.accepted,
                     item.score,

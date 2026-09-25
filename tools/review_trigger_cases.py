@@ -109,6 +109,23 @@ def all_cases_files(runs_dir: Path) -> list[Path]:
     )
 
 
+def live_cases_files_for_date(runs_dir: Path, date: str) -> list[Path]:
+    """Find imported live sessions from one calendar day, oldest first."""
+    return [
+        path
+        for path in all_cases_files(runs_dir)
+        if path.parent.name.startswith(f"{date}_") and is_live_run(path)
+    ]
+
+
+def replay_batch_cases_files(batch_root: Path) -> list[Path]:
+    """Return citation logs from every saved replay batch, oldest first."""
+    return sorted(
+        batch_root.glob("*/logs/*/trigger_cases.jsonl"),
+        key=lambda path: (path.parents[2].name, path.parent.name),
+    )
+
+
 def is_unreviewed(case: dict[str, Any]) -> bool:
     return str(case.get("status") or "unreviewed") == "unreviewed"
 
@@ -133,6 +150,18 @@ def latest_unreviewed_batch(cases_paths: list[Path]) -> list[Path]:
             break
         batch.append(cases_path)
     return list(reversed(batch))
+
+
+def recent_unreviewed_cases_files(cases_paths: list[Path], limit: int) -> list[Path]:
+    """Return at most ``limit`` newest files that still need annotation."""
+    if limit <= 0:
+        return []
+    eligible = [
+        cases_path
+        for cases_path in cases_paths
+        if has_unreviewed_cases(load_jsonl(cases_path))
+    ]
+    return eligible[-limit:]
 
 
 def state_path_for(cases_path: Path) -> Path:
@@ -656,6 +685,20 @@ def normal_slide_updates(events_path: Path) -> list[dict[str, Any]]:
         replay = output.get("replay") if isinstance(output.get("replay"), dict) else {}
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
         reference_list = payload.get("reference_list") if isinstance(payload.get("reference_list"), list) else []
+        if replay.get("sent") and payload.get("chapter_reference"):
+            reference = str(payload.get("ref") or "").strip()
+            if reference:
+                updates.append({
+                    "event_id": f"{events_path.parent.name}:display:{line_number}",
+                    "replay_seconds": replay_seconds,
+                    "ref": reference,
+                    "element": {"text": ""},
+                    "kind": "chapter_reference",
+                    "vosk_text": str(event.get("vosk_text") or ""),
+                    "source": str(payload.get("source") or ""),
+                })
+            accumulated_list_refs.clear()
+            continue
         if replay.get("sent") and reference_list:
             new_refs = [
                 str(item.get("ref") or "").strip()
@@ -1551,7 +1594,11 @@ def review(args: argparse.Namespace) -> None:
         args.cases = str(latest_live_cases_file(Path(args.runs_dir)))
         args.latest = True
     if not args.cases and not args.latest:
-        review_unreviewed_queue(args, all_unreviewed=args.all_unreviewed)
+        review_unreviewed_queue(
+            args,
+            all_unreviewed=args.all_unreviewed or bool(args.live_date),
+            recent_file_limit=args.recent_unreviewed_files,
+        )
         return
 
     cases_path = Path(args.cases) if args.cases else latest_cases_file(Path(args.runs_dir))
@@ -1672,19 +1719,43 @@ def review_latest_batch(args: argparse.Namespace) -> None:
     print(f"Готово. Размечено за этот запуск: {reviewed}. Осталось неразмеченных: {remaining}")
 
 
-def review_unreviewed_queue(args: argparse.Namespace, *, all_unreviewed: bool = False) -> None:
-    runs_dir = Path(args.runs_dir)
-    cases_paths = [path.resolve() for path in all_cases_files(runs_dir)]
+def review_unreviewed_queue(
+    args: argparse.Namespace,
+    *,
+    all_unreviewed: bool = False,
+    recent_file_limit: int = 0,
+) -> None:
+    replay_batches_root = str(getattr(args, "replay_batches_root", "") or "").strip()
+    live_date = str(getattr(args, "live_date", "") or "").strip()
+    if live_date:
+        queue_scope = Path(args.runs_dir)
+        cases_paths = [path.resolve() for path in live_cases_files_for_date(queue_scope, live_date)]
+    elif replay_batches_root:
+        cases_paths = [
+            path.resolve()
+            for path in replay_batch_cases_files(Path(replay_batches_root))
+        ]
+        queue_scope = Path(replay_batches_root)
+    else:
+        queue_scope = Path(args.runs_dir)
+        cases_paths = [path.resolve() for path in all_cases_files(queue_scope)]
     if args.from_run:
         cases_paths = [
             cases_path
             for cases_path in cases_paths
             if cases_path.parent.name >= args.from_run
         ]
-    queue_paths = cases_paths if all_unreviewed else latest_unreviewed_batch(cases_paths)
+    # The visible queue may deliberately contain only several recent files,
+    # but the operator needs to know the size of the whole annotation backlog.
+    # Count it before narrowing the current portion.
+    total_entries = collect_unreviewed_entries(cases_paths)
+    if recent_file_limit:
+        queue_paths = recent_unreviewed_cases_files(cases_paths, recent_file_limit)
+    else:
+        queue_paths = cases_paths if all_unreviewed else latest_unreviewed_batch(cases_paths)
     entries = collect_unreviewed_entries(queue_paths)
     if not entries:
-        print(f"Неразмеченных случаев в новом пакете не найдено: {runs_dir}")
+        print(f"Неразмеченных случаев в выбранной очереди не найдено: {queue_scope}")
         if not all_unreviewed:
             old_entries = collect_unreviewed_entries(cases_paths)
             if old_entries:
@@ -1696,14 +1767,24 @@ def review_unreviewed_queue(args: argparse.Namespace, *, all_unreviewed: bool = 
 
     position = 0
     reviewed = 0
-    if all_unreviewed:
+    if recent_file_limit:
+        print(f"Последних файлов с неразмеченными случаями: {len(queue_paths)}")
+    elif all_unreviewed:
         print(f"Файлов trigger_cases.jsonl: {len(cases_paths)}")
     else:
         print(f"Файлов в новом пакете: {len(queue_paths)}")
         skipped = len(cases_paths) - len(queue_paths)
         if skipped:
-            print(f"Старых файлов вне этого пакета: {skipped} (для просмотра добавьте --all-unreviewed).")
+                print(f"Старых файлов вне этого пакета: {skipped} (для просмотра добавьте --all-unreviewed).")
     print(f"Неразмеченных случаев: {len(entries)}")
+    if len(entries) != len(total_entries):
+        print(
+            "Всего неразмеченных в выбранных журналах: "
+            f"{len(total_entries)}. После разметки всей текущей порции останется: "
+            f"{len(total_entries) - len(entries)}."
+        )
+    else:
+        print("Это вся текущая очередь неразмеченных случаев.")
 
     while 0 <= position < len(entries):
         entry = entries[position]
@@ -1745,7 +1826,12 @@ def review_unreviewed_queue(args: argparse.Namespace, *, all_unreviewed: bool = 
         print("Неизвестная команда.")
 
     remaining = sum(1 for entry in entries if is_unreviewed(entry.case))
-    print(f"Готово. Размечено за этот запуск: {reviewed}. Осталось неразмеченных: {remaining}")
+    remaining_total = len(collect_unreviewed_entries(cases_paths))
+    print(
+        f"Готово. Размечено за этот запуск: {reviewed}. "
+        f"Осталось в текущей порции: {remaining}; "
+        f"в выбранных журналах: {remaining_total}."
+    )
 
 
 def main() -> int:
@@ -1776,7 +1862,23 @@ def main() -> int:
     parser.add_argument("--review-port", type=int, default=0, help="Port for local visual smart-slide review; 0 chooses a free port.")
     parser.add_argument("--no-open-browser", action="store_true", help="Do not open the visual review URL automatically.")
     parser.add_argument("--latest-live", action="store_true", help="Review only the newest live LiVerse run with unreviewed cases.")
+    parser.add_argument(
+        "--live-date",
+        default="",
+        help="Review every unreviewed live session from one day (YYYYMMDD), including imported Windows logs.",
+    )
     parser.add_argument("--all-unreviewed", action="store_true", help="Review all unreviewed cases from all runs.")
+    parser.add_argument(
+        "--replay-batches-root",
+        default="",
+        help="Read replay cases recursively from <batch>/logs/<run>/trigger_cases.jsonl.",
+    )
+    parser.add_argument(
+        "--recent-unreviewed-files",
+        type=int,
+        default=0,
+        help="Review cases from this many newest trigger_cases.jsonl files that still need annotation.",
+    )
     parser.add_argument(
         "--from-run",
         default="",
@@ -1787,6 +1889,16 @@ def main() -> int:
     args = parser.parse_args()
     if args.browser and not args.smart_slides:
         parser.error("--browser доступен только вместе с --smart-slides")
+    if args.live_date and (
+        not re.fullmatch(r"\d{8}", args.live_date)
+        or args.latest
+        or args.latest_live
+        or args.latest_batch
+        or args.cases
+        or args.replay_batches_root
+        or args.smart_slides
+    ):
+        parser.error("--live-date требует дату YYYYMMDD и не сочетается с выбором другого источника")
     review(args)
     return 0
 

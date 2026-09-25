@@ -554,6 +554,44 @@ class ScriptureTextDetectorTest(unittest.TestCase):
         self.assertEqual("Деян. 2:44", decision.reference)
         self.assertEqual(1, decision.confirmations)
 
+    def test_accepted_short_window_beats_unconfirmed_larger_window(self) -> None:
+        accepted = hit(
+            "Кол. 2:18", 95.0,
+            matched=("смиренномудрием", "служением", "ангелов", "вторгаясь", "никто"),
+            book_id=51,
+            chapter=2,
+            verse=18,
+            ordered=92.0,
+            bigram=80.0,
+            trigram=60.0,
+        )
+        ready = hit(
+            "Кол. 2:18", 82.0,
+            matched=("смиренномудрием", "служением", "ангелов", "вторгаясь"),
+            book_id=51,
+            chapter=2,
+            verse=18,
+            ordered=82.0,
+            bigram=50.0,
+            trigram=25.0,
+        )
+        lower = hit("Кол. 2:23", 40.0, matched=("ангел",), book_id=51, chapter=2, verse=23)
+        detector = ScriptureTextDetector(
+            FakeSearcher(
+                [[accepted, lower], [ready, lower], [ready, lower], [ready, lower]]
+            ),
+            self.config(window_sizes=(5, 10), immediate_score=90.0),
+        )
+
+        decision = detector.process_fragment(
+            "никто да не обольщает вас самовольным смиренномудрием и служением ангелов вторгаясь",
+            now=0.0,
+        )
+
+        self.assertTrue(decision.accepted)
+        self.assertEqual("Кол. 2:18", decision.reference)
+        self.assertEqual("immediate_strong_match", decision.reason)
+
     def test_strong_single_verse_match_can_use_exact_book_chapter_context(self) -> None:
         acts_verse = hit(
             "Деян. 2:44", 88.6,
@@ -2422,6 +2460,7 @@ class TextCitationIntegrationTest(unittest.TestCase):
         from tools.vosk_grammar_probe import accumulate_reading_list, add_slide_payload
 
         accumulated: list[dict] = []
+        state: dict = {}
         first = add_slide_payload({
             "text": "псалом девятый девятнадцатый стих",
             "reference_list": [{"ref": "Псалтирь 9:19"}, {"ref": "Псалтирь 38:8"}],
@@ -2431,9 +2470,9 @@ class TextCitationIntegrationTest(unittest.TestCase):
             "reference_list": [{"ref": "Псалтирь 39:5"}, {"ref": "Псалтирь 61:5"}],
         })
 
-        accumulate_reading_list(first, accumulated)
-        accumulate_reading_list(second, accumulated)
-        accumulate_reading_list({"reference_list": []}, accumulated)
+        accumulate_reading_list(first, accumulated, now=10.0, state=state)
+        accumulate_reading_list(second, accumulated, now=11.0, state=state)
+        accumulate_reading_list({"reference_list": []}, accumulated, now=12.0, state=state)
 
         self.assertEqual(
             ["Псалтирь 9:19", "Псалтирь 38:8", "Псалтирь 39:5", "Псалтирь 61:5"],
@@ -2441,6 +2480,67 @@ class TextCitationIntegrationTest(unittest.TestCase):
         )
         self.assertEqual("Псалтирь 9:19\nПсалтирь 38:8\nПсалтирь 39:5\nПсалтирь 61:5", second["slide"]["verse"])
         self.assertEqual([], accumulated)
+
+    def test_reading_list_accepts_next_explicit_reference_for_two_seconds(self) -> None:
+        from tools.vosk_grammar_probe import accumulate_reading_list, add_slide_payload
+
+        accumulated: list[dict] = []
+        state: dict = {}
+        first = add_slide_payload({
+            "text": "притчи первая глава десятый стих и вторая глава тринадцатый стих",
+            "reference_list": [
+                {"ref": "Притчи 1:10"},
+                {"ref": "Притчи 2:13"},
+            ],
+        })
+        accumulate_reading_list(first, accumulated, now=10.0, state=state)
+
+        third = add_slide_payload({
+            "text": "пятая глава восьмой стих",
+            "vosk_text": "пятая глава восьмой стих",
+            "source": "parser",
+            "parsed": {"ref": "Притчи 1:10"},
+        })
+        accumulate_reading_list(third, accumulated, now=11.9, state=state)
+
+        self.assertEqual(
+            ["Притчи 1:10", "Притчи 2:13", "Притчи 5:8"],
+            [item["ref"] for item in third["reference_list"]],
+        )
+        self.assertEqual("reference_list", third["slide"]["slide_type"])
+        self.assertTrue(third["reference_list_updated"])
+
+    def test_reading_list_closes_after_two_second_pause(self) -> None:
+        from tools.vosk_grammar_probe import accumulate_reading_list, add_slide_payload
+
+        accumulated: list[dict] = []
+        state: dict = {}
+        first = add_slide_payload({
+            "text": "притчи первая глава десятый стих и вторая глава тринадцатый стих",
+            "reference_list": [
+                {"ref": "Притчи 1:10"},
+                {"ref": "Притчи 2:13"},
+            ],
+        })
+        accumulate_reading_list(first, accumulated, now=10.0, state=state)
+
+        later = add_slide_payload({
+            "text": "притчи пятая глава восьмой стих",
+            "vosk_text": "притчи пятая глава восьмой стих",
+            "source": "parser",
+            "parsed": {
+                "ref": "Притчи 5:8",
+                "book": "Притчи",
+                "chapter": 5,
+                "start_verse": 8,
+                "end_verse": 8,
+            },
+        })
+        accumulate_reading_list(later, accumulated, now=12.01, state=state)
+
+        self.assertEqual([], accumulated)
+        self.assertFalse(later.get("reference_list_collection_active"))
+        self.assertNotEqual("reference_list", (later.get("slide") or {}).get("slide_type"))
 
     def test_sherpa_subwords_are_converted_to_timed_vosk_words(self) -> None:
         from bible_parser_core.sherpa_streaming import DEFAULT_SHERPA_THREADS
@@ -3231,6 +3331,32 @@ class TextCitationIntegrationTest(unittest.TestCase):
         self.assertIn("но каждый искушается", payload["slide"]["verse"])
         self.assertIn("похоть же, зачав", payload["slide"]["verse"])
 
+    def test_text_match_expands_a_range_after_reading_prompt(self) -> None:
+        from tools.vosk_grammar_probe import text_citation_payload
+
+        candidate = hit(
+            "Кол. 2:18", 95.0,
+            matched=("никто", "обольщать", "смиренномудрие", "ангел"),
+            book_id=51, chapter=2, verse=18,
+        )
+        decision = SimpleNamespace(
+            top_candidate=candidate,
+            window_text="никто да не обольщает вас самовольным смиренномудрием",
+            score=95.0,
+            margin=30.0,
+            matched_words=4,
+            confirmations=1,
+            reason="immediate_strong_match",
+        )
+
+        payload = text_citation_payload(
+            decision,
+            "давайте посмотрим восемнадцатый девятнадцатый стих никто да не обольщает вас",
+        )
+
+        self.assertEqual("Колоссянам 2:18-19", payload["parsed"]["ref"])
+        self.assertTrue(payload["text_citation"]["announced_range_expanded"])
+
     def test_hybrid_modes_reuse_existing_approval_policy(self) -> None:
         from tools.vosk_grammar_probe import text_citation_output_args
 
@@ -3247,6 +3373,75 @@ class TextCitationIntegrationTest(unittest.TestCase):
 
 
 class SmartSlideReviewTest(unittest.TestCase):
+    def test_recent_unreviewed_cases_files_skips_completed_files(self) -> None:
+        from tools.review_trigger_cases import (
+            recent_unreviewed_cases_files,
+            replay_batch_cases_files,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = []
+            for index, status in enumerate(
+                ("reviewed", "unreviewed", "reviewed", "unreviewed", "unreviewed", "unreviewed"),
+                start=1,
+            ):
+                run = root / f"20260920_10000{index}"
+                run.mkdir()
+                path = run / "trigger_cases.jsonl"
+                path.write_text(
+                    json.dumps({"case_id": f"case_{index}", "status": status}) + "\n",
+                    encoding="utf-8",
+                )
+                paths.append(path)
+
+            replay_root = root / "replay"
+            for index in (1, 2):
+                replay_path = (
+                    replay_root
+                    / f"20260920_11000{index}"
+                    / "logs"
+                    / f"20260920_12000{index}"
+                    / "trigger_cases.jsonl"
+                )
+                replay_path.parent.mkdir(parents=True)
+                replay_path.write_text("{}\n", encoding="utf-8")
+
+            recent = recent_unreviewed_cases_files(paths, 3)
+            replay_paths = replay_batch_cases_files(replay_root)
+
+        self.assertEqual(
+            ["20260920_100004", "20260920_100005", "20260920_100006"],
+            [path.parent.name for path in recent],
+        )
+        self.assertEqual(
+            ["20260920_120001", "20260920_120002"],
+            [path.parent.name for path in replay_paths],
+        )
+
+    def test_live_date_finds_all_imported_sessions_without_replay(self) -> None:
+        from tools.review_trigger_cases import live_cases_files_for_date
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, session in (
+                ("20260923_100000_000001", {"asr_engine": "sherpa-0.54"}),
+                ("20260923_120000_000002", {"asr_engine": "sherpa-0.54"}),
+                ("20260923_130000_000003", {"mode": "audio_replay"}),
+                ("20260924_090000_000004", {"asr_engine": "sherpa-0.54"}),
+            ):
+                run = root / name
+                run.mkdir()
+                (run / "trigger_cases.jsonl").write_text('{"status":"unreviewed"}\n', encoding="utf-8")
+                (run / "session.json").write_text(json.dumps(session), encoding="utf-8")
+
+            paths = live_cases_files_for_date(root, "20260923")
+
+        self.assertEqual(
+            ["20260923_100000_000001", "20260923_120000_000002"],
+            [path.parent.name for path in paths],
+        )
+
     def test_shadow_reviews_are_grouped_and_saved_separately(self) -> None:
         from tools.review_trigger_cases import (
             collect_smart_slide_entries,

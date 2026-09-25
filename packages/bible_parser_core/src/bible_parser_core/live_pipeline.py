@@ -631,8 +631,38 @@ def psalm_segment_has_number_before_range(segment: str, book_end: int) -> bool:
     )
 
 
+UNNUMBERED_EPISTLE_BOOKS = {
+    "Римлянам",
+    "Галатам",
+    "Ефесянам",
+    "Филиппийцам",
+    "Колоссянам",
+    "Евреям",
+    "Иаков",
+    "Филимону",
+    "Иуда",
+}
+
+
+def has_numbered_unnumbered_epistle_attempt(text: str) -> bool:
+    """Detect «первое послание Колоссян», which is not a Bible book."""
+    normalized = normalize_text(text)
+    if not re.search(r"\b(?:1|перв\w*)\s+послани\w*\b", normalized):
+        return False
+    return any(
+        candidate.book in UNNUMBERED_EPISTLE_BOOKS
+        and candidate.score >= 0.8
+        for candidate in book_candidates(normalized)
+    )
+
+
 def compact_reference_list(text: str, bible_path: Path = DEFAULT_BIBLE) -> list[dict[str, str]]:
     normalized = normalize_text(text)
+    # A failed first attempt such as «первое послание Колоссян» must not turn
+    # the retry into a two-item reference list.  The complete later address is
+    # parsed normally by resolve_reference_payload.
+    if has_numbered_unnumbered_epistle_attempt(text):
+        return []
     items: list[dict[str, str]] = []
     seen: set[str] = set()
 
@@ -657,6 +687,7 @@ def compact_reference_list(text: str, bible_path: Path = DEFAULT_BIBLE) -> list[
             return items
 
     all_books = book_candidates(normalized)
+    list_book_min_score = 0.85
     exact_books = sorted(
         (
             candidate
@@ -664,7 +695,12 @@ def compact_reference_list(text: str, bible_path: Path = DEFAULT_BIBLE) -> list[
             # A repeated, nearly exact book name can be an ASR inflection:
             # «послание евреем ... и евреям ...».  It is still reliable when
             # both separately introduced references contain their own numbers.
-            if candidate.score >= 0.9
+            # A list contains several independent book-number pairs, which
+            # provide stronger structure than an isolated fuzzy book match.
+            # Accept modestly fuzzy names here; risk scoring below will force
+            # operator confirmation whenever a list item is not an exact
+            # dictionary/alias match.
+            if candidate.score >= list_book_min_score
             and not any(
                 other is not candidate
                 and other.score >= 0.999
@@ -683,7 +719,17 @@ def compact_reference_list(text: str, bible_path: Path = DEFAULT_BIBLE) -> list[
     seen = set()
     for index, candidate in enumerate(exact_books):
         end = exact_books[index + 1].start if index + 1 < len(exact_books) else len(normalized)
-        segment = normalized[candidate.start:end].strip()
+        segment_start = candidate.start
+        # A compact Psalm address may put the Psalm number before the book
+        # word: «33 псалом 4 стих».  Keep that number in the segment; without
+        # it the isolated fragment becomes «псалом 4 стих» and is misread as
+        # Psalm 4 instead of Psalm 33:4.
+        if candidate.book == "Псалтирь":
+            prefix = normalized[:candidate.start]
+            number_before_book = re.search(r"\b\d{1,3}\s+$", prefix)
+            if number_before_book:
+                segment_start = number_before_book.start()
+        segment = normalized[segment_start:end].strip()
         number_count = len(re.findall(r"\b\d+\b", segment))
         if number_count < 2 and not (candidate.book == "Псалтирь" and re.search(r"\bпсал\w*\b", segment)):
             continue
@@ -805,7 +851,8 @@ def same_chapter_reading_plan(text: str, bible_path: Path = DEFAULT_BIBLE) -> li
     normalized = normalize_text(text)
     pattern = re.compile(
         r"\s+(?P<chapter>\d{1,3})\s+глава\s+"
-        r"(?P<single>\d{1,3})\s+(?P<range_start>\d{1,3})\s+и\s+"
+        r"(?P<single>\d{1,3})(?:\s+стих)?\s+"
+        r"(?P<range_start>\d{1,3})(?:\s+стих)?\s+и\s+"
         r"(?P<range_end>\d{1,3})\s+стих\b"
     )
     matches: list[tuple[int, str, re.Match[str]]] = []
@@ -852,7 +899,13 @@ def mentioned_chapter_reference_list(text: str, bible_path: Path = DEFAULT_BIBLE
     narrower kind of reference as a list item instead.
     """
     normalized = normalize_text(text)
-    if not re.search(r"\b(?:можем|можно|могут)\s+прочитать\b", normalized):
+    explicit_reading_intro = bool(
+        re.search(r"\b(?:можем|можно|могут)\s+прочитать\b", normalized)
+    )
+    numbered_epistle_chapter_intro = bool(
+        re.search(r"\bв\s+(?:первом|втором|третьем)\s+послании\b", text.lower())
+    )
+    if not explicit_reading_intro and not numbered_epistle_chapter_intro:
         return []
     if re.search(r"\bстих\w*\b", normalized):
         return []
@@ -861,9 +914,20 @@ def mentioned_chapter_reference_list(text: str, bible_path: Path = DEFAULT_BIBLE
         if candidate.score < 0.999:
             continue
         suffix = normalized[candidate.end :]
-        match = re.search(r"\b(\d+)\s+глава\b", suffix)
+        match = re.search(r"\b(?:в\s+)?(\d+)\s+глава\b", suffix)
         if not match:
             continue
+        # If additional numbers follow the chapter, they are likely the
+        # verses of a compact address whose «стих» marker was lost by ASR.
+        # Let the normal parser recover that address instead of reducing it
+        # to a chapter-only list item.
+        if re.search(r"\b\d+\b", suffix[match.end() :]):
+            continue
+        # A complete numbered epistle title followed by an explicit chapter
+        # is already an address, even when Sherpa omitted the later word
+        # «стих»: «в первом послании ... в одиннадцатой главе».  Keep this
+        # chapter reference from being rebuilt as a false verse reference
+        # from an unrelated fuzzy book.
         chapter = int(match.group(1))
         if chapter not in bible_map(bible_path).get(candidate.book, {}):
             continue
@@ -871,15 +935,61 @@ def mentioned_chapter_reference_list(text: str, bible_path: Path = DEFAULT_BIBLE
     return []
 
 
+def _independent_reference_list(
+    references: list[dict[str, str]],
+    bible_path: Path = DEFAULT_BIBLE,
+) -> bool:
+    """Whether listed references are separate, non-overlapping passages."""
+    if len(references) < 2:
+        return False
+    parsed: list[ParsedReference] = []
+    for item in references:
+        # List builders store the canonical reference in ``ref`` while
+        # ``source_text`` may intentionally contain the whole spoken sentence
+        # (and therefore parse as a single wider range).  Compare the
+        # canonical item itself, not that shared sentence.
+        value = parse_live_reference(str(item.get("ref") or ""), bible_path=bible_path)
+        if value is None:
+            return False
+        parsed.append(value)
+
+    def bounds(value: ParsedReference) -> tuple[tuple[int, int], tuple[int, int]]:
+        end_chapter = value.end_chapter or value.chapter
+        return (value.chapter, value.start_verse), (end_chapter, value.end_verse)
+
+    for index, current in enumerate(parsed):
+        current_start, current_end = bounds(current)
+        for previous in parsed[:index]:
+            previous_start, previous_end = bounds(previous)
+            if current.book != previous.book:
+                continue
+            if max(current_start, previous_start) <= min(current_end, previous_end):
+                return False
+    return True
+
+
 def resolve_reference_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, show_candidates: bool = False) -> dict:
     mentioned_chapter_list = mentioned_chapter_reference_list(text, bible_path=bible_path)
     if mentioned_chapter_list:
+        item = mentioned_chapter_list[0]
+        ref = str(item.get("ref") or "")
+        book, chapter_text = ref.rsplit(" ", 1)
         return {
             "text": text,
             "source": "parser_mentioned_chapter_reference",
             "resolved": None,
-            "parsed": None,
-            "reference_list": mentioned_chapter_list,
+            "parsed": {
+                "book": book,
+                "chapter": int(chapter_text),
+                "start_verse": None,
+                "end_verse": None,
+                "end_chapter": None,
+                "ref": ref,
+                "verse_text": "",
+                "source_text": text,
+            },
+            "chapter_reference": True,
+            "reference_list": [],
             "invalid_reference": None,
             "message": None,
             "matched": True,
@@ -901,7 +1011,7 @@ def resolve_reference_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, sh
         }
 
     same_book_list = same_book_chapter_reference_list(text, bible_path=bible_path)
-    if same_book_list:
+    if _independent_reference_list(same_book_list, bible_path=bible_path):
         return {
             "text": text,
             "source": "parser_same_book_chapter_reference_list",
@@ -915,7 +1025,7 @@ def resolve_reference_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, sh
         }
 
     reading_plan = same_chapter_reading_plan(text, bible_path=bible_path)
-    if reading_plan:
+    if reading_plan and _independent_reference_list(reading_plan, bible_path=bible_path):
         return {
             "text": text,
             "source": "parser_reference_list",
@@ -928,9 +1038,27 @@ def resolve_reference_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, sh
             "bible_path": str(bible_path),
         }
 
-    incomplete_reference = incomplete_reference_without_chapter(text)
+    incomplete_reference = (
+        incomplete_reference_after_explicit_chapter(text)
+        or incomplete_reference_without_chapter(text)
+    )
     reference_list = compact_reference_list(text, bible_path=bible_path)
-    if reference_list:
+    repeated_same_start = False
+    if len(reference_list) == 2:
+        first_item, second_item = reference_list
+        first_ref = parse_live_reference(str(first_item.get("ref") or ""), bible_path=bible_path)
+        second_ref = parse_live_reference(str(second_item.get("ref") or ""), bible_path=bible_path)
+        repeated_same_start = bool(
+            first_ref
+            and second_ref
+            and first_ref.book == second_ref.book
+            and first_ref.chapter == second_ref.chapter
+            and first_ref.start_verse == second_ref.start_verse
+        )
+    if reference_list and (
+        _independent_reference_list(reference_list, bible_path=bible_path)
+        or repeated_same_start
+    ):
         # A speaker can state a range, immediately correct its final verse,
         # and repeat the address.  It is not a reading list when there are
         # exactly two ranges with the same book, chapter, and first verse.
@@ -997,6 +1125,24 @@ def resolve_reference_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, sh
         }
 
     parsed = None if incomplete_reference else parse_live_reference(text, bible_path=bible_path)
+    pending_incomplete_reference = incomplete_reference
+    # A single ASR buffer may contain a complete citation followed by the
+    # beginning of another one («... Марк 16:15 ... Иоанн 15 ...»).  Do not
+    # discard the complete citation merely because the trailing address is
+    # still waiting for its verse.  Parse the text before the pending book and
+    # keep the incomplete address alongside it for the next buffer update.
+    if parsed is None and incomplete_reference and incomplete_reference.get("chapter") is not None:
+        normalized = normalize_text(text)
+        for candidate in book_candidates(normalized):
+            if candidate.book != incomplete_reference.get("book"):
+                continue
+            prefix = normalized[: candidate.start].strip()
+            if not prefix:
+                continue
+            prefix_parsed = parse_live_reference(prefix, bible_path=bible_path)
+            if prefix_parsed is not None:
+                parsed = prefix_parsed
+                break
     source = "parser"
     suffix_parsed = command_suffix_reference(text, bible_path=bible_path) if parsed else None
     if suffix_parsed and suffix_parsed.ref != parsed.ref:
@@ -1097,6 +1243,51 @@ def resolve_reference_payload(text: str, bible_path: Path = DEFAULT_BIBLE, *, sh
     return payload
 
 
+def incomplete_reference_after_explicit_chapter(text: str) -> dict | None:
+    """Keep an explicit book-and-chapter address open for its verse bounds.
+
+    Numbers spoken before the book can belong to ordinary sermon speech, such
+    as «два вида мудрости: первая ... вторая ...».  When the actual address
+    ends with «Послание Иакова, третья глава», those earlier numbers must not
+    become verses 2–3.  The next ASR fragment may still supply the range.
+    """
+    normalized = normalize_text(text)
+    for candidate in book_candidates(normalized):
+        if candidate.score < 0.999:
+            continue
+        prefix = normalized[: candidate.start]
+        # This guard is only for the replay pattern where ordinary sermon
+        # counting («два вида ... первая ... вторая ...») precedes a bare
+        # book-and-chapter mention.  A single title number («первое послание
+        # Коринфянам») must still reach the normal blocking diagnostics.
+        if (
+            len(re.findall(r"\b(?:\d+|один|одна|одно|два|две|три|четыре|пять|шесть|семь|восемь|девять|десять|перв\w*|втор\w*|трет\w*|четверт\w*|пят\w*|шест\w*|седьм\w*|восьм\w*|девят\w*)\b", prefix)) < 2
+            and not (candidate.book == "Иоанн" and "евангелие" in prefix)
+        ):
+            continue
+        # Reversed addresses such as «восьмой стих Деяния ... первой главы»
+        # already contain an explicit verse before the book.  They must go
+        # through the normal parser instead of being mistaken for a bare
+        # chapter mention.
+        if re.search(r"\bстих\w*\b", normalized[: candidate.start]):
+            continue
+        suffix = normalized[candidate.end :]
+        chapter_match = re.match(r"\s+(?P<chapter>\d{1,3})\s+глав\w*\b", suffix)
+        if chapter_match is None:
+            continue
+        # A number after the chapter is already a verse candidate, even when
+        # Sherpa swallowed «стих» or distorted it (for example «... 9 стиль»).
+        # Only a bare book-plus-chapter mention should remain incomplete.
+        if re.search(r"\b\d{1,3}\b", suffix[chapter_match.end() :]):
+            continue
+        return {
+            "book": candidate.book,
+            "chapter": int(chapter_match.group("chapter")),
+            "source_text": text,
+        }
+    return None
+
+
 def incomplete_reference_without_chapter(text: str) -> dict | None:
     """Keep a reliable book and verse when the spoken chapter disappeared."""
     normalized = normalize_text(text)
@@ -1109,6 +1300,12 @@ def incomplete_reference_without_chapter(text: str) -> dict | None:
     if book_candidate.book in ONE_CHAPTER_BOOKS:
         return None
     prefix = normalized[: book_candidate.start].strip()
+    # A Psalm number can be spoken before the word «псалом»: «сто
+    # восемнадцатый псалом, сто пятый стих».  Here the prefix already
+    # supplies the chapter, so the following verse is not an incomplete
+    # address missing a chapter.
+    if book_candidate.book == "Псалтирь" and re.search(r"\b\d{1,3}\s*$", prefix):
+        return None
     # «с первого по пятый стих Послание к Римлянам» names a book and a
     # verse range, but has not named a chapter yet.  Do not reinterpret the
     # first verse as a chapter and show a false single verse such as Rom. 1:5.
@@ -1461,6 +1658,59 @@ def should_block_matched_payload(payload: dict) -> str | None:
     ref = str(parsed.get("ref") or "")
     source = str(payload.get("source") or "")
 
+    # «один стих [из] послания Иакова» can introduce a paraphrase, not a
+    # request to show a verse.  Without a chapter or verse number it must not
+    # become the fabricated address Иаков 1:1.
+    if (
+        re.search(r"\bодин\s+стих\w*\b", raw_text)
+        and re.search(r"\b(?:из\s+)?послани\w*\b", raw_text)
+        and not re.search(r"\bглав\w*\b", raw_text)
+        and not re.search(r"\b\d{1,3}\s*:\s*\d{1,3}\b", raw_text)
+    ):
+        return "ordinary_verse_mention"
+
+    # «числанник видится вот» is a one-off severe distortion of
+    # «Фессалоникийцам» in «первое послание ...».  Do not let fuzzy matching
+    # turn it into the unrelated first John epistle; the following verse text
+    # can still provide the reliable citation.
+    if (
+        parsed.get("book") == "1 Иоанна"
+        and re.search(r"\bчисланник\s+видится\s+вот\b", raw_text)
+        and re.search(r"\bперв\w*\s+послани\w*\b", raw_text)
+    ):
+        return "unreliable_fuzzy_book_fragment"
+
+    # The same «апостол я ... первое послание» repair is safe only while the
+    # address is the complete utterance.  If ordinary reading text follows
+    # («верующий Сына Божия...»), it is a sermon quotation, not a fresh
+    # address; do not open a false 1 John slide from it.
+    if (
+        parsed.get("book") == "1 Иоанна"
+        and re.search(r"\bапостол\s+я\b", raw_text)
+        and re.search(r"\bверующ\w*\b", raw_text)
+    ):
+        return "ordinary_verse_mention"
+
+    # «шестая седьмая книги Судей» is a chapter mention with the word
+    # «глава» omitted, not the compact address Судьи 6:7.  The feminine
+    # ordinal endings are the important signal; without «стих» there is no
+    # safe verse reference to show or ask the operator to confirm.
+    feminine_ordinals = (
+        r"первая|вторая|третья|четвертая|четвертая|пятая|шестая|"
+        r"седьмая|восьмая|девятая|десятая|одиннадцатая|двенадцатая|"
+        r"тринадцатая|четырнадцатая|пятнадцатая|шестнадцатая|"
+        r"семнадцатая|восемнадцатая|девятнадцатая|двадцатая"
+    )
+    if (
+        not re.search(r"\bстих\w*\b", raw_text)
+        and re.search(
+            rf"\b(?:{feminine_ordinals})\s+(?:{feminine_ordinals})\b",
+            raw_text,
+        )
+        and any(candidate.score >= 0.999 for candidate in book_candidates(normalized))
+    ):
+        return "ambiguous_feminine_chapter_pair"
+
     # Do not borrow «один» from an ordinary grammatical construction merely
     # because a Bible book was mentioned nearby.  We look at the original
     # word forms: «одна мысль», «с одной стороны», «один хороший стих» and
@@ -1544,8 +1794,16 @@ def should_block_matched_payload(payload: dict) -> str | None:
         "луки": "Лука",
         "иоанна": "Иоанн",
     }
+    parsed_source_normalized = normalize_text(str(parsed.get("source_text") or ""))
     for marker, book in gospel_conflicts.items():
-        if re.search(rf"\bевангелие\s+от\s+{marker}\b", normalized) and not ref.startswith(book):
+        if (
+            re.search(rf"\bевангелие\s+от\s+{marker}\b", normalized)
+            and not ref.startswith(book)
+            and not (
+                payload.get("incomplete_reference")
+                and not re.search(rf"\bевангелие\s+от\s+{marker}\b", parsed_source_normalized)
+            )
+        ):
             return "gospel_book_conflict"
 
     if (
@@ -1868,6 +2126,20 @@ def score_reference_risk(payload: dict, asr_result: dict | None = None) -> dict:
         score += 0.25
         reasons.append("fuzzy_book_match")
         metrics["book_match_confidence"] = round(book_match_confidence, 3)
+    elif payload.get("source") == "parser_reference_list":
+        list_confidences: list[float] = []
+        for item in payload.get("reference_list") or []:
+            if not isinstance(item, dict):
+                continue
+            item_parsed = parse_live_reference(
+                str(item.get("source_text") or "") or str(item.get("ref") or "")
+            )
+            if item_parsed is not None:
+                list_confidences.append(float(item_parsed.confidence))
+        if list_confidences and min(list_confidences) < 0.999:
+            score += 0.25
+            reasons.append("fuzzy_book_match")
+            metrics["book_match_confidence"] = round(min(list_confidences), 3)
     if (
         parsed
         and parsed.get("start_verse") == parsed.get("end_verse")
@@ -2289,6 +2561,19 @@ def contextual_short_reference(
     explicit_chapter = re.search(r"\b(?P<chapter>\d{1,3})\s+глав\w*\b", normalized)
     if explicit_chapter:
         chapter = int(explicit_chapter.group("chapter"))
+    # In an active context a preacher may omit «с ... по ... стих» and say
+    # only «четвёртая глава, одиннадцать–тринадцать».  Treat the two adjacent
+    # numbers after the chapter as the spoken subrange; the context bounds
+    # below prevent ordinary speech from becoming a Bible reference.
+    compact_context_range = re.search(
+        r"\b(?P<chapter>\d{1,3})\s+глав\w*\s+"
+        r"(?P<start>\d{1,3})\s+(?P<end>\d{1,3})\b",
+        normalized,
+    )
+    if compact_context_range and not spoken_ranges:
+        chapter = int(compact_context_range.group("chapter"))
+        start_verse = int(compact_context_range.group("start"))
+        end_verse = int(compact_context_range.group("end"))
     for pattern in (
         r"\b(?P<verse>\d{1,3})\s+стих\w*\s+(?P<chapter>\d{1,3})\s+глав\w*\b",
         r"\b(?P<chapter>\d{1,3})\s+глав\w*\s+(?P<verse>\d{1,3})(?:\s+стих\w*)?\b",
@@ -2706,6 +2991,7 @@ class LiveReferencePipeline:
             bible_path=self.bible_path,
             asr_result=asr_result,
         )
+        spoken_book_chapter_context = explicit_book_chapter_context(spoken_candidate_texts)
         detected_book_chapter_context = explicit_book_chapter_context(candidate_texts)
         if detected_book_chapter_context:
             self.book_chapter_context = detected_book_chapter_context
@@ -2722,9 +3008,56 @@ class LiveReferencePipeline:
             bible_path=self.bible_path,
             preferred_chapter=self.context_current_chapter,
         )
+        explicit_buffered_address = False
+        if context_payload and spoken_book_chapter_context:
+            # The newest fragment may be only a verse number, so contextual
+            # parsing can produce a plausible nearby continuation before the
+            # buffered explicit address gets a chance to win. Re-parse the
+            # complete candidate carrying an exact book+chapter and retain it
+            # when that exact address is valid, even within the same chapter.
+            explicit_candidate_text = str(
+                spoken_book_chapter_context.get("source_text") or ""
+            )
+            explicit_candidate_payload = resolve_reference_payload(
+                explicit_candidate_text,
+                bible_path=self.bible_path,
+                show_candidates=show_candidates,
+            )
+            explicit_candidate_reference = explicit_candidate_payload.get("parsed") or {}
+            explicit_candidate_is_valid = bool(
+                explicit_candidate_payload.get("matched")
+                and explicit_candidate_reference
+                and book_family(str(explicit_candidate_reference.get("book") or ""))
+                == book_family(str(spoken_book_chapter_context.get("book") or ""))
+                and int(explicit_candidate_reference.get("chapter") or 0)
+                == int(spoken_book_chapter_context.get("chapter") or 0)
+            )
+            explicit_candidate_changes_context = bool(
+                self.context_range
+                and (
+                    book_family(str(explicit_candidate_reference.get("book") or ""))
+                    != book_family(str(self.context_range.get("book") or ""))
+                    or int(explicit_candidate_reference.get("chapter") or 0)
+                    != int(self.context_range.get("chapter") or 0)
+                    or int(explicit_candidate_reference.get("end_verse") or 0)
+                    > int(explicit_candidate_reference.get("start_verse") or 0)
+                    or int(explicit_candidate_reference.get("end_chapter") or 0)
+                    > int(explicit_candidate_reference.get("chapter") or 0)
+                )
+            )
+            explicit_buffered_address = (
+                explicit_candidate_is_valid and explicit_candidate_changes_context
+            )
+            if explicit_buffered_address:
+                payload = explicit_candidate_payload
         explicit_buffered_reference = bool(
             payload.get("matched")
             and context_payload
+            and spoken_book_chapter_context
+            and book_family(str((payload.get("parsed") or {}).get("book") or ""))
+            == book_family(str(spoken_book_chapter_context.get("book") or ""))
+            and int((payload.get("parsed") or {}).get("chapter") or 0)
+            == int(spoken_book_chapter_context.get("chapter") or 0)
             and not (
                 re.search(
                     r"\bпервые\s+(?:\d{1,3}|[а-я]+)\s+стих\w*\b",
@@ -2748,11 +3081,17 @@ class LiveReferencePipeline:
             context_payload
             and str(context_payload.get("source") or "").startswith("context_nearby_same_chapter")
         )
+        parsed_reference = payload.get("parsed") or {}
         # A nearby follow-up has no spoken book of its own.  If the parser
         # nevertheless manufactured a different book from noisy words, retain
-        # the established same-chapter context.  A real other-book marker was
-        # already rejected by contextual_short_reference above.
-        if context_payload and (not explicit_buffered_reference or nearby_context_follow_up):
+        # the established same-chapter context.  A complete buffered address
+        # with an explicitly spoken book/chapter must win over a nearby verse
+        # manufactured from the previous range, even when it names that same
+        # book and chapter: its verse numbers may define a new range.
+        keep_explicit_buffered_reference = explicit_buffered_address or (
+            explicit_buffered_reference and not nearby_context_follow_up
+        )
+        if context_payload and not keep_explicit_buffered_reference:
             payload = context_payload
         payload["vosk_text"] = text
         payload["vosk_buffer"] = list(self.text_buffer.parts)

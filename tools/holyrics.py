@@ -1904,10 +1904,20 @@ def apply_scripture_range_operator_hint(
 def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, str]:
     clear_scripture_range_reading(args)
     setattr(args, "_holyrics_sermon_plan_custom_theme", None)
-    if str(payload.get("slide_type") or "").strip() == "reference_list":
+    if str(payload.get("slide_type") or "").strip() in {"reference_list", "chapter_reference"}:
         text = slide_payload_to_holyrics_text(payload)
         if not text:
             return False, "holyrics_reference_list_empty"
+        sermon_plan_presentation = ensure_holyrics_sermon_plan_presentation(args, base_url)
+        restore_presentation = None
+        if isinstance(sermon_plan_presentation, dict):
+            restore_presentation = refresh_sermon_plan_restore_snapshot(
+                args,
+                base_url,
+                sermon_plan_presentation,
+            )
+            prepare_sermon_plan_custom_theme(args, base_url)
+        cancel_holyrics_restore_timer(args)
         show_ok, show_reason, show_body = post_holyrics_api(
             args,
             base_url,
@@ -1918,7 +1928,16 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
         if not show_ok:
             return False, show_reason
         clear_scripture_range_reading(args)
-        return True, "show_quick_presentation:reference_list"
+        quick_minutes = holyrics_quick_minutes(args)
+        if quick_minutes > 0 and isinstance(restore_presentation, dict):
+            restore_holyrics_presentation_later(
+                args,
+                base_url,
+                restore_presentation,
+                quick_minutes,
+            )
+        suffix = f";temporary_list:{quick_minutes:g}min" if quick_minutes > 0 else ""
+        return True, f"show_quick_presentation:{payload.get('slide_type')}{suffix}"
 
     selected_scripture_range = scripture_range(payload)
     if selected_scripture_range:

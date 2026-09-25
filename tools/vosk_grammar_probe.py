@@ -431,6 +431,40 @@ class JsonlLogger:
         with path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(row, ensure_ascii=False) + "\n")
 
+    def update_trigger_case(self, approval_id: str, updates: dict) -> None:
+        """Persist a delayed operator decision into its original trigger case."""
+        if not self.enabled or self.run_dir is None or not approval_id:
+            return
+        path = self.run_dir / "trigger_cases.jsonl"
+        with self._write_lock:
+            if not path.exists():
+                return
+            try:
+                rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            except (OSError, json.JSONDecodeError):
+                return
+            changed = False
+            for row in rows:
+                if (
+                    str(row.get("approval_id") or "") == approval_id
+                    or approval_id in (row.get("approval_ids") or [])
+                ):
+                    if len(row.get("approval_ids") or []) > 1:
+                        decisions = row.setdefault("approval_decisions", {})
+                        decisions[approval_id] = updates
+                        if len(decisions) == len(row["approval_ids"]):
+                            row["approval_queue_resolved"] = True
+                    else:
+                        row.update(updates)
+                    changed = True
+            if changed:
+                temporary = path.with_suffix(".jsonl.tmp")
+                temporary.write_text(
+                    "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+                    encoding="utf-8",
+                )
+                os.replace(temporary, path)
+
 
 def holyrics_output_enabled(args: argparse.Namespace) -> bool:
     return args.slide_output in {"holyrics", "both"}
@@ -798,7 +832,7 @@ def append_session_reference(records: list[dict], payload: dict, action: str = "
     # The end-of-session report is a list of references actually accepted or
     # sent to Holyrics.  A rejected/ignored operator proposal must not appear
     # there merely because the parser produced a candidate slide.
-    if action in {"reject", "not_citation", "wrong_reference", "skip", "auto_reject"}:
+    if action in {"reject", "not_citation", "wrong_reference", "skip", "auto_reject", "waiting"}:
         return
     record = session_reference_record(payload, action=action)
     if not record:
@@ -957,6 +991,7 @@ def popup_tk_window(tk, title: str, *, show: bool = True):
         child.destroy()
     for sequence in (
         "<Return>",
+        "<KP_Enter>",
         "<Escape>",
         "<space>",
         "<Tab>",
@@ -982,6 +1017,48 @@ def popup_tk_window(tk, title: str, *, show: bool = True):
     else:
         root.withdraw()
     return root
+
+
+def windows_popup_focus_actions(window: int, *, user32, kernel32) -> dict:
+    """Ask Windows to give a popup's top-level window the real input focus.
+
+    Tk's dotted button outline only describes focus *inside Tk*.  Windows can
+    still leave keyboard input with another application.  Temporarily joining
+    the foreground input queue is the narrowest native request we can make;
+    it is always detached before this function returns.
+    """
+    top_level = int(user32.GetAncestor(window, 2) or window)  # GA_ROOT
+    foreground_before = int(user32.GetForegroundWindow() or 0)
+    current_thread = int(kernel32.GetCurrentThreadId() or 0)
+    foreground_thread = int(user32.GetWindowThreadProcessId(foreground_before, 0) or 0)
+    attached = False
+    result = {
+        "window": int(window),
+        "top_level": top_level,
+        "foreground_before": foreground_before,
+        "current_thread": current_thread,
+        "foreground_thread": foreground_thread,
+    }
+    try:
+        if (
+            foreground_thread
+            and current_thread
+            and foreground_thread != current_thread
+        ):
+            attached = bool(
+                user32.AttachThreadInput(current_thread, foreground_thread, True)
+            )
+        result["input_attached"] = attached
+        result["show_restored"] = bool(user32.ShowWindow(top_level, 9))  # SW_RESTORE
+        result["brought_to_top"] = bool(user32.BringWindowToTop(top_level))
+        result["foreground_requested"] = bool(user32.SetForegroundWindow(top_level))
+        result["active_requested"] = bool(user32.SetActiveWindow(top_level))
+        result["focus_requested"] = bool(user32.SetFocus(top_level))
+        result["foreground_after"] = int(user32.GetForegroundWindow() or 0)
+    finally:
+        if attached:
+            user32.AttachThreadInput(current_thread, foreground_thread, False)
+    return result
 
 
 def close_popup_tk_root() -> None:
@@ -1524,7 +1601,7 @@ def load_runtime_risk_model(args: argparse.Namespace) -> None:
 def add_slide_payload(payload: dict) -> dict:
     parsed = payload.get("parsed") or {}
     reference_list = payload.get("reference_list") or []
-    if reference_list:
+    if len(reference_list) >= 2:
         source_text = str(payload.get("text") or "")
         refs = [str(item.get("ref") or "").strip() for item in reference_list if str(item.get("ref") or "").strip()]
         payload["slide"] = {
@@ -1535,6 +1612,19 @@ def add_slide_payload(payload: dict) -> dict:
             "detected_text": source_text,
             "slide_type": "reference_list",
             "references": reference_list,
+        }
+        return payload
+    if payload.get("chapter_reference") and parsed:
+        source_text = str(payload.get("text") or "")
+        payload["slide"] = {
+            "ref": str(parsed.get("ref") or "").strip(),
+            "verse": "",
+            "book": parsed.get("book"),
+            "chapter": parsed.get("chapter"),
+            "source": "vosk:parser_mentioned_chapter_reference",
+            "asr": source_text,
+            "detected_text": source_text,
+            "slide_type": "chapter_reference",
         }
         return payload
     if not parsed:
@@ -1587,35 +1677,158 @@ def add_slide_payload(payload: dict) -> dict:
     return payload
 
 
-def accumulate_reading_list(payload: dict, accumulated: list[dict]) -> dict:
-    """Extend one visible reading-list slide across adjacent ASR finals.
+READING_LIST_CONTINUATION_SECONDS = 2.0
 
-    A spoken list is commonly split into several final recognition results.
-    Ordinary speech or a normal Bible address closes the accumulated list.
-    """
-    reference_list = payload.get("reference_list")
-    if not isinstance(reference_list, list) or not reference_list:
-        accumulated.clear()
-        return payload
 
-    known = {
-        str(item.get("ref") or "").strip()
-        for item in accumulated
-        if isinstance(item, dict) and str(item.get("ref") or "").strip()
-    }
-    for item in reference_list:
-        if not isinstance(item, dict):
+def _reference_list_continuation_item(payload: dict, accumulated: list[dict]) -> dict | None:
+    """Resolve an explicit next address, using a single-book list as context."""
+    current_text = str(payload.get("vosk_text") or payload.get("text") or "").strip()
+    if not current_text:
+        return None
+    bible_path = Path(str(payload.get("bible_path") or DEFAULT_BIBLE))
+
+    parsed = parse_live_reference(current_text, bible_path=bible_path)
+    if parsed is None:
+        previous_books = {
+            value.book
+            for item in accumulated
+            if isinstance(item, dict)
+            and (
+                value := parse_live_reference(
+                    str(item.get("ref") or ""),
+                    bible_path=bible_path,
+                )
+            ) is not None
+        }
+        if len(previous_books) != 1:
+            return None
+        normalized = normalize_text(current_text)
+        # A shared book name permits a complete chapter/verse pair, but not
+        # an unnumbered verse fragment that could be ordinary reading text.
+        if not re.fullmatch(
+            r"(?:(?:в|на)\s+)?\d{1,3}\s+(?:глав\w*\s+)?\d{1,3}(?:\s+стих\w*)?",
+            normalized,
+        ):
+            return None
+        parsed = parse_live_reference(
+            f"{next(iter(previous_books))} {normalized}",
+            bible_path=bible_path,
+        )
+    if parsed is None:
+        return None
+    return {"ref": parsed.ref, "source_text": current_text}
+
+
+def _reference_list_item_is_independent(
+    item: dict,
+    accumulated: list[dict],
+    bible_path: Path = DEFAULT_BIBLE,
+) -> bool:
+    current = parse_live_reference(str(item.get("ref") or ""), bible_path=bible_path)
+    if current is None:
+        return False
+
+    def bounds(value: Any) -> tuple[tuple[int, int], tuple[int, int]]:
+        end_chapter = value.end_chapter or value.chapter
+        return (value.chapter, value.start_verse), (end_chapter, value.end_verse)
+
+    current_start, current_end = bounds(current)
+    for previous_item in accumulated:
+        previous = parse_live_reference(
+            str(previous_item.get("ref") or ""),
+            bible_path=bible_path,
+        )
+        if previous is None:
+            return False
+        if previous.ref == current.ref:
+            return False
+        if previous.book != current.book:
             continue
-        ref = str(item.get("ref") or "").strip()
-        if ref and ref not in known:
-            accumulated.append(dict(item))
-            known.add(ref)
-    payload["reference_list"] = [dict(item) for item in accumulated]
-    slide = payload.get("slide") if isinstance(payload.get("slide"), dict) else None
-    if slide and str(slide.get("slide_type") or "") == "reference_list":
-        refs = [str(item.get("ref") or "").strip() for item in payload["reference_list"]]
-        slide["verse"] = "\n".join(ref for ref in refs if ref)
-        slide["references"] = payload["reference_list"]
+        previous_start, previous_end = bounds(previous)
+        if max(current_start, previous_start) <= min(current_end, previous_end):
+            return False
+    return True
+
+
+def _set_reference_list_slide(payload: dict, references: list[dict]) -> None:
+    source_text = str(payload.get("text") or payload.get("vosk_text") or "")
+    refs = [str(item.get("ref") or "").strip() for item in references]
+    payload["source"] = "parser_reference_list"
+    payload["parsed"] = None
+    payload["reference_list"] = [dict(item) for item in references]
+    payload["slide"] = {
+        "ref": "Ссылки для чтения",
+        "verse": "\n".join(ref for ref in refs if ref),
+        "source": "vosk:parser_reference_list",
+        "asr": source_text,
+        "detected_text": source_text,
+        "slide_type": "reference_list",
+        "references": [dict(item) for item in references],
+    }
+
+
+def accumulate_reading_list(
+    payload: dict,
+    accumulated: list[dict],
+    *,
+    now: float | None = None,
+    state: dict | None = None,
+) -> dict:
+    """Collect a live reference list and immediate continuations for two seconds."""
+    current_time = time.monotonic() if now is None else float(now)
+    collection_state = state if state is not None else {}
+    last_item_time = collection_state.get("last_item_time")
+    if accumulated and (
+        last_item_time is None
+        or current_time - float(last_item_time) > READING_LIST_CONTINUATION_SECONDS
+    ):
+        accumulated.clear()
+        collection_state["last_item_time"] = None
+        collection_state["collection_id"] = None
+
+    reference_list = payload.get("reference_list")
+    is_list_slide = bool(
+        isinstance(reference_list, list)
+        and len(reference_list) >= 2
+        and isinstance(payload.get("slide"), dict)
+        and payload["slide"].get("slide_type") == "reference_list"
+    )
+    if is_list_slide:
+        known = {str(item.get("ref") or "").strip() for item in accumulated if isinstance(item, dict)}
+        for item in reference_list:
+            if not isinstance(item, dict):
+                continue
+            ref = str(item.get("ref") or "").strip()
+            if ref and ref not in known:
+                accumulated.append(dict(item))
+                known.add(ref)
+        if len(accumulated) >= 2:
+            if not collection_state.get("collection_id"):
+                collection_state["collection_id"] = f"list_{time.monotonic_ns()}"
+            collection_state["last_item_time"] = current_time
+            _set_reference_list_slide(payload, accumulated)
+            payload["reference_list_collection_active"] = True
+            payload["reference_list_collection_id"] = collection_state["collection_id"]
+            return payload
+
+    if accumulated:
+        item = _reference_list_continuation_item(payload, accumulated)
+        bible_path = Path(str(payload.get("bible_path") or DEFAULT_BIBLE))
+        if item and _reference_list_item_is_independent(item, accumulated, bible_path):
+            accumulated.append(item)
+            if not collection_state.get("collection_id"):
+                collection_state["collection_id"] = f"list_{time.monotonic_ns()}"
+            collection_state["last_item_time"] = current_time
+            _set_reference_list_slide(payload, accumulated)
+            payload["reference_list_collection_active"] = True
+            payload["reference_list_updated"] = True
+            payload["reference_list_collection_id"] = collection_state["collection_id"]
+            return payload
+
+    accumulated.clear()
+    collection_state["last_item_time"] = None
+    collection_state["collection_id"] = None
+    payload["reference_list_collection_active"] = False
     return payload
 
 
@@ -1629,7 +1842,14 @@ def text_citation_payload(decision: TextCitationDecision, recognized_text: str) 
         return {"text": recognized_text, "source": "text_citation", "parsed": None, "slide": None}
     start_verse = candidate.start_verse
     end_verse = candidate.end_verse or start_verse
-    announced_range = re.match(r"(\d+)\s+(\d+)\s+стих\b", normalize_text(recognized_text))
+    normalized_text = normalize_text(recognized_text)
+    announced_range = re.match(r"(\d+)\s+(?:и\s+)?(\d+)\s+стих\b", normalized_text)
+    if announced_range is None:
+        announced_range = re.match(
+            r"(?:давайте\s+)?(?:сейчас\s+)?(?:посмотрим|прочитаем)\s+"
+            r"(\d+)\s+(?:и\s+)?(\d+)\s+стих\b",
+            normalized_text,
+        )
     if announced_range:
         announced_start, announced_end = (int(value) for value in announced_range.groups())
         if announced_start == start_verse and announced_end > announced_start:
@@ -1810,11 +2030,16 @@ def address_recognition_allowed(address_detection_enabled: bool, long_passage_re
     return bool(address_detection_enabled and not long_passage_reading)
 
 
-def citation_recognition_paused(args: Any, long_passage_reading: bool) -> bool:
-    """Pause new matches while a timed verse is visible, except for long-range paging."""
+def citation_recognition_paused(
+    args: Any,
+    long_passage_reading: bool,
+    reference_list_collecting: bool = False,
+) -> bool:
+    """Pause matches during a timed citation, except while extending its list."""
     return bool(
         temporary_verse_display_active(args)
         and not long_passage_reading
+        and not reference_list_collecting
     )
 
 
@@ -1872,6 +2097,7 @@ def payload_summary(payload: dict) -> dict:
         "has_slide": bool(slide),
         "can_set_context": bool(slide.get("can_set_context")),
         "context_reference": bool(payload.get("context_reference")),
+        "chapter_reference": bool(payload.get("chapter_reference")),
         "context_range": payload.get("context_range") or {},
         "book_chapter_context": payload.get("book_chapter_context") or {},
         "invalid_reference": invalid_reference,
@@ -1913,7 +2139,7 @@ def publish_web_if_needed(args: argparse.Namespace, payload: dict) -> dict:
     return {"enabled": True, "ok": True, "slide": slide}
 
 
-def popup_approval_decision(slide: dict) -> str:
+def popup_approval_decision(slide: dict, *, event_callback=None, on_decision=None) -> str:
     try:
         import tkinter as tk
         from tkinter import font as tkfont
@@ -1980,9 +2206,29 @@ def popup_approval_decision(slide: dict) -> str:
     close_if_superseded_job = None
     keyboard_bindings: list[str] = []
 
+    def write_popup_event(stage: str, **fields) -> None:
+        """Log focus/key delivery without letting diagnostics affect approval."""
+        if event_callback is None:
+            return
+        try:
+            event_callback("popup_keyboard", {"stage": stage, **fields})
+        except Exception:
+            pass
+
     def bind_popup_key(sequence: str, action: str) -> None:
         """Handle the key even when a Button, rather than the root, has focus."""
-        root.bind_all(sequence, lambda _event: (close(action), "break")[1])
+        def on_key(event):
+            write_popup_event(
+                "key_received",
+                sequence=sequence,
+                action=action,
+                keysym=str(getattr(event, "keysym", "")),
+                keycode=getattr(event, "keycode", None),
+            )
+            close(action)
+            return "break"
+
+        root.bind_all(sequence, on_key)
         keyboard_bindings.append(sequence)
 
     def close(action: str) -> None:
@@ -1996,7 +2242,13 @@ def popup_approval_decision(slide: dict) -> str:
         for sequence in keyboard_bindings:
             root.unbind_all(sequence)
         root.withdraw()
-        closed.set(True)
+        if on_decision is not None:
+            try:
+                on_decision(action)
+            except Exception as exc:
+                write_popup_event("async_decision_error", error=str(exc))
+        else:
+            closed.set(True)
 
     def close_if_superseded() -> None:
         nonlocal close_if_superseded_job
@@ -2113,6 +2365,7 @@ def popup_approval_decision(slide: dict) -> str:
     center_tk_window(root, width, height)
 
     bind_popup_key("<Return>", "approve")
+    bind_popup_key("<KP_Enter>", "approve")
     if has_context_button:
         bind_popup_key("0", "approve_context")
         bind_popup_key("<KP_0>", "approve_context")
@@ -2126,7 +2379,7 @@ def popup_approval_decision(slide: dict) -> str:
     bind_popup_key("<Escape>", "skip")
     root.protocol("WM_DELETE_WINDOW", lambda: close("skip"))
 
-    def claim_keyboard_focus() -> None:
+    def claim_keyboard_focus(attempt: str) -> None:
         """Give keystrokes to the approval window, not the main LiVerse GUI.
 
         A withdrawn/reused Tk root can be visible and topmost while Windows
@@ -2137,29 +2390,33 @@ def popup_approval_decision(slide: dict) -> str:
         if not root.winfo_exists() or bool(closed.get()):
             return
         root.lift()
+        native_focus = {"enabled": False}
         if os.name == "nt":
             try:
                 import ctypes
 
-                window = root.winfo_id()
-                user32 = ctypes.windll.user32
-                user32.ShowWindow(window, 9)  # SW_RESTORE
-                user32.BringWindowToTop(window)
-                user32.SetForegroundWindow(window)
-            except Exception:
-                pass
+                native_focus = windows_popup_focus_actions(
+                    int(root.winfo_id()),
+                    user32=ctypes.windll.user32,
+                    kernel32=ctypes.windll.kernel32,
+                )
+                native_focus["enabled"] = True
+            except Exception as exc:
+                native_focus = {"enabled": True, "error": str(exc)}
         root.focus_force()
         approve.focus_set()
         approve.focus_force()
+        write_popup_event("focus_claim", attempt=attempt, native=native_focus)
 
     # Do not expose a reused window at its old coordinates. It becomes
     # visible only after the operator-monitor geometry and keyboard bindings
     # are complete.
     root.deiconify()
     close_if_superseded_job = root.after(100, close_if_superseded)
-    root.after_idle(claim_keyboard_focus)
-    root.after(100, claim_keyboard_focus)
-    root.wait_variable(closed)
+    root.after_idle(lambda: claim_keyboard_focus("idle"))
+    root.after(100, lambda: claim_keyboard_focus("retry_100ms"))
+    if on_decision is None:
+        root.wait_variable(closed)
     return decision["action"]
 
 
@@ -2404,9 +2661,20 @@ def approve_with_popup(args: argparse.Namespace, payload: dict) -> dict:
         return {"enabled": False}
     proposed_ref = str(slide.get("ref") or "")
     try:
-        action = popup_approval_decision(slide)
+        action = popup_approval_decision(
+            slide,
+            event_callback=getattr(args, "_popup_event_logger", None),
+        )
     except Exception as exc:
         return {"enabled": True, "ok": False, "reason": str(exc)}
+    return finish_popup_approval(args, payload, action)
+
+
+def finish_popup_approval(args: argparse.Namespace, payload: dict, action: str) -> dict:
+    slide = payload.get("slide")
+    if not slide:
+        return {"enabled": False}
+    proposed_ref = str(slide.get("ref") or "")
     if action.startswith("alternative:"):
         try:
             alternative_index = int(action.split(":", 1)[1])
@@ -2441,6 +2709,191 @@ def approve_with_popup(args: argparse.Namespace, payload: dict) -> dict:
     }
 
 
+class PopupApprovalQueue:
+    """Show popup approvals one at a time without pausing microphone processing."""
+
+    def __init__(self, args: argparse.Namespace, logger: JsonlLogger, session_refs: list[dict]):
+        self.args = args
+        self.logger = logger
+        self.session_refs = session_refs
+        self.pending: list[dict] = []
+        self.active: dict | None = None
+        self.next_id = 1
+        self.enqueued_list_refs: dict[str, set[str]] = {}
+        self.approved_list_refs: dict[str, list[dict]] = {}
+
+    def submit(self, args: argparse.Namespace, payload: dict) -> dict:
+        slide = payload.get("slide") or {}
+        references = payload.get("reference_list") or []
+        if slide.get("slide_type") == "reference_list" and references:
+            collection_id = str(
+                payload.get("reference_list_collection_id") or f"list_{time.monotonic_ns()}"
+            )
+            payload["reference_list_collection_id"] = collection_id
+            seen = self.enqueued_list_refs.setdefault(collection_id, set())
+            added = 0
+            for reference in references:
+                ref = str((reference or {}).get("ref") or "").strip()
+                if not ref or ref in seen:
+                    continue
+                seen.add(ref)
+                candidate = core_resolve_reference_payload(
+                    ref,
+                    bible_path=Path(str(payload.get("bible_path") or DEFAULT_BIBLE)),
+                )
+                candidate["text"] = str(payload.get("text") or payload.get("vosk_text") or "")
+                candidate["vosk_text"] = payload.get("vosk_text")
+                candidate["vosk_buffer"] = list(payload.get("vosk_buffer") or [])
+                for key in ("risk", "risk_score", "risk_level", "risk_reasons", "ml_risk", "asr"):
+                    if key in payload:
+                        candidate[key] = payload[key]
+                candidate["reference_list_collection_id"] = collection_id
+                candidate["_source_payload"] = payload
+                candidate = add_slide_payload(candidate)
+                self._enqueue_one(args, candidate)
+                added += 1
+            return {
+                "enabled": True,
+                "ok": True,
+                "action": "waiting",
+                "queue_position": len(self.pending) + (1 if self.active else 0),
+                "queued_references": added,
+            }
+        return self._enqueue_one(args, payload)
+
+    def _enqueue_one(self, args: argparse.Namespace, payload: dict) -> dict:
+        approval_id = f"approval_{self.next_id:05d}"
+        self.next_id += 1
+        payload["approval_id"] = approval_id
+        payload["_approval_args"] = args
+        source_payload = payload.get("_source_payload", payload)
+        source_payload.setdefault("approval_ids", []).append(approval_id)
+        self.pending.append(payload)
+        self.logger.write(
+            "approval_queued",
+            {
+                "approval_id": approval_id,
+                "ref": str((payload.get("slide") or {}).get("ref") or ""),
+                "queue_size": len(self.pending) + (1 if self.active else 0),
+            },
+        )
+        return {
+            "enabled": True,
+            "ok": True,
+            "action": "waiting",
+            "approval_id": approval_id,
+            "queue_position": len(self.pending) + (1 if self.active else 0),
+        }
+
+    def pump(self) -> None:
+        global _POPUP_TK_ROOT
+        if self.active is None and self.pending:
+            payload = self.pending.pop(0)
+            self.active = payload
+
+            def decided(action: str, item=payload) -> None:
+                list_id = str(item.get("reference_list_collection_id") or "")
+                item_ref = str((item.get("slide") or {}).get("ref") or "")
+                if list_id and action in {"approve", "approve_context"} or (
+                    list_id and action.startswith("alternative:")
+                ):
+                    approved = self.approved_list_refs.setdefault(list_id, [])
+                    candidate_slide = item.get("slide") or {}
+                    ref = str(candidate_slide.get("ref") or "").strip()
+                    if ref and all(str(value.get("ref") or "") != ref for value in approved):
+                        approved.append(
+                            {
+                                "ref": ref,
+                                "source_text": str(item.get("text") or ""),
+                            }
+                        )
+                    if len(approved) >= 2:
+                        _set_reference_list_slide(item, approved)
+                result = finish_popup_approval(item.get("_approval_args", self.args), item, action)
+                item["output"] = {
+                    "approval": result,
+                    "holyrics": result.get("holyrics", {"enabled": False, "reason": "rejected_or_no_slide"}),
+                    "web": result.get("web", {"enabled": False, "reason": "rejected_or_no_slide"}),
+                }
+                final_action = approval_action(item["output"])
+                if action_selects_context(final_action, item.get("slide") or {}):
+                    pipeline = getattr(self.args, "_live_reference_pipeline", None)
+                    if pipeline is not None:
+                        pipeline.set_context_range(item["slide"])
+                feedback = operator_feedback(item["output"])
+                item["operator_feedback"] = feedback or {}
+                if list_id and action in {"approve", "approve_context"}:
+                    for reference in self.approved_list_refs.get(list_id, []):
+                        if not any(
+                            row.get("ref") == reference.get("ref")
+                            and row.get("action") == final_action
+                            for row in self.session_refs
+                        ):
+                            self.session_refs.append(
+                                {
+                                    "ref": reference.get("ref"),
+                                    "action": final_action,
+                                    "asr": str(item.get("vosk_text") or item.get("text") or ""),
+                                    "detected_text": "",
+                                }
+                            )
+                else:
+                    append_session_reference(self.session_refs, item, action=final_action)
+                self.logger.write(
+                    "approval_decision",
+                    {
+                        "approval_id": item.get("approval_id"),
+                        "action": final_action,
+                        "proposed_ref": item_ref,
+                        "selected_ref": result.get("selected_ref"),
+                        "output": item["output"],
+                    },
+                )
+                self.logger.update_trigger_case(
+                    str(item.get("approval_id") or ""),
+                    {
+                        "action": final_action,
+                        "operator_feedback": item["operator_feedback"],
+                        "output": item["output"],
+                    },
+                )
+                self.active = None
+
+            try:
+                popup_approval_decision(
+                    payload.get("slide") or {},
+                    event_callback=getattr(self.args, "_popup_event_logger", None),
+                    on_decision=decided,
+                )
+            except Exception as exc:
+                failure = {
+                    "approval": {"enabled": True, "ok": False, "reason": str(exc)},
+                    "holyrics": {"enabled": False, "reason": "approval_popup_error"},
+                    "web": {"enabled": False, "reason": "approval_popup_error"},
+                }
+                payload["output"] = failure
+                self.logger.update_trigger_case(
+                    str(payload.get("approval_id") or ""),
+                    {"action": "output_failed", "output": failure},
+                )
+                self.logger.write(
+                    "approval_popup_error",
+                    {"approval_id": payload.get("approval_id"), "error": str(exc)},
+                )
+                self.active = None
+
+        if _POPUP_TK_ROOT is not None:
+            try:
+                count = len(self.pending)
+                title = "LiVerse — подтверждение"
+                if count:
+                    title += f" (в очереди: {count})"
+                _POPUP_TK_ROOT.title(title)
+                _POPUP_TK_ROOT.update()
+            except Exception as exc:
+                self.logger.write("approval_popup_pump_error", {"error": str(exc)})
+
+
 def submit_for_approval(args: argparse.Namespace, payload: dict) -> dict:
     if not payload.get("slide"):
         return {"enabled": False}
@@ -2453,11 +2906,17 @@ def submit_for_approval(args: argparse.Namespace, payload: dict) -> dict:
 def approval_required_for_payload(args: argparse.Namespace, payload: dict) -> bool:
     if not payload.get("slide"):
         return False
+    fuzzy_reference_list = (
+        payload.get("source") == "parser_reference_list"
+        and "fuzzy_book_match" in (payload.get("risk_reasons") or [])
+    )
     ml_risk = payload.get("ml_risk") or {}
-    if ml_risk.get("auto_reject"):
-        return False
     if args.require_approval:
         return True
+    if args.semi_auto_approval and fuzzy_reference_list:
+        return True
+    if ml_risk.get("auto_reject"):
+        return False
     return bool(args.semi_auto_approval and ml_risk.get("needs_confirmation"))
 
 
@@ -2507,8 +2966,12 @@ def apply_ml_risk(args: argparse.Namespace, payload: dict, asr_result: dict | No
         risk_score = 0.0
     decision_reasons = list(ml_risk.get("decision_reasons") or [])
     trusted_explicit_context = "trusted_explicit_context_verse" in decision_reasons
+    fuzzy_reference_list = (
+        payload.get("source") == "parser_reference_list"
+        and "fuzzy_book_match" in (payload.get("risk_reasons") or [])
+    )
     auto_reject_threshold = float(getattr(args, "risk_auto_reject_threshold", 0.9) or 0.0)
-    if auto_reject_threshold > 0 and risk_score >= auto_reject_threshold:
+    if auto_reject_threshold > 0 and risk_score >= auto_reject_threshold and not fuzzy_reference_list:
         if payload.get("source") == "context_range":
             # The confirmed long range already fixes the book, chapter and
             # allowed verse boundaries.  A low-confidence ASR result should
@@ -2529,6 +2992,13 @@ def apply_ml_risk(args: argparse.Namespace, payload: dict, asr_result: dict | No
     ):
         ml_risk["needs_confirmation"] = True
         decision_reasons.append("manual_medium_or_high_risk_score")
+    if fuzzy_reference_list:
+        # Do not silently show or discard a list assembled using approximate
+        # book-name matches. The list structure can rescue these ASR forms,
+        # but the operator must verify every proposed destination.
+        ml_risk["auto_reject"] = False
+        ml_risk["needs_confirmation"] = True
+        decision_reasons.append("fuzzy_reference_list_requires_confirmation")
     if decision_reasons:
         ml_risk["decision_reasons"] = decision_reasons
     payload["ml_risk"] = ml_risk
@@ -2620,6 +3090,14 @@ def publish_payload(args: argparse.Namespace, payload: dict) -> dict:
         }
     if approval_required_for_payload(args, payload):
         if args.approval_ui == "popup":
+            approval_queue = getattr(args, "_popup_approval_queue", None)
+            if approval_queue is not None:
+                queued = approval_queue.submit(args, payload)
+                return {
+                    "approval": queued,
+                    "holyrics": {"enabled": False, "reason": "waiting_for_approval"},
+                    "web": {"enabled": False, "reason": "waiting_for_approval"},
+                }
             popup_result = approve_with_popup(args, payload)
             return {
                 "approval": popup_result,
@@ -2918,6 +3396,9 @@ def run_microphone(args: argparse.Namespace) -> int:
     )
     logger = JsonlLogger(Path(args.log_dir), enabled=not args.no_log)
     setattr(args, "_holyrics_event_logger", logger.write)
+    setattr(args, "_popup_event_logger", logger.write)
+    if args.approval_ui == "popup":
+        setattr(args, "_popup_approval_queue", PopupApprovalQueue(args, logger, session_refs))
     command_argv = safe_command_argv(list(sys.argv))
     logger.write_session(
         {
@@ -3044,6 +3525,7 @@ def run_microphone(args: argparse.Namespace) -> int:
         audio_queue.put(data)
 
     pipeline = LiveReferencePipeline(args.bible, buffer_parts=args.vosk_buffer_parts)
+    setattr(args, "_live_reference_pipeline", pipeline)
     text_searcher = None
     text_detector = None
     if text_detection_enabled:
@@ -3082,6 +3564,7 @@ def run_microphone(args: argparse.Namespace) -> int:
     pending_incomplete_reference = None
     pending_incomplete_fragments = 0
     reading_list: list[dict] = []
+    reading_list_state: dict = {"last_item_time": None}
 
     def sample_rate_candidates() -> list[int]:
         values = [args.samplerate, 16000, 48000, 44100]
@@ -3265,6 +3748,9 @@ def run_microphone(args: argparse.Namespace) -> int:
                     stop_action = consume_stop_request(args.stop_file)
                     if stop_action:
                         raise GracefulStopRequested(stop_action)
+                    approval_queue = getattr(args, "_popup_approval_queue", None)
+                    if approval_queue is not None:
+                        approval_queue.pump()
                     try:
                         data = audio_queue.get(timeout=0.25)
                     except queue.Empty:
@@ -3312,7 +3798,18 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 recognition_time=recognition_time,
                                 text_detector=text_detector,
                             )
-                            if citation_recognition_paused(args, long_passage_reading):
+                            last_list_item_time = reading_list_state.get("last_item_time")
+                            list_collection_active = bool(
+                                reading_list
+                                and last_list_item_time is not None
+                                and recognition_time - float(last_list_item_time)
+                                <= READING_LIST_CONTINUATION_SECONDS
+                            )
+                            if citation_recognition_paused(
+                                args,
+                                long_passage_reading,
+                                reference_list_collecting=list_collection_active,
+                            ):
                                 pipeline.text_buffer.clear()
                                 if text_detector is not None:
                                     text_detector.clear()
@@ -3437,7 +3934,12 @@ def run_microphone(args: argparse.Namespace) -> int:
                                         "score": float(plan_match["score"]),
                                     }
                                     if args.approval_ui == "popup":
-                                        plan_action = popup_approval_decision(plan_candidate)
+                                        plan_action = popup_approval_decision(
+                                            plan_candidate,
+                                            event_callback=getattr(
+                                                args, "_popup_event_logger", None
+                                            ),
+                                        )
                                         if plan_action == "approve":
                                             plan_ok, plan_reason = show_holyrics_text_slide(
                                                 args,
@@ -3678,13 +4180,29 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 output_args = text_citation_output_args(args)
                             else:
                                 payload = add_slide_payload(pipeline_payload)
-                            accumulate_reading_list(payload, reading_list)
+                            reading_list_before = [dict(item) for item in reading_list]
+                            reading_list_state_before = dict(reading_list_state)
+                            accumulate_reading_list(
+                                payload,
+                                reading_list,
+                                now=time.monotonic(),
+                                state=reading_list_state,
+                            )
                             payload["asr"] = result
                             apply_ml_risk(output_args, payload, asr_result=result)
                             if operator_completed_payload is not None:
                                 payload["output"] = publish_after_approval(output_args, payload)
                             else:
                                 payload["output"] = publish_payload(output_args, payload)
+                            if approval_action(payload["output"]) in {
+                                "reject",
+                                "not_citation",
+                                "wrong_reference",
+                                "skip",
+                            }:
+                                reading_list[:] = reading_list_before
+                                reading_list_state.clear()
+                                reading_list_state.update(reading_list_state_before)
                             if payload.get("slide"):
                                 action = approval_action(payload["output"])
                                 feedback = operator_feedback(payload["output"])
@@ -3749,6 +4267,8 @@ def run_microphone(args: argparse.Namespace) -> int:
                                         "audio": audio_path,
                                         **time_info,
                                         "action": action,
+                                        "approval_id": payload.get("approval_id"),
+                                        "approval_ids": payload.get("approval_ids") or [],
                                         "operator_feedback": feedback or {},
                                         "ref": ref,
                                         "vosk_text": text,
@@ -4166,6 +4686,7 @@ def main() -> int:
         grammar = None if args.open_vocabulary else build_grammar()
         logger = JsonlLogger(Path(args.log_dir), enabled=not args.no_log)
         setattr(args, "_holyrics_event_logger", logger.write)
+        setattr(args, "_popup_event_logger", logger.write)
         command_argv = safe_command_argv(list(sys.argv))
         logger.write_session(
             {

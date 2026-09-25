@@ -341,6 +341,15 @@ ASR_REPLACEMENTS = (
     (r"\bи\s+у\s*ван(?:на|ов)\b", "иоанна"),
     (r"\bи\s+уанна\b", "иоанна"),
     (r"\bиоана\b", "иоанна"),
+    # In a spoken introduction Sherpa merged «из Писания. Иоанна 3:16»
+    # into «два отрыжка из писания я на три шестнадцать».  Do not let the
+    # preceding count become a chapter or let «писания» fuzzy-match Исаию.
+    # The complete introduction plus two following number words keeps this
+    # repair out of ordinary uses of «я на ...».
+    (
+        r"\b(?:два|2)\s+отр(?:ывк|ыжк)[а-я]*\s+из\s+писания\s+я\s+на\s+([а-я0-9]+)\s+([а-я0-9]+)\b",
+        r"иоанна \1 \2",
+    ),
     (
         r"\bтретье\s+послание[.,]?\s+апостол\s+и\s+иоанна\s+(\d+)\s*[-–]\s*(\d+)\b",
         r"третье послание иоанна \1-\2 стих",
@@ -386,6 +395,13 @@ ASR_REPLACEMENTS = (
     (r"\bивангел[а-я]*\b", "евангелие"),
     (r"\bивангед[а-я]*\b", "евангелие"),
     (r"\bевангелия\b", "евангелие"),
+    # In the full title «Откровение Иоанна Богослова» ASR can put
+    # «Откровение» in an oblique case.  Keep the repair tied to all title
+    # words so a separate mention of John is never turned into Revelation.
+    (
+        r"\bоткровени(?:ем|и|я)\s+иоанна\s+богослова\b",
+        "откровение иоанна богослова",
+    ),
     (r"\bевангелие\s+атеана\b", "евангелие от иоанна"),
     # Rodnik replay: «Евангелие от Иоанна» -> «евангетана».
     # This fused form is specific enough to restore the book without making
@@ -428,8 +444,20 @@ ASR_REPLACEMENTS = (
     # speech about a magpie («сорока») is unaffected.
     (r"\bсорока\s+(?=(?:перв\w*|втор\w*|трет\w*|четверт\w*|пят\w*|шест\w*|седьм\w*|восьм\w*|девят\w*|десят\w*|\d+)\s+стих)", "сорок "),
     (r"\bмалахи\b", "малахия"),
+    # In a Bible address Sherpa may clip «Марк» to «мар».  Require a
+    # following chapter/verse marker so ordinary words beginning with «мар»
+    # are never treated as a book name.
+    (r"\bмар(?=\s+(?:\d+|перв\w*|втор\w*|трет\w*|четверт\w*|пят\w*|шест\w*|седьм\w*|восьм\w*|девят\w*|десят\w*)\s*(?::|глав\w*|стих\w*))", "марк"),
+    # Observed replay form of «Евангелие от Иоанна» with both the title and
+    # the name distorted.  Keep it tied to a following chapter marker.
+    (r"\bиван\s+евангел(?:ий|ие)\s+от\s+иад[а-я]*(?=\s+(?:\d+|перв\w*|втор\w*|трет\w*|четверт\w*|пят\w*|шест\w*|седьм\w*|восьм\w*|девят\w*|десят\w*)\s+гла(?:в\w*)?\b)", "евангелие от иоанна"),
     (r"\bпервым\s+посланником\b", "первое послание"),
     (r"\bвторым\s+посланником\b", "второе послание"),
+    # Sherpa may reduce «Иоанн» to «я».  In the fixed address context
+    # «апостол ... в первом послании» this unambiguously means 1 Иоанна.
+    # Keep these rules before the generic «первом послании» normalization.
+    (r"\b(?:апостол\s+)?я\s+(?:сказал\s+)?в\s+первом\s+послании\b", "1 послание иоанна"),
+    (r"\b(?:апостол\s+)?я\s+первом\s+послании\b", "1 послание иоанна"),
     (r"\bдеяния апостола\b", "деяния апостолов"),
     (r"\bидея боссов\b", "деяния апостолов"),
     (r"\bдиаметр\W+опослов\b", "деяния апостолов"),
@@ -465,6 +493,7 @@ ASR_REPLACEMENTS = (
     # not a chapter number; normalize them before number parsing.
     (r"\bпервый\s+тимофе[йяю]\b", "1 тимофею"),
     (r"\bвторой\s+тимофе[йяю]\b", "2 тимофею"),
+    (r"\bвторой\s+тимофеич\b", "2 тимофею"),
     (r"\bкол\s+о\s+сия\s+нам\b", "колоссянам"),
     (r"\bкол\s+оси\s+нам\b", "колоссянам"),
     (r"\bкол\s+оси\s+яна\b", "колоссянам"),
@@ -479,10 +508,23 @@ ASR_REPLACEMENTS = (
     (r"\bколос\s+са\s+нам\b", "колоссянам"),
     (r"\bколоса\s+нам\b", "колоссянам"),
     (r"\bкоренция\s+нам\b", "коринфянам"),
+    # Rodnik replay ASR: «послание к Галатам» may become «познание голова
+    # там».  Require a following chapter/verse number and «стих», so ordinary
+    # speech about knowledge and a head remains untouched.
+    (
+        r"\bпознание\s+голова\s+там(?=\s+(?:\d+|перв\w*|втор\w*|трет\w*|четверт\w*|пят\w*|шест\w*|седьм\w*|восьм\w*|девят\w*|десят\w*)\s+(?:глав\w*|стих\w*))",
+        "послание к галатам",
+    ),
+    (
+        r"\bпознание\s+голова\s+там\s+((?:перв\w*|втор\w*|трет\w*|четверт\w*|пят\w*|шест\w*|седьм\w*|восьм\w*|девят\w*|десят\w*))\s+((?:перв\w*|втор\w*|трет\w*|четверт\w*|пят\w*|шест\w*|седьм\w*|восьм\w*|девят\w*|десят\w*))\s+стих",
+        r"послание к галатам \1 глава \2 стих",
+    ),
     (r"\bкаринфен[а-я]*\b", "коринфянам"),
     (r"\bкаримфин[а-я]*\b", "коринфянам"),
     (r"\bкаренкома\b", "коринфянам"),
     (r"\bкарифинам\b", "коринфянам"),
+    # Sherpa: «карефеном» is a distortion of «Коринфянам» in an epistle address.
+    (r"\bкарефеном\b", "коринфянам"),
     # Rodnik replay ASR: «второй постоянный корень винова» ->
     # «второе послание Коринфянам».
     (r"\bвторой\s+постоянный\b", "второе послание"),
@@ -506,8 +548,10 @@ ASR_REPLACEMENTS = (
     # Sherpa: "книга Левитов" -> "книга лимитов".
     (r"\bкнига\s+лимитов\b", "книга левит"),
     (r"\bфилиппитс\b", "филиппийцам"),
+    # Numbered epistle alias, including the observed Sherpa split
+    # «фессола ни кейтса»; preserve the first/second epistle marker.
     (
-        r"\b(?:1|первое|первая|первого)\s+(?:послани[ея]\s+)?фес+с?\s+салон(?:ик|ики)?\b",
+        r"\b(?:1|первое|первая|первого)\s+(?:послани[ея]\s+)?(?:фес+с?\s+салон(?:ик|ики)?|фессола\s+ни\s+кейтса)\b",
         "1 фессалоникийцам",
     ),
     (
@@ -547,6 +591,10 @@ ASR_REPLACEMENTS = (
     # Sherpa: "Ефесянам шестая глава" -> "вся нам читаю глава".
     (r"\b(?:и\s+)?вся\s+нам\b", "ефесянам"),
     (r"\bефесянам\s+читаю\s+глава\b", "ефесянам шестая глава"),
+    # Rodnik replay ASR: «первое послание Фессалоникийцам» may be heard as
+    # «перво послание фила никийсон».  Keep the numbered-epistle context so
+    # this cannot be confused with the nearby fuzzy match Филиппийцам.
+    (r"\b(?:перво|первое|первого)\s+послани[ея]\s+фила\s+никийсон\b", "1 фессалоникийцам"),
     (r"\bпервое\s+послание\s+(?:апостола\s+павл[аы]\s+)?ф[еэ]с[еоа]лоник[еий]*ц[ае]м\b", "1 фессалоникийцам"),
     (r"\bвторое\s+послание\s+(?:апостола\s+павл[аы]\s+)?ф[еэ]с[еоа]лоник[еий]*ц[ае]м\b", "2 фессалоникийцам"),
     (r"\b(?:первое|первая|1)\s+(?:послание\s+)?фес+с?\b", "1 фессалоникийцам"),
@@ -660,6 +708,31 @@ TRUNCATED_OK_COMPOUND_RE = re.compile(
     + r")\s+стих\b"
 )
 
+# Sherpa can merge «сто» with the following ordinal and replace the vowel
+# ``о`` with ``у``: «сто пятый» -> «ступятый».  This is a family of address
+# distortions, not a word-level alias for one observed number.  Restrict the
+# repair to a following verse marker.
+FUSED_HUNDRED_ORDINAL_STEMS = {
+    "перв": 101,
+    "втор": 102,
+    "трет": 103,
+    "треть": 103,
+    "четвер": 104,
+    "четверт": 104,
+    "пят": 105,
+    "шест": 106,
+    "седь": 107,
+    "седьм": 107,
+    "вось": 108,
+    "восьм": 108,
+    "девят": 109,
+}
+FUSED_HUNDRED_ORDINAL_RE = re.compile(
+    r"\bсту("
+    + "|".join(sorted(FUSED_HUNDRED_ORDINAL_STEMS, key=len, reverse=True))
+    + r")[а-я]*\s+(?=стих\w*\b)"
+)
+
 TRUNCATED_ORDINAL_VERSES = {
     "одиннад": 11,
     "двенад": 12,
@@ -723,6 +796,63 @@ TRUNCATED_FEMININE_CHAPTER_ORDINAL_RE = re.compile(
     + "|".join(sorted(TRUNCATED_FEMININE_CHAPTER_ORDINALS, key=len, reverse=True))
     + r")\s+(глав\w*)\b"
 )
+# Speakers sometimes begin the chapter number with a cardinal and then
+# correct themselves with a feminine ordinal: «двадцать четырнадцатая глава,
+# двадцать восемь тридцать».  Discard the first number only when the following
+# chapter/verse shape confirms an address.  Keep valid compounds such as
+# «двадцать первая глава» (chapter 21).
+FEMININE_CHAPTER_ORDINALS = {
+    word: value
+    for word, value in ORDINALS.items()
+    if word.endswith("ая") or word == "третья"
+}
+CARDINAL_WORD_PATTERN = "|".join(sorted(CARDINALS, key=len, reverse=True))
+FEMININE_CHAPTER_ORDINAL_PATTERN = "|".join(
+    sorted(FEMININE_CHAPTER_ORDINALS, key=len, reverse=True)
+)
+NUMBER_WORD_PATTERN = "|".join(sorted(NUMBER_WORDS, key=len, reverse=True))
+ADDRESS_NUMBER_PATTERN = rf"(?:\d+|(?:{NUMBER_WORD_PATTERN})(?:\s+(?:{NUMBER_WORD_PATTERN}))?)"
+CARDINAL_BEFORE_FEMININE_CHAPTER_RE = re.compile(
+    rf"\b(?P<cardinal>{CARDINAL_WORD_PATTERN})\s+"
+    rf"(?P<ordinal>{FEMININE_CHAPTER_ORDINAL_PATTERN})"
+    rf"(?=(?:\s+глав\w*)?\s+(?:(?:с\s+)?{ADDRESS_NUMBER_PATTERN}"
+    rf"(?:\s+по\s+{ADDRESS_NUMBER_PATTERN}|\s+{ADDRESS_NUMBER_PATTERN})|"
+    rf"с\s+{ADDRESS_NUMBER_PATTERN}\s+по\s+{ADDRESS_NUMBER_PATTERN})"
+    rf"(?:\s+стих\w*)?\b)"
+)
+
+
+def is_compact_cross_chapter_numbering(match: re.Match[str]) -> bool:
+    """Keep all four numbers in a compact ``chapter:verse-chapter:verse`` form."""
+    prefix = match.string[: match.start()]
+    if not any(candidate.score >= 0.999 for candidate in book_candidates(prefix)):
+        return False
+
+    following_numbers = re.match(
+        rf"\s+(?P<next_chapter>{NUMBER_WORD_PATTERN})"
+        rf"\s+(?P<end_verse>{NUMBER_WORD_PATTERN})(?![а-я])",
+        match.string[match.end() :],
+    )
+    if not following_numbers:
+        return False
+
+    try:
+        start_chapter = CARDINALS[match.group("cardinal")]
+        start_verse = ORDINALS[match.group("ordinal")]
+        next_chapter = NUMBER_WORDS[following_numbers.group("next_chapter")]
+        end_verse = NUMBER_WORDS[following_numbers.group("end_verse")]
+    except KeyError:
+        return False
+
+    # The order is start chapter, start verse, next chapter, end verse. The
+    # parser later verifies that both verses actually exist in this book.
+    return (
+        next_chapter == start_chapter + 1
+        and 1 <= start_verse <= 176
+        and 1 <= end_verse <= 176
+    )
+
+
 # Sherpa may fuse a feminine chapter ordinal with the omitted word ``глава``
 # and return a masculine-looking ``-ого`` form, e.g. ``двадцать первоего``.
 # Keep this repair tied to a following verse marker so ordinary genitive
@@ -800,6 +930,19 @@ def replace_truncated_feminine_chapter_ordinal(match: re.Match[str]) -> str:
     return f"{TRUNCATED_FEMININE_CHAPTER_ORDINALS[match.group(1)]} {match.group(2)}"
 
 
+def replace_cardinal_before_feminine_chapter(match: re.Match[str]) -> str:
+    cardinal = CARDINALS[match.group("cardinal")]
+    ordinal = FEMININE_CHAPTER_ORDINALS[match.group("ordinal")]
+    if is_compact_cross_chapter_numbering(match):
+        return match.group(0)
+    # Keep canonical compounds such as «двадцать первая» (= 21) and
+    # «сто третья» (= 103). Other adjacent cardinals cannot form one
+    # Russian compound ordinal and are likely a false start.
+    if cardinal >= 20 and cardinal % 10 == 0 and 1 <= ordinal <= 9:
+        return match.group(0)
+    return match.group("ordinal")
+
+
 def replace_fused_feminine_chapter_ordinal(match: re.Match[str]) -> str:
     # If a chapter was already stated earlier in the same utterance, a
     # following ``пятого/девятого ... стих`` is normally a verse number (or a
@@ -850,6 +993,10 @@ def replace_truncated_ok_compound(match: re.Match[str]) -> str:
     return f"по {TRUNCATED_OK_TENS[match.group(1)] + TRUNCATED_OK_UNITS[match.group(2)]} стих"
 
 
+def replace_fused_hundred_ordinal(match: re.Match[str]) -> str:
+    return f"{FUSED_HUNDRED_ORDINAL_STEMS[match.group(1)]} "
+
+
 def normalize_text(text: str) -> str:
     normalized = text.lower().replace("ё", "е")
     for pattern, replacement in ASR_REPLACEMENTS:
@@ -859,6 +1006,8 @@ def normalize_text(text: str) -> str:
         lambda match: f"{ROMAN_NUMERALS.get(match.group(1), match.group(1))} глава",
         normalized,
     )
+    # Sherpa may clip the final «ва» in «глава» at the end of an address.
+    normalized = re.sub(r"\b(\d+)\s+гла\b", r"\1 глава", normalized)
     normalized = re.sub(
         r"\b(евангелие\s+от\s+иоанна|от\s+иоанна|иоанна)\s+(\d)(\d{2})\b",
         r"\1 \2 \3",
@@ -876,6 +1025,10 @@ def normalize_text(text: str) -> str:
     )
     normalized = TRUNCATED_OK_COMPOUND_RE.sub(
         replace_truncated_ok_compound,
+        normalized,
+    )
+    normalized = FUSED_HUNDRED_ORDINAL_RE.sub(
+        replace_fused_hundred_ordinal,
         normalized,
     )
     normalized = TRUNCATED_FEMININE_CHAPTER_ORDINAL_RE.sub(
@@ -915,10 +1068,40 @@ def normalize_text(text: str) -> str:
         replace_truncated_genitive_range_start,
         normalized,
     )
+    normalized = CARDINAL_BEFORE_FEMININE_CHAPTER_RE.sub(
+        replace_cardinal_before_feminine_chapter,
+        normalized,
+    )
     normalized = replace_number_phrases(normalized)
     tokens = normalized.split()
     tokens = replace_number_words(tokens)
     normalized = " ".join(tokens)
+    normalized = re.sub(r"\b(\d+)\s+гла\b", r"\1 глава", normalized)
+    # ASR can turn a one-digit verse into a tens word («восемь» ->
+    # «восемьдесят») when the verse marker is swallowed.  In the narrow
+    # chapter/verse shape below, reduce only the second number; ordinary
+    # numbers elsewhere remain untouched.
+    tens_to_single = {10: 1, 20: 2, 30: 3, 40: 4, 50: 5, 60: 6, 70: 7, 80: 8, 90: 9}
+    normalized = re.sub(
+        r"(\b\d+\s+глава\s+\d+)\s+(10|20|30|40|50|60|70|80|90)(?=\s+(?!\d+\b|стих\b))",
+        lambda match: f"{match.group(1)} {tens_to_single[int(match.group(2))]}",
+        normalized,
+    )
+    # If «стих» itself was swallowed, two numbers immediately after a chapter
+    # still form a compact verse range (for example «глава 7 8 подвигом»).
+    normalized = re.sub(
+        r"(\b\d+\s+глава\s+\d+)\s+(\d+)(?=\s+[^0-9])",
+        r"\1 \2 стих",
+        normalized,
+    )
+    # In a first-John address Sherpa may omit «стих» after two verse numbers:
+    # «1 послание Иоанна, пятая глава, десятая одиннадцати».  The two numbers
+    # are a range, not an unfinished chapter-only mention.
+    normalized = re.sub(
+        r"(\b1\s+иоанна\s+\d+\s+глава\s+\d+)\s+(\d+)(?=\s|$)",
+        r"\1 \2 стих",
+        normalized,
+    )
     normalized = THOUSAND_NOISE_VERSE_RANGE_RE.sub(
         replace_thousand_noise_verse_range,
         normalized,
@@ -929,6 +1112,24 @@ def normalize_text(text: str) -> str:
     normalized = re.sub(
         r"\b(\d{1,3})\s+пол(?:у)?\s+(\d{1,3})\s+стих\b",
         r"\1 по \2 стих",
+        normalized,
+    )
+    # Sherpa can fuse the range connector «по» with the following ordinal and
+    # insert an extra «л»: «по шестой» -> «полшестой».  Restrict this repair to
+    # an ordinal immediately followed by «стих», so ordinary words such as
+    # «полшубы» are never treated as a Bible range.
+    fused_range_ordinals = "|".join(sorted(ORDINALS, key=len, reverse=True))
+    normalized = re.sub(
+        rf"\bпол(?=(?:{fused_range_ordinals})\s+стих\b)",
+        "по ",
+        normalized,
+    )
+    # Sherpa may hear «псалом» as «писала» after a numeric psalm number.
+    # Require the following one or two verse numbers and «стих», so ordinary
+    # speech containing «писала» cannot start a Psalm reference.
+    normalized = re.sub(
+        r"\b(\d{1,3})\s+писала\s+(?=\d+(?:\s+\d+)?\s+стих\b)",
+        r"\1 псалом ",
         normalized,
     )
     normalized = re.sub(r"\b1\s+книг\w*\s+(?:пар|пара)липомин[а-я]*\b", "1 паралипоменон", normalized)
@@ -991,6 +1192,13 @@ def normalize_text(text: str) -> str:
     normalized = re.sub(
         r"\b(откро\w*)\s+речи(?=\s+\d+\s+глав)",
         r"\1 притчи",
+        normalized,
+    )
+    # Re-apply after the late ASR cleanups: the verse marker is required for
+    # the compact first-John range to win over chapter-only detection.
+    normalized = re.sub(
+        r"(\b1\s+иоанна\s+\d+\s+глава\s+\d+)\s+(\d+)(?=\s|$)",
+        r"\1 \2 стих",
         normalized,
     )
     return normalized
@@ -1268,6 +1476,12 @@ def book_candidates(normalized: str) -> list[BookCandidate]:
             # «Быт», но сами по себе не должны означать книгу Бытие.
             if candidate_text in {"бы", "быть"}:
                 continue
+            # «да не» is an ordinary Russian construction, including the
+            # biblical wording «никто да не обольщает вас».  Its fuzzy match
+            # to «Деяния» must never manufacture a book and chapter from the
+            # following verse numbers.
+            if candidate_text == "да не":
+                continue
             if candidate_text in {"фи", "послание фи"}:
                 continue
             # «Апостола» само по себе — обычное слово, а не название книги.
@@ -1514,6 +1728,27 @@ def ref_candidates(normalized: str, book: str, bible: dict[str, dict[int, dict[i
         chapter = int(match.group(3))
         if start_verse <= end_verse:
             add(chapter, list(range(start_verse, end_verse + 1)), match.start(), match.end(), 0.99)
+
+    # In a spoken address the book name can arrive after the end of a
+    # cross-chapter range: «17 стиха по 1 стих 4 главы, послание Колоссянам,
+    # 3 глава».  The two chapter numbers must be consecutive; that constraint
+    # keeps this recovery from joining unrelated sermon speech.
+    for match in re.finditer(
+        r"(\d+)\s+стих\s+(?:по|до)\s+(\d+)\s+стих\s+(\d+)\s+глава\s+"
+        r"(?:послани[ея]|евангели[ея]|книг[аи])(?:\s+[а-я]+){1,4}\s+(\d+)\s+глава",
+        normalized,
+    ):
+        start_verse, end_verse, end_chapter, start_chapter = map(int, match.groups())
+        if end_chapter == start_chapter + 1:
+            add_cross_chapter(
+                start_chapter,
+                start_verse,
+                end_chapter,
+                end_verse,
+                match.start(),
+                match.end(),
+                1.08,
+            )
 
     cross_chapter_patterns = (
         (r"(\d+)\s+глава\s+(?:с\s+)?(\d+)\s+стих\s+(?:по|до)\s+(\d+)\s+глава\s+(\d+)\s+стих", 3, 4, 0.995),

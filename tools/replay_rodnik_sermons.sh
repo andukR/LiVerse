@@ -9,6 +9,11 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 AUDIO_ROOT="$PROJECT_ROOT/.cache/liverse/replay_audio"
 RODNIK_CHANNEL_URL="https://www.youtube.com/channel/UCqO7ojmGKRrat4TN2GQW9eQ/videos"
 AUTO_DOWNLOAD_LIMIT=3
+TRAINING_REFRESH_LIMIT=3
+# The explicit annotation category 0 / excluded_cascade was introduced by
+# commit 4b5780a1.  Files downloaded before that moment form the legacy pool
+# which had not yet benefited from that exclusion during its first review.
+TRAINING_REFRESH_CUTOFF="2026-09-07 20:05:03 +0500"
 ASR_ENGINE="sherpa-0.54"
 CITATION_DETECTION_MODE="hybrid_confirm"
 RUN_REPLAY=false
@@ -17,6 +22,7 @@ CONTROL_ONLY=false
 PYTHON="$PROJECT_ROOT/.venv/bin/python"
 BATCH_ROOT="$PROJECT_ROOT/.cache/liverse/rodnik_replay_batches"
 LATEST_BATCH_FILE="$BATCH_ROOT/latest_logs_dir"
+TRAINING_REFRESH_STATE_FILE="$BATCH_ROOT/training_refresh_processed_audio.txt"
 AUTO_FETCH_ATTEMPTED=false
 TIMED_SUBTITLE_ROOTS=(
     "$PROJECT_ROOT/../bible_parser_cli/transcripts"
@@ -28,6 +34,7 @@ usage() {
     cat <<'EOF'
 Использование:
   tools/replay_rodnik_sermons.sh next
+  tools/replay_rodnik_sermons.sh training-next [--plan]
   tools/replay_rodnik_sermons.sh batch AUDIO_1 [AUDIO_2] [AUDIO_3]
   tools/replay_rodnik_sermons.sh audit AUDIO_1 [AUDIO_2] [AUDIO_3]
   tools/replay_rodnik_sermons.sh subtitles
@@ -40,6 +47,11 @@ next                  Автоматически выбрать до трёх е
                       проповедей и запустить для них всю эмуляцию. Когда
                       локальная очередь закончилась, скачать до трёх новых
                       воскресных записей с YouTube и продолжить.
+training-next         Выбрать три уже обработанные локальные проповеди,
+                      скачанные до появления категории 0 (07.09.2026 20:05),
+                      и повторно прогнать их текущим кодом для новой разметки
+                      НБА. Внутри одного цикла записи не повторяются.
+  --plan              Только показать следующую тройку, не запускать replay.
 batch AUDIO_1 [AUDIO_2] [AUDIO_3]
                       Для одной-трёх выбранных записей: подобрать окна по субтитрам,
                       нарезать WAV и запустить Sherpa 0.54 в hybrid_confirm.
@@ -48,7 +60,8 @@ audit AUDIO_1 [AUDIO_2] [AUDIO_3]
                       Отдельно проверить обычную речь на ложные срабатывания.
 subtitles             Показать записи без SRT/VTT; с --run скачать только русские
                       субтитры YouTube, без загрузки аудио и без эмуляции.
-review                Открыть аннотатор только для последней успешной пачки.
+review                Открыть аннотатор для пяти последних файлов с неразмеченными
+                      случаями из всех сохранённых replay-пачек.
 review-slides         Разметить решения умного перелистывателя из этой пачки.
   --browser            Показать слайд и WAV в локальном браузере.
 
@@ -216,6 +229,106 @@ run_next_batch() {
     run_batch "${selected[@]}"
 }
 
+run_training_refresh_batch() {
+    local plan_only="${1:-false}"
+    if [[ ! -d "$AUDIO_ROOT" ]]; then
+        echo "Не найдена папка с записями Родника: $AUDIO_ROOT" >&2
+        return 1
+    fi
+
+    declare -A normally_processed=()
+    declare -A refresh_processed=()
+    declare -A timed_subtitles=()
+    local marker_file processed_path processed_id subtitle_root subtitle_path subtitle_id
+    for subtitle_root in "${TIMED_SUBTITLE_ROOTS[@]}"; do
+        [[ -d "$subtitle_root" ]] || continue
+        while IFS= read -r -d '' subtitle_path; do
+            subtitle_id="$(youtube_id_from_path "$subtitle_path")"
+            [[ -n "$subtitle_id" ]] && timed_subtitles["$subtitle_id"]=1
+        done < <(find "$subtitle_root" -type f \( -iname '*.srt' -o -iname '*.vtt' \) -print0)
+    done
+    while IFS= read -r -d '' marker_file; do
+        while IFS= read -r processed_path || [[ -n "$processed_path" ]]; do
+            [[ -n "$processed_path" ]] || continue
+            normally_processed["$processed_path"]=1
+            processed_id="$(youtube_id_from_path "$processed_path")"
+            [[ -n "$processed_id" ]] && normally_processed["id:$processed_id"]=1
+        done < "$marker_file"
+    done < <(find "$BATCH_ROOT" -type f -name processed_audio.txt -print0)
+    if [[ -f "$TRAINING_REFRESH_STATE_FILE" ]]; then
+        while IFS= read -r processed_path || [[ -n "$processed_path" ]]; do
+            [[ -n "$processed_path" ]] || continue
+            refresh_processed["$processed_path"]=1
+            processed_id="$(youtube_id_from_path "$processed_path")"
+            [[ -n "$processed_id" ]] && refresh_processed["id:$processed_id"]=1
+        done < "$TRAINING_REFRESH_STATE_FILE"
+    fi
+
+    local cutoff_epoch
+    cutoff_epoch="$(date -d "$TRAINING_REFRESH_CUTOFF" +%s)"
+    local candidates=()
+    local audio_file canonical_path video_id download_epoch
+    local skipped_after_cutoff=0 skipped_without_birth_time=0 skipped_without_subtitles=0 skipped_not_processed=0 skipped_refresh=0
+    shopt -s nullglob
+    local available=("$AUDIO_ROOT"/Воскресное*.webm)
+    shopt -u nullglob
+    for audio_file in "${available[@]}"; do
+        canonical_path="$(realpath -e "$audio_file")"
+        video_id="$(youtube_id_from_path "$canonical_path")"
+        if [[ -z "$video_id" || -z "${timed_subtitles[$video_id]+present}" ]]; then
+            ((skipped_without_subtitles += 1))
+            continue
+        fi
+        if [[ -z "${normally_processed[$canonical_path]+present}" && -z "${normally_processed[id:$video_id]+present}" ]]; then
+            ((skipped_not_processed += 1))
+            continue
+        fi
+        if [[ -n "${refresh_processed[$canonical_path]+present}" || -n "${refresh_processed[id:$video_id]+present}" ]]; then
+            ((skipped_refresh += 1))
+            continue
+        fi
+        download_epoch="$(stat -c %W "$canonical_path")"
+        if [[ ! "$download_epoch" =~ ^[0-9]+$ ]] || ((download_epoch <= 0)); then
+            ((skipped_without_birth_time += 1))
+            continue
+        fi
+        if ((download_epoch >= cutoff_epoch)); then
+            ((skipped_after_cutoff += 1))
+            continue
+        fi
+        candidates+=("$download_epoch|$canonical_path")
+    done
+
+    if ((${#candidates[@]} == 0)); then
+        echo "Нет подходящих старых записей для нового обучающего прогона."
+        echo "Уже взято в этом цикле: $skipped_refresh; скачано после введения категории 0: $skipped_after_cutoff; время создания неизвестно: $skipped_without_birth_time; без субтитров: $skipped_without_subtitles; ещё не проходили обычный replay: $skipped_not_processed."
+        return 0
+    fi
+
+    local sorted_candidates=()
+    mapfile -t sorted_candidates < <(printf '%s\n' "${candidates[@]}" | sort -t '|' -k1,1nr)
+    local selected=() candidate
+    for candidate in "${sorted_candidates[@]}"; do
+        selected+=("${candidate#*|}")
+        if ((${#selected[@]} >= TRAINING_REFRESH_LIMIT)); then
+            break
+        fi
+    done
+
+    echo "Подходящих записей в старом архиве: ${#candidates[@]}; уже взято в этом цикле: $skipped_refresh; скачано после введения категории 0: $skipped_after_cutoff; время создания неизвестно: $skipped_without_birth_time; без субтитров: $skipped_without_subtitles; ещё не проходили обычный replay: $skipped_not_processed."
+    echo "Повторный обучающий прогон: выбрано ${#selected[@]} ранее обработанных записей, скачанных до введения категории 0 ($TRAINING_REFRESH_CUTOFF)."
+    printf '  - %s\n' "${selected[@]}"
+    if [[ "$plan_only" == true ]]; then
+        echo "Только план: аудио не запускалось, выбранные записи не отмечены обработанными."
+        return 0
+    fi
+    run_batch "${selected[@]}"
+    for audio_file in "${selected[@]}"; do
+        realpath -e "$audio_file" >> "$TRAINING_REFRESH_STATE_FILE"
+    done
+    echo "Записи отмечены как использованные в текущем цикле обучающего перепрогона."
+}
+
 download_next_rodnik_sermons() {
     if [[ ! -x "$PYTHON" ]]; then
         echo "Не найдено виртуальное окружение Python: $PYTHON" >&2
@@ -299,18 +412,14 @@ youtube_id_from_path() {
     fi
 }
 
-review_latest_batch() {
-    if [[ ! -s "$LATEST_BATCH_FILE" ]]; then
-        echo "Нет последней успешной пачки. Сначала выполните batch для трёх записей." >&2
+review_recent_unreviewed() {
+    if [[ ! -d "$BATCH_ROOT" ]]; then
+        echo "Не найдена папка сохранённых replay-пачек: $BATCH_ROOT" >&2
         return 1
     fi
-    local logs_dir
-    logs_dir="$(<"$LATEST_BATCH_FILE")"
-    if [[ ! -d "$logs_dir" ]]; then
-        echo "Папка логов последней пачки не найдена: $logs_dir" >&2
-        return 1
-    fi
-    exec "$PYTHON" tools/review_trigger_cases.py --runs-dir "$logs_dir" --all-unreviewed
+    exec "$PYTHON" tools/review_trigger_cases.py \
+        --replay-batches-root "$BATCH_ROOT" \
+        --recent-unreviewed-files 5
 }
 
 review_latest_smart_slides() {
@@ -359,6 +468,19 @@ case "${1:-}" in
         run_next_batch
         exit $?
         ;;
+    training-next)
+        if (($# > 2)) || { (($# == 2)) && [[ "$2" != "--plan" ]]; }; then
+            echo "Допустимый параметр training-next: --plan" >&2
+            exit 2
+        fi
+        cd "$PROJECT_ROOT"
+        training_plan_only=false
+        if [[ "${2:-}" == "--plan" ]]; then
+            training_plan_only=true
+        fi
+        run_training_refresh_batch "$training_plan_only"
+        exit $?
+        ;;
     batch)
         shift
         cd "$PROJECT_ROOT"
@@ -379,7 +501,7 @@ case "${1:-}" in
             exit 2
         fi
         cd "$PROJECT_ROOT"
-        review_latest_batch
+        review_recent_unreviewed
         ;;
     review-slides)
         if (($# > 2)) || { (($# == 2)) && [[ "$2" != "--browser" ]]; }; then

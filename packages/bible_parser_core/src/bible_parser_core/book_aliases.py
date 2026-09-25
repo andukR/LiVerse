@@ -285,7 +285,10 @@ books_data = [
             "филимон",
         ],
     ),
-    ("Евреям", ["послание к евреям", "евр"]),
+    # Sherpa can drop the case ending in «послание к Евреям» and return
+    # «послание евреи».  Keep the full phrase so a later mention of
+    # «Откровение» in an explanation cannot steal the address.
+    ("Евреям", ["послание к евреям", "послание евреи", "евр"]),
     (
         "Иаков",
         ["послание иакова", "послание и около", "иак", "Яков", "апостол Яков", "иакова", "иаково"],
