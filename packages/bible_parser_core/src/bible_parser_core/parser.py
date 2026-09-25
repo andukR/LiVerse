@@ -259,6 +259,21 @@ ORDINALS = {
     "пятидесятом": 50,
 }
 
+SPLIT_ORDINAL_VERSE_PAIRS: dict[str, int] = {}
+for _ordinal, _number in ORDINALS.items():
+    for _split_at in range(3, len(_ordinal) - 1):
+        SPLIT_ORDINAL_VERSE_PAIRS.setdefault(
+            f"{_ordinal[:_split_at]} {_ordinal[_split_at:]}", _number
+        )
+SPLIT_ORDINAL_VERSE_RE = re.compile(
+    r"\b(?:"
+    + "|".join(
+        re.escape(pair)
+        for pair in sorted(SPLIT_ORDINAL_VERSE_PAIRS, key=len, reverse=True)
+    )
+    + r")(?=\s+стих\w*\b)"
+)
+
 CARDINALS = {
     "один": 1,
     "одна": 1,
@@ -459,6 +474,14 @@ ASR_REPLACEMENTS = (
     (r"\b(?:апостол\s+)?я\s+(?:сказал\s+)?в\s+первом\s+послании\b", "1 послание иоанна"),
     (r"\b(?:апостол\s+)?я\s+первом\s+послании\b", "1 послание иоанна"),
     (r"\bдеяния апостола\b", "деяния апостолов"),
+    # Sherpa can omit «Деяния» and leave only «апостолов» before a complete
+    # chapter-and-verse address. Restore the book name only when both address
+    # markers follow, so ordinary mentions of apostles are not book aliases.
+    (
+        r"\bапостолов(?=\s+(?:в\s+)?[а-я0-9]+\s+глав[а-я]*"
+        r"\s+[а-я0-9]+\s+стих[а-я]*\b)",
+        "деяния апостолов",
+    ),
     (r"\bидея боссов\b", "деяния апостолов"),
     (r"\bдиаметр\W+опослов\b", "деяния апостолов"),
     (r"\b(?:апостол\s+)?пет(?:е)?р\s+(?:в|во)\s+первом\s+послании\b", "1 послание петра"),
@@ -734,6 +757,7 @@ FUSED_HUNDRED_ORDINAL_RE = re.compile(
 )
 
 TRUNCATED_ORDINAL_VERSES = {
+    "десят": 10,
     "одиннад": 11,
     "двенад": 12,
     "тринад": 13,
@@ -1001,6 +1025,9 @@ def normalize_text(text: str) -> str:
     normalized = text.lower().replace("ё", "е")
     for pattern, replacement in ASR_REPLACEMENTS:
         normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+    # On fast speech Sherpa can omit the boundary between «стих» and the next
+    # book name: «пятый стихмарка четвёртая глава...».
+    normalized = re.sub(r"\bстих(?=марк(?:а|е|у|ом|и)?\b)", "стих ", normalized)
     normalized = re.sub(
         r"\b([ivxlcdm]+)\s*,?\s+глав[аеуы]\b",
         lambda match: f"{ROMAN_NUMERALS.get(match.group(1), match.group(1))} глава",
@@ -1019,6 +1046,13 @@ def normalize_text(text: str) -> str:
     normalized = re.sub(r"(\d+)\s*[-–]\s*(\d+)\s*[-–]?\s*х\b", r"\1-\2 стих", normalized)
     normalized = re.sub(r"(\d+)[-–]?(?:й|я|ю|е|го|му|м)\b", r"\1", normalized)
     normalized = re.sub(r"[^0-9а-яa-z]+", " ", normalized)
+    # Sherpa can split the end of a masculine ordinal across adjacent words
+    # («восьм ой стих»). Rejoin only when the two pieces form a known ordinal
+    # and are immediately followed by the masculine noun «стих».
+    normalized = SPLIT_ORDINAL_VERSE_RE.sub(
+        lambda match: str(SPLIT_ORDINAL_VERSE_PAIRS[match.group(0)]),
+        normalized,
+    )
     normalized = TRUNCATED_OK_ORDINAL_RE.sub(
         replace_truncated_ok_ordinal,
         normalized,
@@ -1060,7 +1094,7 @@ def normalize_text(text: str) -> str:
         normalized,
     )
     normalized = re.sub(
-        r"\b(одиннад|двенад|тринад|четырнад|пятнад|шестнад|семнад|восемнад|девятнад|двад|трид)\w*\s+стих\b",
+        r"\b(десят|одиннад|двенад|тринад|четырнад|пятнад|шестнад|семнад|восемнад|девятнад|двад|трид)\w*\s+стих\b",
         replace_truncated_ordinal_verse,
         normalized,
     )
@@ -2129,6 +2163,16 @@ def infer_chapter_and_verses(normalized: str, book: str, bible: dict[str, dict[i
     if chapter and verses:
         return chapter, verses
 
+    # Do not reinterpret verse numbers as ``chapter:verse`` when an address
+    # explicitly mentions a chapter but its number was lost by ASR, or when
+    # a verse range was spoken without any chapter number.  In particular,
+    # ``Исаия ... глава с первого по третий стих`` must not become Isa. 1:3.
+    if chapter is None and (
+        re.search(r"\bглав\w*\b", normalized)
+        or re.search(r"\bс\s+\d+\s+по\s+\d+\s+стих\w*\b", normalized)
+    ):
+        return None, []
+
     numbers = [value for value, _start, _end in reference_numbers(normalized, book)]
     if chapter is None and book == "Псалтирь" and len(numbers) == 1:
         chapters = bible.get(book, {})
@@ -2452,6 +2496,21 @@ def parse_live_reference(text: str, bible_path: Path = DEFAULT_BIBLE) -> ParsedR
             # immediately; the fuller aliases «послание Иакова» remain
             # unambiguous even when the speaker pauses before the numbers.
             if _unanchored_person_name_book_candidate(book_candidate, ref_candidate, normalized):
+                continue
+            # In ``Иоанна 3:16, Лука ...`` the trailing book begins the next
+            # reference; it must not retroactively capture the preceding
+            # number pair merely because it is an exact book match. Prefer a
+            # book candidate before those numbers when it has the same span.
+            if ref_candidate.end <= book_candidate.start and any(
+                other is not book_candidate
+                and other.end <= ref_candidate.start
+                and any(
+                    earlier_ref.start == ref_candidate.start
+                    and earlier_ref.end == ref_candidate.end
+                    for earlier_ref in ref_candidates(normalized, other.book, bible)
+                )
+                for other in books
+            ):
                 continue
             # A full Gospel title is a strong anchor for the reference that
             # follows it. Ignore numeric fragments from earlier sermon speech

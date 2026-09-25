@@ -27,6 +27,7 @@ DEFAULT_CROSS_CHAPTER_SLIDE_MAX_CHARS = 760
 DEFAULT_CROSS_CHAPTER_SLIDE_MAX_VERSES = 9
 DEFAULT_LONG_RANGE_SLIDE_MAX_CHARS = 620
 DEFAULT_LONG_RANGE_SLIDE_MAX_VERSES = 7
+_LIVE_LATENCY_CONTEXT = threading.local()
 # Holyrics may acknowledge ShowQuickPresentation before GetCurrentPresentation
 # starts returning the new quick presentation.  During this short interval the
 # previous sermon-plan presentation is stale state, not a manual operator move.
@@ -403,6 +404,46 @@ def holyrics_diagnostic_event(args: Any, event: str, payload: dict[str, Any]) ->
         return
 
 
+def set_live_latency_context(trace: dict[str, Any] | None) -> None:
+    """Set timing context for Holyrics display calls on the current thread."""
+    _LIVE_LATENCY_CONTEXT.trace = trace
+
+
+def build_live_presentation_latency_event(
+    trace: dict[str, Any],
+    endpoint: str,
+    *,
+    completed_at: float,
+    api_elapsed_ms: float,
+) -> dict[str, Any] | None:
+    try:
+        callback_at = float(trace["audio_callback_monotonic"])
+        asr_final_at = float(trace["asr_final_monotonic"])
+        decision_ready_at = float(trace["decision_ready_monotonic"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    fields: dict[str, Any] = {
+        "endpoint": endpoint,
+        "reference": str(trace.get("reference") or ""),
+        "approval_id": str(trace.get("approval_id") or ""),
+        "approval_required": trace.get("approval_decided_monotonic") is not None,
+        "audio_callback_to_asr_final_ms": round((asr_final_at - callback_at) * 1000, 1),
+        "asr_final_to_decision_ready_ms": round((decision_ready_at - asr_final_at) * 1000, 1),
+        "decision_ready_to_holyrics_ack_ms": round((completed_at - decision_ready_at) * 1000, 1),
+        "audio_callback_to_holyrics_ack_ms": round((completed_at - callback_at) * 1000, 1),
+        "holyrics_api_elapsed_ms": round(float(api_elapsed_ms), 1),
+        "endpoint_semantics": "Holyrics API acknowledgement; physical display time is not observed",
+    }
+    queued_at = trace.get("approval_queued_monotonic")
+    decided_at = trace.get("approval_decided_monotonic")
+    if queued_at is not None and decided_at is not None:
+        fields["approval_queue_wait_ms"] = round(
+            (float(decided_at) - float(queued_at)) * 1000,
+            1,
+        )
+    return fields
+
+
 def safe_holyrics_response_body(body: str) -> Any:
     if not body:
         return ""
@@ -730,6 +771,8 @@ def post_holyrics_api(args: Any, base_url: str, endpoint: str, body: dict) -> tu
         response_body: str,
         http_status: int | None,
     ) -> tuple[bool, str, str]:
+        completed_at = time.monotonic()
+        elapsed_ms = round((completed_at - started_at) * 1000, 1)
         holyrics_diagnostic_event(
             args,
             "holyrics_api_response",
@@ -739,10 +782,28 @@ def post_holyrics_api(args: Any, base_url: str, endpoint: str, body: dict) -> tu
                 "ok": ok,
                 "reason": reason,
                 "http_status": http_status,
-                "elapsed_ms": round((time.monotonic() - started_at) * 1000, 1),
+                "elapsed_ms": elapsed_ms,
                 "response_body": safe_holyrics_response_body(response_body),
             },
         )
+        display_endpoints = {
+            "ShowQuickPresentation",
+            "ShowText",
+            "ShowVerse",
+            "ActionGoToIndex",
+            "ActionNext",
+            "ActionPrevious",
+        }
+        trace = getattr(_LIVE_LATENCY_CONTEXT, "trace", None)
+        if ok and endpoint in display_endpoints and isinstance(trace, dict):
+            fields = build_live_presentation_latency_event(
+                trace,
+                endpoint,
+                completed_at=completed_at,
+                api_elapsed_ms=elapsed_ms,
+            )
+            if fields is not None:
+                holyrics_diagnostic_event(args, "LIVE_PRESENTATION_LATENCY", fields)
         return ok, reason, response_body
 
     data = json.dumps(body, ensure_ascii=False).encode("utf-8")

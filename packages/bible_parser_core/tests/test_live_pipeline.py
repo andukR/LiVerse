@@ -34,6 +34,35 @@ from tools.holyrics import (
 
 
 class LiveReferencePipelineTest(unittest.TestCase):
+    def test_live_presentation_latency_reports_each_observable_stage(self):
+        from tools.holyrics import build_live_presentation_latency_event
+
+        fields = build_live_presentation_latency_event(
+            {
+                "audio_callback_monotonic": 10.0,
+                "asr_final_monotonic": 10.2,
+                "decision_ready_monotonic": 10.35,
+                "approval_queued_monotonic": 10.4,
+                "approval_decided_monotonic": 14.0,
+                "approval_id": "approval_00001",
+                "reference": "Иоанн 3:16",
+            },
+            "ShowQuickPresentation",
+            completed_at=15.0,
+            api_elapsed_ms=25.0,
+        )
+
+        self.assertIsNotNone(fields)
+        self.assertEqual("Иоанн 3:16", fields["reference"])
+        self.assertEqual("approval_00001", fields["approval_id"])
+        self.assertEqual(200.0, fields["audio_callback_to_asr_final_ms"])
+        self.assertEqual(150.0, fields["asr_final_to_decision_ready_ms"])
+        self.assertEqual(4650.0, fields["decision_ready_to_holyrics_ack_ms"])
+        self.assertEqual(5000.0, fields["audio_callback_to_holyrics_ack_ms"])
+        self.assertEqual(3600.0, fields["approval_queue_wait_ms"])
+        self.assertEqual(25.0, fields["holyrics_api_elapsed_ms"])
+        self.assertIn("physical display time is not observed", fields["endpoint_semantics"])
+
     def test_popup_approval_queue_keeps_asr_side_nonblocking_and_fifo(self):
         from tools.vosk_grammar_probe import JsonlLogger, PopupApprovalQueue
 
@@ -72,6 +101,72 @@ class LiveReferencePipelineTest(unittest.TestCase):
                 approval_queue.pump()
                 self.assertEqual(2, len(displayed))
                 self.assertIs(second, approval_queue.active)
+
+    def test_queued_popup_retries_focus_only_briefly_when_not_focused(self):
+        from tools.vosk_grammar_probe import schedule_popup_focus_retry
+
+        class FakeRoot:
+            def __init__(self):
+                self.after_calls = []
+
+            def after(self, delay, callback):
+                self.after_calls.append((delay, callback))
+
+        root = FakeRoot()
+        retries = []
+        self.assertTrue(
+            schedule_popup_focus_retry(
+                root,
+                retries.append,
+                focused=False,
+                retry_number=1,
+            )
+        )
+        self.assertEqual([200], [delay for delay, _callback in root.after_calls])
+        root.after_calls[0][1]()
+        self.assertEqual([2], retries)
+        self.assertFalse(
+            schedule_popup_focus_retry(
+                root,
+                retries.append,
+                focused=True,
+                retry_number=1,
+            )
+        )
+        self.assertFalse(
+            schedule_popup_focus_retry(
+                root,
+                retries.append,
+                focused=False,
+                retry_number=4,
+            )
+        )
+
+    def test_performance_diagnostics_write_to_separate_optional_log(self):
+        import json
+
+        from tools.vosk_grammar_probe import JsonlLogger
+
+        with tempfile.TemporaryDirectory() as temporary:
+            logger = JsonlLogger(Path(temporary))
+            logger.write("ordinary_event", {"value": 1})
+            logger.write_performance("LIVE_PROCESSING_TIMING", {"process_cpu_percent": 12.5})
+
+            self.assertEqual(
+                "ordinary_event",
+                json.loads((logger.run_dir / "events.jsonl").read_text(encoding="utf-8"))["event"],
+            )
+            performance = json.loads(
+                (logger.run_dir / "performance.jsonl").read_text(encoding="utf-8")
+            )
+            self.assertEqual("LIVE_PROCESSING_TIMING", performance["event"])
+            self.assertEqual(12.5, performance["process_cpu_percent"])
+
+    def test_system_cpu_sample_calculates_delta_without_a_background_sampler(self):
+        from tools.vosk_grammar_probe import system_cpu_percent_between
+
+        self.assertEqual(25.0, system_cpu_percent_between((100, 60), (200, 135)))
+        self.assertIsNone(system_cpu_percent_between(None, (200, 135)))
 
     def test_popup_queue_confirms_references_individually_then_builds_list(self):
         from tools.vosk_grammar_probe import JsonlLogger, PopupApprovalQueue
@@ -164,9 +259,18 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertIn("--smart-slide-streaming-control", command)
         self.assertNotIn("--no-smart-slide-streaming-control", command)
         self.assertIn("--text-operator-hints", command)
+        self.assertIn("--no-performance-diagnostics", command)
         self.assertEqual("640", command[command.index("--popup-anchor-x") + 1])
         self.assertEqual("360", command[command.index("--popup-anchor-y") + 1])
         self.assertNotIn("secret-token", command)
+
+        diagnostic_command = engine_command(
+            GuiConfig(performance_diagnostics=True),
+            project_root=Path("C:/LiVerse"),
+            python_executable="pythonw.exe",
+        )
+        self.assertIn("--performance-diagnostics", diagnostic_command)
+        self.assertNotIn("--no-performance-diagnostics", diagnostic_command)
 
     def test_packaged_gui_engine_command_uses_sibling_executable(self):
         from tools.liverse_gui import GuiConfig, engine_command
@@ -210,6 +314,20 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertLess(audio_level_percent(300), audio_level_percent(3000))
         self.assertLess(audio_level_percent(3000), audio_level_percent(30000))
         self.assertEqual(100, audio_level_percent(32767))
+
+    def test_pipeline_can_report_parse_and_rule_risk_timings_on_request(self):
+        pipeline = LiveReferencePipeline()
+        timings = {}
+
+        result = pipeline.process_text(
+            "Иоанн третья глава шестнадцатый стих",
+            timing=timings,
+        )
+
+        self.assertEqual("Иоанн 3:16", result.get("parsed", {}).get("ref"))
+        self.assertGreaterEqual(timings["reference_parse_ms"], 0.0)
+        self.assertGreaterEqual(timings["rule_risk_ms"], 0.0)
+        self.assertGreaterEqual(timings["pipeline_total_ms"], 0.0)
 
     def test_missing_chapter_is_not_invented_from_distorted_deuteronomy(self):
         pipeline = LiveReferencePipeline()
@@ -436,14 +554,21 @@ class LiveReferencePipelineTest(unittest.TestCase):
                 '{"command":"liverse --holyrics-token private", "token":"private"}\n',
                 encoding="utf-8",
             )
+            (newer / "performance.jsonl").write_text(
+                '{"event":"LIVE_PROCESSING_TIMING","process_cpu_percent":12.5}\n',
+                encoding="utf-8",
+            )
             (newer / "audio.wav").write_bytes(b"audio")
             (newer / ".env").write_text("HOLYRICS_TOKEN=secret\n", encoding="utf-8")
             destination = root / "logs.zip"
 
             self.assertEqual([newer, older], list_log_sessions(root))
-            self.assertEqual(1, create_log_archive([newer], destination))
+            self.assertEqual(2, create_log_archive([newer], destination))
             with zipfile.ZipFile(destination) as archive:
-                self.assertEqual([f"{newer.name}/session.json"], archive.namelist())
+                self.assertEqual(
+                    [f"{newer.name}/session.json", f"{newer.name}/performance.jsonl"],
+                    archive.namelist(),
+                )
                 exported = archive.read(archive.namelist()[0]).decode("utf-8")
                 self.assertNotIn("private", exported)
                 self.assertIn("[скрыто]", exported)
@@ -473,6 +598,8 @@ class LiveReferencePipelineTest(unittest.TestCase):
         )
 
     def test_holyrics_api_diagnostics_include_request_and_full_response_without_token(self):
+        from tools.holyrics import set_live_latency_context
+
         events: list[tuple[str, dict]] = []
         args = SimpleNamespace(
             holyrics_token="private-token",
@@ -492,30 +619,48 @@ class LiveReferencePipelineTest(unittest.TestCase):
             def read(self):
                 return b'{"status":"ok","data":{"id":"theme-1","token":"response-secret"}}'
 
-        with patch("tools.holyrics.request.urlopen", return_value=Response()) as urlopen:
-            ok, reason, response = post_holyrics_api(
-                args,
-                "http://127.0.0.1:8091",
-                "ShowQuickPresentation",
-                {
-                    "slides": [
-                        {"text": "Иоанн 3:16", "theme": {"id": "theme-1"}}
-                    ],
-                    "diagnostic_note": "must also hide private-token here",
-                },
-            )
+        set_live_latency_context(
+            {
+                "audio_callback_monotonic": 10.0,
+                "asr_final_monotonic": 10.1,
+                "decision_ready_monotonic": 10.2,
+                "reference": "Иоанн 3:16",
+            }
+        )
+        try:
+            with patch("tools.holyrics.request.urlopen", return_value=Response()) as urlopen:
+                ok, reason, response = post_holyrics_api(
+                    args,
+                    "http://127.0.0.1:8091",
+                    "ShowQuickPresentation",
+                    {
+                        "slides": [
+                            {"text": "Иоанн 3:16", "theme": {"id": "theme-1"}}
+                        ],
+                        "diagnostic_note": "must also hide private-token here",
+                    },
+                )
+        finally:
+            set_live_latency_context(None)
 
         self.assertTrue(ok)
         self.assertEqual("", reason)
         self.assertIn('"status":"ok"', response)
-        self.assertEqual(["holyrics_api_request", "holyrics_api_response"], [item[0] for item in events])
+        self.assertEqual(
+            ["holyrics_api_request", "holyrics_api_response", "LIVE_PRESENTATION_LATENCY"],
+            [item[0] for item in events],
+        )
         request_event = events[0][1]
         response_event = events[1][1]
+        latency_event = events[2][1]
         self.assertEqual("ShowQuickPresentation", request_event["endpoint"])
         self.assertEqual("theme-1", request_event["request_body"]["slides"][0]["theme"]["id"])
         self.assertIn("[скрыто]", request_event["request_body"]["diagnostic_note"])
         self.assertNotIn("token", request_event["base_url"])
         self.assertEqual(200, response_event["http_status"])
+        self.assertEqual("Иоанн 3:16", latency_event["reference"])
+        self.assertEqual("ShowQuickPresentation", latency_event["endpoint"])
+        self.assertIn("physical display time is not observed", latency_event["endpoint_semantics"])
         self.assertEqual("[скрыто]", response_event["response_body"]["data"]["token"])
         self.assertNotIn("private-token", str(events))
         self.assertNotIn("private-token", urlopen.call_args.args[0].full_url.split("?")[0])
@@ -4722,6 +4867,70 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertEqual("обычная пята попытка", normalize_text("обычная пята попытка"))
 
+    def test_split_ordinal_before_verse_marker_restores_third_list_reference(self):
+        from bible_parser_core.live_pipeline import resolve_reference_payload
+
+        text = (
+            "матфея пятая глава седьмой стих матфея шестая глава третий стих "
+            "и матфея седьмая глава восьм ой стих"
+        )
+        result = resolve_reference_payload(text)
+
+        self.assertEqual(
+            ["Матфей 5:7", "Матфей 6:3", "Матфей 7:8"],
+            [item["ref"] for item in result["reference_list"]],
+        )
+        self.assertEqual("восьм ой день", normalize_text("восьм ой день"))
+
+    def test_fused_verse_marker_and_mark_book_do_not_hide_middle_list_item(self):
+        from bible_parser_core.live_pipeline import resolve_reference_payload
+
+        text = (
+            "итак марка третья глава пятый стихмарка четвёртая глава "
+            "шестой стих марка пятая глава седьмой стих"
+        )
+        result = resolve_reference_payload(text)
+
+        self.assertEqual(
+            ["Марк 3:5", "Марк 4:6", "Марк 5:7"],
+            [item["ref"] for item in result["reference_list"]],
+        )
+
+    def test_truncated_tenth_verse_is_retained_as_third_list_item(self):
+        from bible_parser_core.live_pipeline import resolve_reference_payload
+
+        text = (
+            "иакова третья глава восьмой стих иакова четвёртая глава девятый стих "
+            "и иакова пятая глава десят стих"
+        )
+        result = resolve_reference_payload(text)
+
+        self.assertEqual(
+            ["Иаков 3:8", "Иаков 4:9", "Иаков 5:10"],
+            [item["ref"] for item in result["reference_list"]],
+        )
+
+    def test_verse_range_without_recovered_chapter_does_not_default_to_chapter_one(self):
+        for text in (
+            "книга пророка истая глава с первого по третий стих",
+            "книга пророка исаии глава с первого по третий стих",
+            "книга пророка исаии с первого по третий стих",
+        ):
+            with self.subTest(text=text):
+                result = LiveReferencePipeline().process_text(text)
+                self.assertIsNone(result.get("parsed"))
+                self.assertFalse(result.get("matched"))
+
+        explicit = LiveReferencePipeline().process_text(
+            "книга пророка исаии шестая глава с первого по третий стих"
+        )
+        self.assertEqual("Исаия 6:1-3", explicit.get("parsed", {}).get("ref"))
+
+    def test_trailing_book_name_starts_next_reference_instead_of_stealing_numbers(self):
+        result = LiveReferencePipeline().process_text("ивана три шестнадцать лука")
+
+        self.assertEqual("Иоанн 3:16", result.get("parsed", {}).get("ref"))
+
     def test_masculine_asr_forms_restore_feminine_chapter_context(self):
         for distorted, expected in (
             ("возьмого", "Исаия 58:3"),
@@ -5025,6 +5234,18 @@ class LiveReferencePipelineTest(unittest.TestCase):
         )
 
         self.assertEqual("Деяния 2:44", result.get("parsed", {}).get("ref"))
+
+    def test_apostolov_without_deyaniya_is_book_only_in_full_address_context(self):
+        pipeline = LiveReferencePipeline()
+
+        result = pipeline.process_text(
+            "апостолов в первую главу восьмой стих и когда примете силу блоха святого"
+        )
+
+        self.assertEqual("Деяния 1:8", result.get("parsed", {}).get("ref"))
+
+        ordinary = pipeline.process_text("история апостолов в первую главу книги")
+        self.assertFalse(ordinary.get("matched"))
 
     def test_confusable_thirteen_thirty_chapter_adds_existing_alternative(self):
         pipeline = LiveReferencePipeline()

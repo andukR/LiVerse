@@ -98,6 +98,7 @@ from tools.holyrics import (
     scripture_range,
     scripture_range_reading_active,
     sync_scripture_range_reading,
+    set_live_latency_context,
     temporary_verse_display_active,
     post_holyrics_update,
     format_missing_holyrics_permissions,
@@ -270,6 +271,7 @@ def save_startup_settings(args: argparse.Namespace) -> None:
         "smart_slide_streaming_control": bool(
             getattr(args, "smart_slide_streaming_control", False)
         ),
+        "performance_diagnostics": bool(getattr(args, "performance_diagnostics", False)),
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -399,6 +401,7 @@ class JsonlLogger:
         self.run_dir = log_dir / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.events_path = self.run_dir / "events.jsonl"
+        self.performance_path = self.run_dir / "performance.jsonl"
 
     def write(self, event: str, payload: dict) -> None:
         if not self.enabled or self.events_path is None:
@@ -411,6 +414,19 @@ class JsonlLogger:
         with self._write_lock:
             with self.events_path.open("a", encoding="utf-8") as file:
                 file.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    def write_performance(self, event: str, payload: dict) -> None:
+        if not self.enabled or self.run_dir is None:
+            return
+        row = {
+            "ts": datetime.now().isoformat(timespec="milliseconds"),
+            "event": event,
+            **payload,
+        }
+        with self._write_lock:
+            with (self.run_dir / "performance.jsonl").open("a", encoding="utf-8") as file:
+                file.write(json.dumps(row, ensure_ascii=False) + "\n")
+
 
     def write_session(self, payload: dict) -> None:
         if not self.enabled or self.run_dir is None:
@@ -464,6 +480,59 @@ class JsonlLogger:
                     encoding="utf-8",
                 )
                 os.replace(temporary, path)
+
+
+def system_cpu_snapshot() -> tuple[int, int] | None:
+    """Return cumulative (total, idle) CPU ticks without polling or dependencies."""
+    if sys.platform.startswith("linux"):
+        try:
+            fields = Path("/proc/stat").read_text(encoding="ascii").splitlines()[0].split()
+            values = [int(value) for value in fields[1:]]
+            idle = values[3] + (values[4] if len(values) > 4 else 0)
+            return sum(values), idle
+        except (OSError, ValueError, IndexError):
+            return None
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            class FileTime(ctypes.Structure):
+                _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+            idle = FileTime()
+            kernel = FileTime()
+            user = FileTime()
+            get_times = ctypes.WinDLL("kernel32", use_last_error=True).GetSystemTimes
+            get_times.argtypes = [
+                ctypes.POINTER(FileTime),
+                ctypes.POINTER(FileTime),
+                ctypes.POINTER(FileTime),
+            ]
+            get_times.restype = ctypes.c_int
+            if not get_times(ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)):
+                return None
+
+            def ticks(value: FileTime) -> int:
+                return (int(value.high) << 32) | int(value.low)
+
+            idle_ticks = ticks(idle)
+            return ticks(kernel) + ticks(user), idle_ticks
+        except (AttributeError, OSError):
+            return None
+    return None
+
+
+def system_cpu_percent_between(
+    earlier: tuple[int, int] | None,
+    later: tuple[int, int] | None,
+) -> float | None:
+    if earlier is None or later is None:
+        return None
+    total_delta = later[0] - earlier[0]
+    idle_delta = later[1] - earlier[1]
+    if total_delta <= 0:
+        return None
+    return round(max(0.0, min(100.0, (total_delta - idle_delta) * 100.0 / total_delta)), 1)
 
 
 def holyrics_output_enabled(args: argparse.Namespace) -> bool:
@@ -1019,6 +1088,14 @@ def popup_tk_window(tk, title: str, *, show: bool = True):
     return root
 
 
+def schedule_popup_focus_retry(root, callback, *, focused: bool, retry_number: int) -> bool:
+    """Schedule bounded refocus attempts while a queued window is being mapped."""
+    if focused or retry_number >= 4:
+        return False
+    root.after(200, lambda: callback(retry_number + 1))
+    return True
+
+
 def windows_popup_focus_actions(window: int, *, user32, kernel32) -> dict:
     """Ask Windows to give a popup's top-level window the real input focus.
 
@@ -1538,6 +1615,8 @@ def apply_saved_startup_settings(args: argparse.Namespace, settings: dict) -> No
             args.long_range_slide_mode = slide_mode
     if not setting_was_explicit("--long-range-operator-hints"):
         args.long_range_operator_hints = bool(settings.get("long_range_operator_hints", False))
+    if not setting_was_explicit("--performance-diagnostics", "--no-performance-diagnostics"):
+        args.performance_diagnostics = bool(settings.get("performance_diagnostics", False))
 
 
 def configure_interactive_approval_mode(args: argparse.Namespace) -> None:
@@ -1680,6 +1759,20 @@ def add_slide_payload(payload: dict) -> dict:
 READING_LIST_CONTINUATION_SECONDS = 2.0
 
 
+def reading_list_clock(asr_result: dict | None, fallback: float | None = None) -> tuple[float, str]:
+    """Use speech timestamps when available so CPU delays do not close lists."""
+    words = asr_result.get("result") if isinstance(asr_result, dict) else None
+    if isinstance(words, list):
+        ends = [
+            float(word["end"])
+            for word in words
+            if isinstance(word, dict) and isinstance(word.get("end"), (int, float))
+        ]
+        if ends:
+            return max(ends), "audio"
+    return (time.monotonic() if fallback is None else float(fallback)), "monotonic"
+
+
 def _reference_list_continuation_item(payload: dict, accumulated: list[dict]) -> dict | None:
     """Resolve an explicit next address, using a single-book list as context."""
     current_text = str(payload.get("vosk_text") or payload.get("text") or "").strip()
@@ -1772,11 +1865,17 @@ def accumulate_reading_list(
     accumulated: list[dict],
     *,
     now: float | None = None,
+    clock_basis: str = "monotonic",
     state: dict | None = None,
 ) -> dict:
     """Collect a live reference list and immediate continuations for two seconds."""
     current_time = time.monotonic() if now is None else float(now)
     collection_state = state if state is not None else {}
+    previous_clock_basis = collection_state.get("clock_basis")
+    if accumulated and previous_clock_basis and previous_clock_basis != clock_basis:
+        accumulated.clear()
+        collection_state["last_item_time"] = None
+        collection_state["collection_id"] = None
     last_item_time = collection_state.get("last_item_time")
     if accumulated and (
         last_item_time is None
@@ -1785,6 +1884,7 @@ def accumulate_reading_list(
         accumulated.clear()
         collection_state["last_item_time"] = None
         collection_state["collection_id"] = None
+    collection_state["clock_basis"] = clock_basis
 
     reference_list = payload.get("reference_list")
     is_list_slide = bool(
@@ -2406,15 +2506,43 @@ def popup_approval_decision(slide: dict, *, event_callback=None, on_decision=Non
         root.focus_force()
         approve.focus_set()
         approve.focus_force()
-        write_popup_event("focus_claim", attempt=attempt, native=native_focus)
+        focused_widget = None
+        focused = False
+        try:
+            focused_widget = root.focus_displayof()
+            focused = bool(
+                focused_widget is not None
+                and focused_widget.winfo_toplevel() == root
+            )
+        except Exception:
+            pass
+        write_popup_event(
+            "focus_claim",
+            attempt=attempt,
+            native=native_focus,
+            focused=focused,
+            focused_widget=(str(focused_widget) if focused_widget is not None else ""),
+        )
+        # Window managers can refuse the first focus request while an
+        # asynchronously queued popup is being mapped. Retry briefly, but do
+        # not keep stealing focus after the operator has had time to act.
+        try:
+            retry = int(attempt.rsplit("_", 1)[-1])
+        except (TypeError, ValueError):
+            retry = 0
+        schedule_popup_focus_retry(
+            root,
+            lambda next_retry: claim_keyboard_focus(f"queue_retry_{next_retry}"),
+            focused=focused,
+            retry_number=retry,
+        )
 
     # Do not expose a reused window at its old coordinates. It becomes
     # visible only after the operator-monitor geometry and keyboard bindings
     # are complete.
     root.deiconify()
     close_if_superseded_job = root.after(100, close_if_superseded)
-    root.after_idle(lambda: claim_keyboard_focus("idle"))
-    root.after(100, lambda: claim_keyboard_focus("retry_100ms"))
+    root.after(100, lambda: claim_keyboard_focus("queue_retry_0"))
     if on_decision is None:
         root.wait_variable(closed)
     return decision["action"]
@@ -2749,6 +2877,8 @@ class PopupApprovalQueue:
                         candidate[key] = payload[key]
                 candidate["reference_list_collection_id"] = collection_id
                 candidate["_source_payload"] = payload
+                if isinstance(payload.get("_live_latency_trace"), dict):
+                    candidate["_live_latency_trace"] = dict(payload["_live_latency_trace"])
                 candidate = add_slide_payload(candidate)
                 self._enqueue_one(args, candidate)
                 added += 1
@@ -2766,6 +2896,11 @@ class PopupApprovalQueue:
         self.next_id += 1
         payload["approval_id"] = approval_id
         payload["_approval_args"] = args
+        latency_trace = payload.get("_live_latency_trace")
+        if isinstance(latency_trace, dict):
+            latency_trace["approval_queued_monotonic"] = time.monotonic()
+            latency_trace["approval_id"] = approval_id
+            latency_trace["reference"] = str((payload.get("slide") or {}).get("ref") or "")
         source_payload = payload.get("_source_payload", payload)
         source_payload.setdefault("approval_ids", []).append(approval_id)
         self.pending.append(payload)
@@ -2792,6 +2927,13 @@ class PopupApprovalQueue:
             self.active = payload
 
             def decided(action: str, item=payload) -> None:
+                approval_decided_at = time.monotonic()
+                latency_trace = item.get("_live_latency_trace")
+                if isinstance(latency_trace, dict):
+                    latency_trace["approval_decided_monotonic"] = approval_decided_at
+                    latency_trace["approval_id"] = str(item.get("approval_id") or "")
+                    latency_trace["reference"] = str((item.get("slide") or {}).get("ref") or "")
+                    set_live_latency_context(latency_trace)
                 list_id = str(item.get("reference_list_collection_id") or "")
                 item_ref = str((item.get("slide") or {}).get("ref") or "")
                 if list_id and action in {"approve", "approve_context"} or (
@@ -3296,6 +3438,11 @@ def log_live_streaming_alignment(
         and targets
         and current_index == len(targets) - 1
     ):
+        latency_trace = getattr(args, "_active_live_latency_trace", None)
+        if isinstance(latency_trace, dict):
+            latency_trace["decision_ready_monotonic"] = time.monotonic()
+            latency_trace["reference"] = str(state.get("ref") or "")
+            set_live_latency_context(latency_trace)
         target = targets[current_index]
         completion = handle_scripture_range_reading_match(
             args,
@@ -3346,6 +3493,11 @@ def log_live_streaming_alignment(
         and alignment.proposed_index > int(state.get("current_index") or 0)
     ):
         previous_index = int(state.get("current_index") or 0)
+        latency_trace = getattr(args, "_active_live_latency_trace", None)
+        if isinstance(latency_trace, dict):
+            latency_trace["decision_ready_monotonic"] = time.monotonic()
+            latency_trace["reference"] = str(state.get("ref") or "")
+            set_live_latency_context(latency_trace)
         ok, reason = apply_scripture_range_operator_hint(
             args,
             "apply",
@@ -3384,7 +3536,7 @@ def run_microphone(args: argparse.Namespace) -> int:
     if args.asr_engine == "vosk-0.22":
         from vosk import KaldiRecognizer, Model, SetLogLevel
 
-    audio_queue: queue.Queue[bytes] = queue.Queue()
+    audio_queue: queue.Queue[tuple[bytes, float]] = queue.Queue()
     console = ConsoleStatus(debug=args.debug_console)
     session_refs: list[dict] = []
     address_detection_enabled = args.citation_detection_mode != "text_only"
@@ -3421,6 +3573,9 @@ def run_microphone(args: argparse.Namespace) -> int:
             "blocksize": args.blocksize,
             "device": args.device,
             "open_vocabulary": args.open_vocabulary,
+            "performance_diagnostics": bool(
+                getattr(args, "performance_diagnostics", False)
+            ),
             "citation_detection_mode": args.citation_detection_mode,
             "text_detection_db": str(args.text_detection_db) if text_detection_enabled else None,
             "vosk_buffer_parts": args.vosk_buffer_parts,
@@ -3508,7 +3663,7 @@ def run_microphone(args: argparse.Namespace) -> int:
     if logger.run_dir and args.print_log_path:
         print(f"Vosk log: {logger.run_dir / 'events.jsonl'}")
 
-    def callback(indata, frames, time, status):
+    def callback(indata, frames, stream_time, status):
         if status:
             print(status, file=sys.stderr)
             logger.write("audio_status", {"status": str(status)})
@@ -3522,7 +3677,7 @@ def run_microphone(args: argparse.Namespace) -> int:
             audio_stats["chunks"] += 1
         except Exception:
             pass
-        audio_queue.put(data)
+        audio_queue.put((data, time.monotonic()))
 
     pipeline = LiveReferencePipeline(args.bible, buffer_parts=args.vosk_buffer_parts)
     setattr(args, "_live_reference_pipeline", pipeline)
@@ -3748,11 +3903,12 @@ def run_microphone(args: argparse.Namespace) -> int:
                     stop_action = consume_stop_request(args.stop_file)
                     if stop_action:
                         raise GracefulStopRequested(stop_action)
+                    set_live_latency_context(None)
                     approval_queue = getattr(args, "_popup_approval_queue", None)
                     if approval_queue is not None:
                         approval_queue.pump()
                     try:
-                        data = audio_queue.get(timeout=0.25)
+                        data, audio_callback_monotonic = audio_queue.get(timeout=0.25)
                     except queue.Empty:
                         continue
                     if audio_log:
@@ -3767,6 +3923,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                         last_audio_level_at = now
                     if recognizer.AcceptWaveform(data):
                         result = json.loads(recognizer.Result())
+                        asr_final_monotonic = time.monotonic()
                         text = result.get("text", "").strip()
                         last_streaming_partial = ""
                         final_audio_stats = dict(audio_stats)
@@ -3774,9 +3931,40 @@ def run_microphone(args: argparse.Namespace) -> int:
                         audio_stats["peak"] = 0
                         logger.write(
                             "final_raw",
-                            {"result": result, "text": text, "audio": final_audio_stats},
+                            {
+                                "result": result,
+                                "text": text,
+                                "audio": final_audio_stats,
+                                "live_timing": {
+                                    "audio_callback_to_asr_final_ms": round(
+                                        (asr_final_monotonic - audio_callback_monotonic) * 1000,
+                                        1,
+                                    ),
+                                },
+                            },
                         )
                         if text:
+                            performance_enabled = bool(
+                                getattr(args, "performance_diagnostics", False)
+                                and logger.enabled
+                            )
+                            post_asr_started = (
+                                time.perf_counter() if performance_enabled else None
+                            )
+                            process_cpu_started = (
+                                time.process_time() if performance_enabled else None
+                            )
+                            system_cpu_started = (
+                                system_cpu_snapshot() if performance_enabled else None
+                            )
+                            pipeline_timings: dict[str, float] = {}
+                            latency_trace = {
+                                "audio_callback_monotonic": audio_callback_monotonic,
+                                "asr_final_monotonic": asr_final_monotonic,
+                                "decision_ready_monotonic": asr_final_monotonic,
+                            }
+                            setattr(args, "_active_live_latency_trace", latency_trace)
+                            set_live_latency_context(latency_trace)
                             print(f"Распознано: {text}", flush=True)
                             empty_final_count = 0
                             console.status("распознаю")
@@ -3798,11 +3986,16 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 recognition_time=recognition_time,
                                 text_detector=text_detector,
                             )
+                            list_clock_time, list_clock_basis = reading_list_clock(
+                                result,
+                                fallback=recognition_time,
+                            )
                             last_list_item_time = reading_list_state.get("last_item_time")
                             list_collection_active = bool(
                                 reading_list
                                 and last_list_item_time is not None
-                                and recognition_time - float(last_list_item_time)
+                                and reading_list_state.get("clock_basis") == list_clock_basis
+                                and list_clock_time - float(last_list_item_time)
                                 <= READING_LIST_CONTINUATION_SECONDS
                             )
                             if citation_recognition_paused(
@@ -3830,11 +4023,20 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 address_detection_enabled,
                                 long_passage_reading,
                             ):
+                                parser_call_started = (
+                                    time.perf_counter() if performance_enabled else None
+                                )
                                 pipeline_payload = pipeline.process_text(
                                     text,
                                     asr_result=result,
                                     show_candidates=args.show_candidates,
+                                    timing=pipeline_timings if performance_enabled else None,
                                 )
+                                if performance_enabled and parser_call_started is not None:
+                                    pipeline_timings["pipeline_call_ms"] = round(
+                                        (time.perf_counter() - parser_call_started) * 1000.0,
+                                        3,
+                                    )
                             else:
                                 pipeline_payload = {
                                     "text": text,
@@ -3920,6 +4122,9 @@ def run_microphone(args: argparse.Namespace) -> int:
                                     args,
                                     plan_match,
                                 )
+                                latency_trace["decision_ready_monotonic"] = time.monotonic()
+                                latency_trace["reference"] = f"План: слайд {plan_match['slide_number']}"
+                                set_live_latency_context(latency_trace)
                                 if text_detector is not None:
                                     text_detector.clear()
                                 if plan_requires_approval:
@@ -4112,6 +4317,9 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 and not getattr(args, "smart_slide_streaming_control", False)
                                 and text_decision_ready_for_scripture_range(text_decision)
                             ):
+                                latency_trace["decision_ready_monotonic"] = time.monotonic()
+                                latency_trace["reference"] = str(text_decision.reference or "")
+                                set_live_latency_context(latency_trace)
                                 range_reading_action = handle_scripture_range_reading_match(
                                     args,
                                     text_decision.top_candidate,
@@ -4182,14 +4390,88 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 payload = add_slide_payload(pipeline_payload)
                             reading_list_before = [dict(item) for item in reading_list]
                             reading_list_state_before = dict(reading_list_state)
+                            list_clock_time, list_clock_basis = reading_list_clock(
+                                result,
+                                fallback=time.monotonic(),
+                            )
                             accumulate_reading_list(
                                 payload,
                                 reading_list,
-                                now=time.monotonic(),
+                                now=list_clock_time,
+                                clock_basis=list_clock_basis,
                                 state=reading_list_state,
                             )
                             payload["asr"] = result
+                            ml_risk_started = (
+                                time.perf_counter() if performance_enabled else None
+                            )
                             apply_ml_risk(output_args, payload, asr_result=result)
+                            decision_ready_monotonic = time.monotonic()
+                            if performance_enabled and post_asr_started is not None:
+                                post_asr_total_ms = (time.perf_counter() - post_asr_started) * 1000.0
+                                ml_risk_ms = (
+                                    (time.perf_counter() - ml_risk_started) * 1000.0
+                                    if ml_risk_started is not None
+                                    else 0.0
+                                )
+                                pipeline_call_ms = float(
+                                    pipeline_timings.get("pipeline_call_ms") or 0.0
+                                )
+                                process_cpu_ms = (
+                                    (time.process_time() - process_cpu_started) * 1000.0
+                                    if process_cpu_started is not None
+                                    else 0.0
+                                )
+                                system_cpu_percent = system_cpu_percent_between(
+                                    system_cpu_started,
+                                    system_cpu_snapshot(),
+                                )
+                                logger.write_performance(
+                                    "LIVE_PROCESSING_TIMING",
+                                    {
+                                        "reference": str(
+                                            (payload.get("slide") or {}).get("ref") or ""
+                                        ),
+                                        "source": str(payload.get("source") or ""),
+                                        "asr_final_to_decision_ready_ms": round(
+                                            post_asr_total_ms, 3
+                                        ),
+                                        "reference_parse_ms": pipeline_timings.get(
+                                            "reference_parse_ms", 0.0
+                                        ),
+                                        "rule_risk_ms": pipeline_timings.get(
+                                            "rule_risk_ms", 0.0
+                                        ),
+                                        "pipeline_total_ms": pipeline_timings.get(
+                                            "pipeline_total_ms", 0.0
+                                        ),
+                                        "pipeline_call_ms": round(pipeline_call_ms, 3),
+                                        "ml_risk_ms": round(ml_risk_ms, 3),
+                                        "other_post_asr_ms": round(
+                                            max(0.0, post_asr_total_ms - pipeline_call_ms - ml_risk_ms),
+                                            3,
+                                        ),
+                                        "process_cpu_ms": round(process_cpu_ms, 3),
+                                        "process_cpu_percent": round(
+                                            process_cpu_ms / post_asr_total_ms * 100.0
+                                            if post_asr_total_ms > 0
+                                            else 0.0,
+                                            1,
+                                        ),
+                                        "system_cpu_percent": system_cpu_percent,
+                                        "audio_queue_items": audio_queue.qsize(),
+                                        "process_cpu_percent_scope": "LiVerse process; may exceed 100 with multiple busy threads",
+                                        "system_cpu_percent_scope": "whole system during post-ASR processing interval",
+                                    },
+                                )
+                            latency_trace.update(
+                                {
+                                    "decision_ready_monotonic": decision_ready_monotonic,
+                                    "reference": str((payload.get("slide") or {}).get("ref") or ""),
+                                }
+                            )
+                            payload["_live_latency_trace"] = latency_trace
+                            set_live_latency_context(latency_trace)
                             if operator_completed_payload is not None:
                                 payload["output"] = publish_after_approval(output_args, payload)
                             else:
@@ -4445,6 +4727,19 @@ def main() -> int:
         help="Exit cleanly when this local control file appears.",
     )
     parser.add_argument("--no-log", action="store_true", help="Disable JSONL logging.")
+    performance_group = parser.add_mutually_exclusive_group()
+    performance_group.add_argument(
+        "--performance-diagnostics",
+        dest="performance_diagnostics",
+        action="store_true",
+        help="Log per-result processing stage timings and LiVerse process CPU usage.",
+    )
+    performance_group.add_argument(
+        "--no-performance-diagnostics",
+        dest="performance_diagnostics",
+        action="store_false",
+        help="Disable optional processing timing and CPU diagnostics.",
+    )
     parser.add_argument("--log-partials", action="store_true", help="Log Vosk partial results too.")
     parser.add_argument(
         "--log-audio",
@@ -4616,6 +4911,7 @@ def main() -> int:
         session_summary_popup=True,
         log_audio=True,
         smart_slide_streaming_control=False,
+        performance_diagnostics=None,
     )
     args = parser.parse_args()
     if args.smart_slide_streaming_shadow and args.smart_slide_streaming_control:

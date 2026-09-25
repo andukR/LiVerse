@@ -2931,7 +2931,9 @@ class LiveReferencePipeline:
         asr_result: dict | None = None,
         show_candidates: bool = False,
         now_ms: int | float | None = None,
+        timing: dict[str, float] | None = None,
     ) -> dict:
+        process_started = time.perf_counter() if timing is not None else 0.0
         text = re.sub(r"\s+", " ", (text or "")).strip()
         if not text:
             return resolve_reference_payload("", bible_path=self.bible_path, show_candidates=show_candidates)
@@ -2996,6 +2998,7 @@ class LiveReferencePipeline:
         if detected_book_chapter_context:
             self.book_chapter_context = detected_book_chapter_context
             self.book_chapter_context_at_ms = current_ms
+        parse_started = time.perf_counter() if timing is not None else 0.0
         payload = parsed_payload_from_candidates(
             candidate_texts,
             bible_path=self.bible_path,
@@ -3093,6 +3096,11 @@ class LiveReferencePipeline:
         )
         if context_payload and not keep_explicit_buffered_reference:
             payload = context_payload
+        if timing is not None:
+            timing["reference_parse_ms"] = round(
+                (time.perf_counter() - parse_started) * 1000.0,
+                3,
+            )
         payload["vosk_text"] = text
         payload["vosk_buffer"] = list(self.text_buffer.parts)
         payload["candidate_texts"] = candidate_texts
@@ -3102,7 +3110,13 @@ class LiveReferencePipeline:
         payload["buffer_reset_by_gap"] = buffer_reset_by_gap
         payload["buffer_kept_for_incomplete_address"] = incomplete_address_carried
         payload["book_chapter_context"] = dict(self.book_chapter_context or {})
+        risk_started = time.perf_counter() if timing is not None else 0.0
         add_risk_score(payload, asr_result=asr_result)
+        if timing is not None:
+            timing["rule_risk_ms"] = round(
+                (time.perf_counter() - risk_started) * 1000.0,
+                3,
+            )
         if payload.get("blocked_weak_context") == "incomplete_first_verse_after_chapter":
             payload["buffer_kept_for_open_range"] = True
         if payload.get("parsed"):
@@ -3120,4 +3134,9 @@ class LiveReferencePipeline:
             else:
                 self.text_buffer.clear()
                 payload["buffer_cleared_after_match"] = True
+        if timing is not None:
+            timing["pipeline_total_ms"] = round(
+                (time.perf_counter() - process_started) * 1000.0,
+                3,
+            )
         return payload

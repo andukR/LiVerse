@@ -2510,6 +2510,55 @@ class TextCitationIntegrationTest(unittest.TestCase):
         self.assertEqual("reference_list", third["slide"]["slide_type"])
         self.assertTrue(third["reference_list_updated"])
 
+    def test_reading_list_uses_audio_clock_when_asr_processing_is_delayed(self) -> None:
+        from tools.vosk_grammar_probe import (
+            accumulate_reading_list,
+            add_slide_payload,
+            reading_list_clock,
+        )
+
+        first_result = {"result": [{"start": 10.0, "end": 10.4}]}
+        delayed_result = {"result": [{"start": 10.35, "end": 10.8}]}
+        first_clock = reading_list_clock(first_result, fallback=100.0)
+        delayed_clock = reading_list_clock(delayed_result, fallback=104.0)
+        self.assertEqual((10.4, "audio"), first_clock)
+        self.assertEqual((10.8, "audio"), delayed_clock)
+
+        accumulated: list[dict] = []
+        state: dict = {}
+        first = add_slide_payload({
+            "text": "притчи первая глава десятый стих и вторая глава тринадцатый стих",
+            "reference_list": [
+                {"ref": "Притчи 1:10"},
+                {"ref": "Притчи 2:13"},
+            ],
+        })
+        accumulate_reading_list(
+            first,
+            accumulated,
+            now=first_clock[0],
+            clock_basis=first_clock[1],
+            state=state,
+        )
+        third = add_slide_payload({
+            "text": "пятая глава восьмой стих",
+            "vosk_text": "пятая глава восьмой стих",
+            "source": "parser",
+            "parsed": {"ref": "Притчи 1:10"},
+        })
+        accumulate_reading_list(
+            third,
+            accumulated,
+            now=delayed_clock[0],
+            clock_basis=delayed_clock[1],
+            state=state,
+        )
+
+        self.assertEqual(
+            ["Притчи 1:10", "Притчи 2:13", "Притчи 5:8"],
+            [item["ref"] for item in third["reference_list"]],
+        )
+
     def test_reading_list_closes_after_two_second_pause(self) -> None:
         from tools.vosk_grammar_probe import accumulate_reading_list, add_slide_payload
 

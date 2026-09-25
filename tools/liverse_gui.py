@@ -93,7 +93,7 @@ STATE_COLORS = {
     "error": ("#FDE8E7", "#A12622"),
     "neutral": ("#E9EEF3", "#465463"),
 }
-LOG_EXPORT_NAMES = ("session.json", "events.jsonl", "trigger_cases.jsonl")
+LOG_EXPORT_NAMES = ("session.json", "events.jsonl", "trigger_cases.jsonl", "performance.jsonl")
 SENSITIVE_LOG_KEYS = ("token", "password", "secret", "authorization")
 
 
@@ -253,6 +253,7 @@ class GuiConfig:
     long_range_operator_hints: bool = False
     smart_slide_streaming_control: bool = True
     text_operator_hints: bool = False
+    performance_diagnostics: bool = False
     open_operator_qr: bool = True
     auto_hide: bool = True
     text_detection_db: Path = DEFAULT_TEXT_DETECTION_DB
@@ -377,6 +378,7 @@ def load_gui_config() -> GuiConfig:
             settings.get("smart_slide_streaming_control", True)
         ),
         text_operator_hints=bool(settings.get("text_operator_hints", False)),
+        performance_diagnostics=bool(settings.get("performance_diagnostics", False)),
         open_operator_qr=bool(settings.get("open_operator_qr", True)),
         auto_hide=bool(settings.get("gui_auto_hide", True)),
         text_detection_db=Path(
@@ -403,6 +405,7 @@ def save_gui_config(config: GuiConfig) -> None:
         long_range_operator_hints=config.long_range_operator_hints,
         smart_slide_streaming_control=config.smart_slide_streaming_control,
         text_operator_hints=config.text_operator_hints,
+        performance_diagnostics=config.performance_diagnostics,
     )
     save_startup_settings(args)
 
@@ -457,6 +460,11 @@ def engine_command(
         command.append("--no-smart-slide-streaming-control")
     if config.text_operator_hints:
         command.append("--text-operator-hints")
+    command.append(
+        "--performance-diagnostics"
+        if config.performance_diagnostics
+        else "--no-performance-diagnostics"
+    )
     if config.run_mode == "semi_auto":
         command.append("--semi-auto-approval")
     elif config.run_mode == "approval":
@@ -582,6 +590,9 @@ class LiVerseGui:
             value=self.config.smart_slide_streaming_control
         )
         self.text_operator_hints_var = tk.BooleanVar(value=self.config.text_operator_hints)
+        self.performance_diagnostics_var = tk.BooleanVar(
+            value=self.config.performance_diagnostics
+        )
         self.token_var = tk.StringVar(value=self.config.holyrics_token)
         self.port_var = tk.StringVar(value=str(self.config.holyrics_port))
         self.auto_hide_var = tk.BooleanVar(value=self.config.auto_hide)
@@ -791,6 +802,12 @@ class LiVerseGui:
             self.settings_tab,
             text="Спрашивать через пульт при слабом совпадении текста",
             variable=self.text_operator_hints_var,
+        ).grid(row=row, column=1, sticky="w", pady=(0, 7))
+        row += 1
+        ttk.Checkbutton(
+            self.settings_tab,
+            text="Записывать подробные замеры времени и CPU LiVerse",
+            variable=self.performance_diagnostics_var,
         ).grid(row=row, column=1, sticky="w", pady=(0, 7))
         row += 1
 
@@ -1108,6 +1125,7 @@ class LiVerseGui:
                 self.smart_slide_streaming_control_var.get()
             ),
             text_operator_hints=bool(self.text_operator_hints_var.get()),
+            performance_diagnostics=bool(self.performance_diagnostics_var.get()),
             open_operator_qr=bool(self.open_qr_var.get()),
             auto_hide=bool(self.auto_hide_var.get()),
             text_detection_db=self.config.text_detection_db,
