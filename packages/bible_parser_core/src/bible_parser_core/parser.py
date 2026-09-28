@@ -654,6 +654,13 @@ ASR_REPLACEMENTS = (
     (r"\bстихии\b", "стих"),
 )
 
+# Retain stable patterns outside Python's bounded regex cache: ASR repairs
+# and book aliases would otherwise evict each other on every phrase.
+_COMPILED_ASR_REPLACEMENTS = tuple(
+    (re.compile(pattern, re.IGNORECASE), replacement)
+    for pattern, replacement in ASR_REPLACEMENTS
+)
+
 GENERIC_BOOK_VARIANTS = {
     "итак",
     "книга",
@@ -1023,8 +1030,8 @@ def replace_fused_hundred_ordinal(match: re.Match[str]) -> str:
 
 def normalize_text(text: str) -> str:
     normalized = text.lower().replace("ё", "е")
-    for pattern, replacement in ASR_REPLACEMENTS:
-        normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+    for pattern, replacement in _COMPILED_ASR_REPLACEMENTS:
+        normalized = pattern.sub(replacement, normalized)
     # On fast speech Sherpa can omit the boundary between «стих» and the next
     # book name: «пятый стихмарка четвёртая глава...».
     normalized = re.sub(r"\bстих(?=марк(?:а|е|у|ом|и)?\b)", "стих ", normalized)
@@ -1460,6 +1467,11 @@ def book_variants() -> dict[str, str]:
 
 
 BOOK_VARIANTS = book_variants()
+_BOOK_VARIANT_PATTERNS = tuple(
+    (variant, canonical, re.compile(rf'(?<!\S){re.escape(variant)}(?!\S)'))
+    for variant, canonical in BOOK_VARIANTS.items()
+    if variant and variant not in GENERIC_BOOK_VARIANTS
+)
 
 
 def token_spans(normalized: str) -> list[tuple[str, int, int]]:
@@ -1477,10 +1489,8 @@ def is_first_n_chapters_discussion(normalized: str) -> bool:
 def book_candidates(normalized: str) -> list[BookCandidate]:
     candidates: list[BookCandidate] = []
     seen: dict[tuple[str, int, int], BookCandidate] = {}
-    for variant, canonical in BOOK_VARIANTS.items():
-        if not variant or variant in GENERIC_BOOK_VARIANTS:
-            continue
-        for match in re.finditer(rf"(?<!\S){re.escape(variant)}(?!\S)", normalized):
+    for variant, canonical, pattern in _BOOK_VARIANT_PATTERNS:
+        for match in pattern.finditer(normalized):
             # A phrase found verbatim in the maintained alias dictionary is
             # an exact lexical match, regardless of its length.  Previously
             # short but intentional ASR aliases (for example «ефисянам»)
