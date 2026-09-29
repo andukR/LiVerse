@@ -399,7 +399,6 @@ def save_gui_config(config: GuiConfig) -> None:
         citation_detection_mode=config.citation_detection_mode,
         open_operator_qr=config.open_operator_qr,
         gui_auto_hide=config.auto_hide,
-        holyrics_theme=str(previous.get("holyrics_theme") or ""),
         holyrics_quick_minutes=config.quick_seconds / 60.0,
         long_range_slide_mode=config.long_range_slide_mode,
         long_range_operator_hints=config.long_range_operator_hints,
@@ -508,7 +507,6 @@ def holyrics_check_args(config: GuiConfig) -> SimpleNamespace:
         holyrics_token=config.holyrics_token,
         holyrics_timeout=1.5,
         sermon_plan=True,
-        holyrics_theme="",
     )
 
 
@@ -697,7 +695,7 @@ class LiVerseGui:
         self.notebook = ttk.Notebook(outer)
         self.notebook.pack(fill="both", expand=True)
         self.status_tab = ttk.Frame(self.notebook, padding=14)
-        self.settings_tab = ttk.Frame(self.notebook, padding=14)
+        self.settings_tab = ttk.Frame(self.notebook, padding=8)
         self.diagnostics_tab = ttk.Frame(self.notebook, padding=14)
         self.logs_tab = ttk.Frame(self.notebook, padding=14)
         self.help_tab = ttk.Frame(self.notebook, padding=14)
@@ -752,97 +750,120 @@ class LiVerseGui:
         ttk.Button(buttons, text="Скрыть", command=self.hide_window).pack(side="right", padx=8)
 
     def _build_settings_tab(self) -> None:
-        self.settings_tab.columnconfigure(1, weight=1)
-        row = 0
+        self.settings_tab.columnconfigure(0, weight=3, uniform="settings_column")
+        self.settings_tab.columnconfigure(1, weight=2, uniform="settings_column")
+        modes = ttk.LabelFrame(self.settings_tab, text="Распознавание и показ", padding=8)
+        holyrics = ttk.LabelFrame(self.settings_tab, text="HoLyrics и дополнительные настройки", padding=8)
+        modes.grid(row=0, column=0, sticky="nsew", padx=(0, 4), pady=(0, 6))
+        holyrics.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=(0, 6))
+        modes.columnconfigure(0, weight=1)
+        holyrics.columnconfigure(1, weight=1)
+        mode_row = 0
 
-        def add_combo(label: str, variable: tk.StringVar, values: list[str]) -> ttk.Combobox:
-            nonlocal row
-            ttk.Label(self.settings_tab, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=7)
-            combo = ttk.Combobox(self.settings_tab, textvariable=variable, values=values, state="readonly")
-            combo.grid(row=row, column=1, sticky="ew", pady=7)
-            row += 1
+        def add_mode_combo(
+            label: str,
+            variable: tk.StringVar,
+            values: list[str],
+        ) -> ttk.Combobox:
+            nonlocal mode_row
+            ttk.Label(modes, text=label).grid(row=mode_row, column=0, sticky="w", pady=(3, 0))
+            mode_row += 1
+            combo = ttk.Combobox(modes, textvariable=variable, values=values, state="readonly")
+            combo.grid(row=mode_row, column=0, sticky="ew", pady=(0, 4))
+            mode_row += 1
             return combo
 
-        add_combo("Режим работы", self.run_mode_var, list(RUN_MODE_LABELS.values()))
-        add_combo("Подтверждение", self.approval_var, list(APPROVAL_LABELS.values()))
-        self.microphone_combo = add_combo("Микрофон", self.microphone_var, ["Автоматический выбор"])
-        add_combo("Распознавание", self.detection_var, list(DETECTION_LABELS.values()))
+        add_mode_combo("Режим работы", self.run_mode_var, list(RUN_MODE_LABELS.values()))
+        add_mode_combo("Подтверждение", self.approval_var, list(APPROVAL_LABELS.values()))
+        self.microphone_combo = add_mode_combo(
+            "Микрофон", self.microphone_var, ["Автоматический выбор"]
+        )
+        self.detection_combo = add_mode_combo(
+            "Распознавание", self.detection_var, list(DETECTION_LABELS.values())
+        )
 
-        ttk.Label(self.settings_tab, text="Время показа, секунд").grid(
-            row=row, column=0, sticky="w", padx=(0, 12), pady=7
+        ttk.Label(modes, text="Время показа, секунд").grid(
+            row=mode_row, column=0, sticky="w", pady=(3, 0)
         )
-        ttk.Entry(self.settings_tab, textvariable=self.quick_seconds_var, width=12).grid(
-            row=row, column=1, sticky="w", pady=7
+        mode_row += 1
+        ttk.Entry(modes, textvariable=self.quick_seconds_var, width=12).grid(
+            row=mode_row, column=0, sticky="w", pady=(0, 4)
         )
-        row += 1
-        add_combo(
-            "Длинные отрывки",
-            self.long_range_slide_var,
-            list(LONG_RANGE_SLIDE_LABELS.values()),
+        mode_row += 1
+        ttk.Label(modes, text="Длинные отрывки").grid(
+            row=mode_row, column=0, sticky="w", pady=(3, 0)
         )
+        mode_row += 1
+        ttk.Combobox(
+            modes,
+            textvariable=self.long_range_slide_var,
+            values=list(LONG_RANGE_SLIDE_LABELS.values()),
+            state="readonly",
+        ).grid(row=mode_row, column=0, sticky="ew", pady=(0, 2))
+        mode_row += 1
         ttk.Label(
-            self.settings_tab,
+            modes,
             text="Настройка действует только на диапазоны из нескольких стихов.",
-            wraplength=430,
-        ).grid(row=row, column=1, sticky="w", pady=(0, 7))
-        row += 1
+            wraplength=390,
+        ).grid(row=mode_row, column=0, sticky="w", pady=(0, 3))
+        mode_row += 1
         ttk.Checkbutton(
-            self.settings_tab,
-            text="Подсказывать оператору, не перелистывая автоматически",
+            modes,
+            text="Подсказывать оператору,\nне перелистывая автоматически",
             variable=self.long_range_operator_hints_var,
-        ).grid(row=row, column=1, sticky="w", pady=(0, 7))
-        row += 1
+        ).grid(row=mode_row, column=0, sticky="w", pady=2)
+        mode_row += 1
         ttk.Checkbutton(
-            self.settings_tab,
-            text="Потоковый УПС для чтения стих за стихом (рекомендуется)",
+            modes,
+            text="Потоковый УПС для чтения\nстих за стихом (рекомендуется)",
             variable=self.smart_slide_streaming_control_var,
-        ).grid(row=row, column=1, sticky="w", pady=(0, 7))
-        row += 1
+        ).grid(row=mode_row, column=0, sticky="w", pady=2)
+
+        right_row = 0
         ttk.Checkbutton(
-            self.settings_tab,
-            text="Спрашивать через пульт при слабом совпадении текста",
+            holyrics,
+            text="Спрашивать через пульт\nпри слабом совпадении текста",
             variable=self.text_operator_hints_var,
-        ).grid(row=row, column=1, sticky="w", pady=(0, 7))
-        row += 1
+        ).grid(row=right_row, column=0, columnspan=2, sticky="w", pady=3)
+        right_row += 1
         ttk.Checkbutton(
-            self.settings_tab,
-            text="Записывать подробные замеры времени и CPU LiVerse",
+            holyrics,
+            text="Записывать подробные замеры\nвремени и CPU LiVerse",
             variable=self.performance_diagnostics_var,
-        ).grid(row=row, column=1, sticky="w", pady=(0, 7))
-        row += 1
+        ).grid(row=right_row, column=0, columnspan=2, sticky="w", pady=3)
+        right_row += 1
 
-        ttk.Separator(self.settings_tab).grid(row=row, column=0, columnspan=2, sticky="ew", pady=12)
-        row += 1
-        ttk.Label(self.settings_tab, text="HoLyrics token").grid(
-            row=row, column=0, sticky="w", padx=(0, 12), pady=7
+        ttk.Separator(holyrics).grid(row=right_row, column=0, columnspan=2, sticky="ew", pady=6)
+        right_row += 1
+        ttk.Label(holyrics, text="HoLyrics token").grid(
+            row=right_row, column=0, sticky="w", padx=(0, 8), pady=4
         )
-        ttk.Entry(self.settings_tab, textvariable=self.token_var, show="●").grid(
-            row=row, column=1, sticky="ew", pady=7
+        ttk.Entry(holyrics, textvariable=self.token_var, show="●").grid(
+            row=right_row, column=1, sticky="ew", pady=4
         )
-        row += 1
-        ttk.Label(self.settings_tab, text="Порт HoLyrics").grid(
-            row=row, column=0, sticky="w", padx=(0, 12), pady=7
+        right_row += 1
+        ttk.Label(holyrics, text="Порт HoLyrics").grid(
+            row=right_row, column=0, sticky="w", padx=(0, 8), pady=4
         )
-        ttk.Entry(self.settings_tab, textvariable=self.port_var, width=12).grid(
-            row=row, column=1, sticky="w", pady=7
+        ttk.Entry(holyrics, textvariable=self.port_var, width=12).grid(
+            row=right_row, column=1, sticky="w", pady=4
         )
-        row += 1
+        right_row += 1
 
         ttk.Checkbutton(
-            self.settings_tab,
-            text="После успешного запуска скрывать окно",
+            holyrics,
+            text="После успешного запуска\nскрывать окно",
             variable=self.auto_hide_var,
-        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=6)
-        row += 1
+        ).grid(row=right_row, column=0, columnspan=2, sticky="w", pady=3)
+        right_row += 1
         ttk.Checkbutton(
-            self.settings_tab,
-            text="Показывать QR-код для подключения телефона",
+            holyrics,
+            text="Показывать QR-код для\nподключения телефона",
             variable=self.open_qr_var,
-        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=6)
-        row += 1
+        ).grid(row=right_row, column=0, columnspan=2, sticky="w", pady=3)
 
         actions = ttk.Frame(self.settings_tab)
-        actions.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self._create_primary_button(actions, text="Сохранить и запустить", command=self.save_and_start).pack(
             side="left"
         )
@@ -1416,7 +1437,9 @@ class LiVerseGui:
         self.activity_var.set("Связь с HoLyrics работает")
 
     def show_permissions(self) -> None:
-        permissions = required_holyrics_permissions(SimpleNamespace(sermon_plan=True, holyrics_theme=""))
+        permissions = sorted(
+            required_holyrics_permissions(SimpleNamespace(sermon_plan=True))
+        )
         messagebox.showinfo(
             "Разрешения HoLyrics",
             "В HoLyrics → Settings → API Server → Manage permissions\n"

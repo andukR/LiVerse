@@ -178,6 +178,12 @@ class LiveReferencePipelineTest(unittest.TestCase):
             payload = {
                 "text": "Притчи один десять, Притчи два тринадцать",
                 "reference_list_collection_id": "list_test",
+                "session_plan_context": {
+                    "presentation_id": "plan-1",
+                    "presentation_name": "План проповеди",
+                    "slide_number": 2,
+                    "slide_text": "Пункт второй",
+                },
                 "reference_list": [
                     {"ref": "Притчи 1:10"},
                     {"ref": "Притчи 2:13"},
@@ -211,6 +217,91 @@ class LiveReferencePipelineTest(unittest.TestCase):
                 self.assertEqual(2, len(decisions))
                 decisions[1]("approve")
                 self.assertEqual("reference_list", second_candidate["slide"]["slide_type"])
+            self.assertEqual(1, len(approval_queue.session_refs))
+            self.assertEqual("reference_list", approval_queue.session_refs[0]["kind"])
+            self.assertEqual(["Притчи 1:10", "Притчи 2:13"], approval_queue.session_refs[0]["references"])
+            self.assertEqual(2, approval_queue.session_refs[0]["plan_context"]["slide_number"])
+
+    def test_session_summary_groups_references_and_multiple_lists_by_plan_slide(self):
+        from tools.vosk_grammar_probe import session_references_text
+
+        context = {
+            "presentation_id": "plan-1",
+            "presentation_name": "План проповеди",
+            "slide_number": 3,
+            "slide_text": "Бог показал Свою любовь во Христе",
+        }
+        text = session_references_text(
+            [
+                {"kind": "reference", "ref": "Иоанн 3:16", "plan_context": context},
+                {
+                    "kind": "reference_list",
+                    "collection_id": "list-a",
+                    "references": ["Римлянам 5:8", "1 Иоанна 4:9"],
+                    "plan_context": context,
+                },
+                {
+                    "kind": "reference_list",
+                    "collection_id": "list-b",
+                    "references": ["Галатам 2:20", "Иоанн 12:47"],
+                    "plan_context": context,
+                },
+                {"kind": "reference", "ref": "Псалом 22:1", "plan_context": None},
+            ]
+        )
+        self.assertIn("План проповеди — пункт/слайд 3", text)
+        self.assertIn("Отдельные цитаты и диапазоны:\n1. Иоанн 3:16", text)
+        self.assertIn("Список ссылок 1:\n1. Римлянам 5:8\n2. 1 Иоанна 4:9", text)
+        self.assertIn("Список ссылок 2:\n1. Галатам 2:20\n2. Иоанн 12:47", text)
+        self.assertIn("Вне пункта плана\nОтдельные цитаты и диапазоны:\n1. Псалом 22:1", text)
+
+    def test_session_summary_captures_actual_active_text_plan_slide(self):
+        from tools.vosk_grammar_probe import session_plan_context
+
+        args = SimpleNamespace(sermon_plan=True, holyrics_url="http://localhost:8090")
+        current = {
+            "type": "text",
+            "text_id": "plan-1",
+            "name": "План",
+            "slide_number": 2,
+            "slides": [{"text": "Вступление"}, {"text": "Главный пункт"}],
+        }
+        with patch("tools.vosk_grammar_probe.get_holyrics_current_presentation", return_value=current):
+            context = session_plan_context(args)
+        self.assertEqual(
+            {
+                "presentation_id": "plan-1",
+                "presentation_name": "План",
+                "slide_number": 2,
+                "slide_text": "Главный пункт",
+            },
+            context,
+        )
+
+    def test_session_collection_updates_keep_one_list_group(self):
+        from tools.vosk_grammar_probe import append_session_reference
+
+        records = []
+        base = {
+            "reference_list_collection_id": "list-1",
+            "session_plan_context": {"slide_number": 4, "slide_text": "Пункт плана"},
+            "slide": {"slide_type": "reference_list", "ref": "Ссылки для чтения"},
+        }
+        append_session_reference(
+            records,
+            {**base, "reference_list": [{"ref": "Матфей 5:7"}, {"ref": "Матфей 6:3"}]},
+        )
+        append_session_reference(
+            records,
+            {**base, "reference_list": [{"ref": "Матфей 5:7"}, {"ref": "Матфей 6:3"}, {"ref": "Матфей 7:8"}]},
+        )
+
+        self.assertEqual(1, len(records))
+        self.assertEqual(
+            ["Матфей 5:7", "Матфей 6:3", "Матфей 7:8"],
+            records[0]["references"],
+        )
+
     def test_regression_suite_does_not_shrink_silently(self):
         tests_dir = Path(__file__).resolve().parent
         suite = unittest.defaultTestLoader.discover(str(tests_dir), pattern="test_*.py")
@@ -271,6 +362,25 @@ class LiveReferencePipelineTest(unittest.TestCase):
         )
         self.assertIn("--performance-diagnostics", diagnostic_command)
         self.assertNotIn("--no-performance-diagnostics", diagnostic_command)
+
+    def test_gui_holyrics_permission_help_sorts_permissions_by_action_name(self):
+        from tools.liverse_gui import LiVerseGui
+
+        app = LiVerseGui.__new__(LiVerseGui)
+        with patch("tools.liverse_gui.messagebox.showinfo") as showinfo:
+            app.show_permissions()
+
+        message = showinfo.call_args.args[1]
+        permissions = [
+            line.removeprefix("• ")
+            for line in message.splitlines()
+            if line.startswith("• ")
+        ]
+        self.assertEqual(permissions, sorted(permissions))
+        for prefix in ("Action", "Close", "Get", "Set", "Show"):
+            positions = [index for index, item in enumerate(permissions) if item.startswith(prefix)]
+            self.assertEqual(positions, list(range(positions[0], positions[-1] + 1)))
+        self.assertIn("GetCurrentTheme", permissions)
 
     def test_packaged_gui_engine_command_uses_sibling_executable(self):
         from tools.liverse_gui import GuiConfig, engine_command
@@ -920,7 +1030,6 @@ class LiveReferencePipelineTest(unittest.TestCase):
                     "HOLYRICS_TOKEN": "secret-token",
                     "HOLYRICS_HOST": "http://localhost",
                     "HOLYRICS_PORT": "8091",
-                    "HOLYRICS_THEME": "",
                 },
                 load_env_file(env_path),
             )
@@ -947,6 +1056,10 @@ class LiveReferencePipelineTest(unittest.TestCase):
                 "ShowText",
                 "ShowVerse",
                 "ActionGoToIndex",
+                "GetThemes",
+                "GetBackgrounds",
+                "GetCurrentTheme",
+                "GetCurrentBackground",
             ),
             permissions,
         )
@@ -1275,7 +1388,10 @@ class LiveReferencePipelineTest(unittest.TestCase):
     def test_timed_verse_display_pauses_recognition_until_restore(self):
         from tools.holyrics import restore_holyrics_presentation_later
 
-        args = SimpleNamespace()
+        diagnostic_events = []
+        args = SimpleNamespace(
+            _holyrics_event_logger=lambda event, payload: diagnostic_events.append((event, payload))
+        )
 
         with patch("tools.holyrics.threading.Timer") as timer_class:
             restore_holyrics_presentation_later(
@@ -1293,6 +1409,13 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         restore.assert_called_once()
         self.assertFalse(temporary_verse_display_active(args))
+        self.assertEqual(
+            [
+                "temporary_presentation_restore_timer_scheduled",
+                "temporary_presentation_restore_timer_fired",
+            ],
+            [event for event, _payload in diagnostic_events],
+        )
 
     def test_confident_plan_match_is_automatic_in_semi_auto_mode(self):
         from tools.vosk_grammar_probe import sermon_plan_match_requires_approval
@@ -1409,17 +1532,67 @@ class LiveReferencePipelineTest(unittest.TestCase):
             payload["ml_risk"]["decision_reasons"],
         )
 
-    def test_sermon_plan_startup_does_not_request_theme_list(self):
-        from tools.vosk_grammar_probe import ask_holyrics_theme_name
+    def test_legacy_theme_setting_is_not_applied_to_startup_args(self):
+        from tools.vosk_grammar_probe import apply_saved_startup_settings
 
-        args = SimpleNamespace(slide_output="holyrics", text=None, sermon_plan=True)
-        with (
-            patch("tools.vosk_grammar_probe.sys.stdin.isatty", return_value=True),
-            patch("tools.vosk_grammar_probe.get_holyrics_theme_options") as get_themes,
-        ):
-            ask_holyrics_theme_name(args)
+        args = SimpleNamespace(holyrics_theme="")
+        with patch("tools.vosk_grammar_probe.setting_was_explicit", return_value=False):
+            apply_saved_startup_settings(args, {"holyrics_theme": "deleted-user-theme"})
 
-        get_themes.assert_not_called()
+        self.assertEqual("", args.holyrics_theme)
+
+    def test_legacy_theme_name_never_reaches_holyrics_bible_settings(self):
+        from tools.holyrics import post_holyrics_url
+
+        args = SimpleNamespace(holyrics_theme="deleted-user-theme", holyrics_quick_minutes=0)
+        payload = {
+            "ref": "Иоанн 3:16",
+            "book": "Иоанн",
+            "chapter": 3,
+            "start_verse": 16,
+            "end_verse": 16,
+        }
+        with patch("tools.holyrics.post_holyrics_api", return_value=(True, "", "")) as api:
+            ok, _reason = post_holyrics_url(args, "http://127.0.0.1:8091", payload)
+
+        self.assertTrue(ok)
+        self.assertEqual("SetBibleSettings", api.call_args_list[0].args[2])
+        self.assertEqual({"show_x_verses": 1}, api.call_args_list[0].args[3])
+        self.assertEqual("ShowVerse", api.call_args_list[1].args[2])
+
+    def test_saving_holyrics_connection_removes_legacy_theme_name(self):
+        import tempfile
+
+        from tools.holyrics import load_env_file, save_holyrics_env
+
+        with tempfile.TemporaryDirectory() as directory:
+            env_path = Path(directory) / ".env"
+            env_path.write_text(
+                "HOLYRICS_TOKEN=old-token\nHOLYRICS_PORT=8091\nHOLYRICS_THEME=deleted-user-theme\n",
+                encoding="utf-8",
+            )
+
+            save_holyrics_env("new-token", 8091, env_path)
+
+            self.assertNotIn("HOLYRICS_THEME", load_env_file(env_path))
+
+    def test_startup_settings_do_not_persist_theme(self):
+        import json
+        import tempfile
+
+        from tools.vosk_grammar_probe import save_startup_settings
+
+        with tempfile.TemporaryDirectory() as directory:
+            settings_path = Path(directory) / "settings.json"
+            args = SimpleNamespace(
+                _liverse_startup_settings_enabled=True,
+                holyrics_theme="deleted-user-theme",
+                holyrics_quick_minutes=0,
+            )
+            with patch("tools.vosk_grammar_probe.startup_settings_path", return_value=settings_path):
+                save_startup_settings(args)
+
+            self.assertNotIn("holyrics_theme", json.loads(settings_path.read_text(encoding="utf-8")))
 
     def test_sermon_plan_recovers_after_starting_on_quick_presentation(self):
         from bible_parser_core.live_pipeline import match_sermon_plan_slide
@@ -1803,6 +1976,156 @@ class LiveReferencePipelineTest(unittest.TestCase):
             },
             slide_payload_to_holyrics_body(args, {"ref": "Иоанн 3:16"}),
         )
+
+    def test_blank_text_presentation_theme_keeps_image_and_makes_text_readable(self):
+        args = SimpleNamespace(holyrics_token="secret")
+        with patch(
+            "tools.holyrics.post_holyrics_api",
+            side_effect=[
+                (True, "", '{"data":{"name":"Holyrics 01"}}'),
+                (True, "", '{"data":{"name":"Backdrop","type":"my_image"}}'),
+                (True, "", '{"data":[{"id":"theme-1","name":"Holyrics 01",'
+                            '"font":{"color":"F5F5F5"},'
+                            '"shape_fill":{"enabled":false},'
+                            '"background":{"type":"my_image","id":"null"}}]}'),
+                (True, "", '{"data":[{"id":"image-1","name":"Backdrop",'
+                            '"type":"my_image"}]}'),
+            ],
+        ):
+            theme = prepare_sermon_plan_custom_theme(
+                args, "http://127.0.0.1:8091", blank_presentation=True
+            )
+
+        self.assertEqual({"type": "my_image", "id": "image-1"}, theme["background"])
+        self.assertEqual("FFFFFF", theme["font"]["color"])
+        self.assertFalse(theme["shape_fill"]["enabled"])
+        self.assertEqual("000000", theme["effect"]["outline_color"])
+        self.assertEqual(1.5, theme["effect"]["outline_weight"])
+
+    def test_blank_text_presentation_reuses_original_theme_after_quick_slide(self):
+        args = SimpleNamespace(
+            _holyrics_blank_text_restore_presentation={"type": "text", "text_id": "empty-plan"},
+            _holyrics_blank_text_custom_theme_snapshot={
+                "text_id": "empty-plan",
+                "custom_theme": {"font": {"color": "FFFFFF"}, "background": {"id": "-4"}},
+            },
+        )
+
+        with patch("tools.holyrics.post_holyrics_api") as api:
+            custom_theme = prepare_sermon_plan_custom_theme(
+                args,
+                "http://127.0.0.1:8091",
+                blank_presentation=True,
+            )
+
+        self.assertEqual(
+            {"font": {"color": "FFFFFF"}, "background": {"id": "-4"}},
+            custom_theme,
+        )
+        self.assertEqual(custom_theme, args._holyrics_sermon_plan_custom_theme)
+        api.assert_not_called()
+
+    def test_blank_text_presentation_uses_quick_verse_and_restores_blank_slide(self):
+        blank = {
+            "type": "text",
+            "text_id": "blank-sermon",
+            "slide_number": 2,
+            "slides": [
+                {"text": "", "theme_id": "image-1"},
+                {"text": "", "theme_id": "image-1"},
+            ],
+        }
+        args = SimpleNamespace(
+            sermon_plan=True,
+            holyrics_quick_minutes=5 / 60,
+            holyrics_theme="",
+        )
+        payload = {
+            "ref": "Иоанн 3:16",
+            "verse": "Ибо так возлюбил Бог мир...",
+            "book": "Иоанн",
+            "chapter": 3,
+            "start_verse": 16,
+            "end_verse": 16,
+        }
+        readable_theme = {
+            "background": {"type": "my_image", "id": "image-1"},
+            "font": {"color": "FFFFFF"},
+            "effect": {"outline_color": "000000", "outline_weight": 1.5},
+            "shape_fill": {"enabled": False},
+        }
+
+        def prepare_theme(theme_args, _base_url, *, blank_presentation=False):
+            self.assertTrue(blank_presentation)
+            theme_args._holyrics_sermon_plan_custom_theme = readable_theme
+            return readable_theme
+
+        with (
+            patch("tools.holyrics.get_holyrics_current_presentation", return_value=blank),
+            patch("tools.holyrics.prepare_sermon_plan_custom_theme", side_effect=prepare_theme),
+            patch("tools.holyrics.post_holyrics_api", return_value=(True, "", "")) as api,
+            patch("tools.holyrics.restore_holyrics_presentation_later") as restore_later,
+        ):
+            ok, reason = post_holyrics_url(args, "http://127.0.0.1:8091", payload)
+
+        self.assertTrue(ok)
+        self.assertEqual(
+            "show_quick_presentation:sermon_verse;temporary_verse:0.0833333min",
+            reason,
+        )
+        self.assertEqual(
+            [call(
+                args,
+                "http://127.0.0.1:8091",
+                "ShowQuickPresentation",
+                {"slides": [{
+                    "text": "Иоанн 3:16\n\nИбо так возлюбил Бог мир...",
+                    "custom_theme": readable_theme,
+                }]},
+            )],
+            api.call_args_list,
+        )
+        restore_snapshot = restore_later.call_args.args[2]
+        self.assertEqual("blank-sermon", restore_snapshot["text_id"])
+        self.assertEqual(2, restore_snapshot["slide_number"])
+        self.assertEqual(1, restore_snapshot["current_index"])
+        self.assertEqual(blank["slides"], restore_snapshot["slides"])
+        self.assertFalse(hasattr(args, "_holyrics_sermon_plan_presentation"))
+        self.assertEqual("blank-sermon", args._holyrics_blank_text_restore_presentation["text_id"])
+
+    def test_blank_text_restore_snapshot_survives_first_quick_presentation(self):
+        args = SimpleNamespace(
+            sermon_plan=True,
+            holyrics_quick_minutes=5 / 60,
+            holyrics_theme="",
+            _holyrics_blank_text_restore_presentation={
+                "type": "text",
+                "text_id": "blank-sermon",
+                "slide_number": 2,
+                "slides": [{"text": ""}, {"text": ""}],
+            },
+        )
+        quick = {"type": "quick_presentation", "slides": [{"text": "Иоанн 3:16"}]}
+        payload = {
+            "slide_type": "reference_list",
+            "ref": "Ссылки для чтения",
+            "verse": "Иоанн 3:16\nМатфей 5:7",
+            "reference_list": [{"ref": "Иоанн 3:16"}, {"ref": "Матфей 5:7"}],
+            "slide": {"slide_type": "reference_list", "references": []},
+        }
+
+        with (
+            patch("tools.holyrics.get_holyrics_current_presentation", return_value=quick),
+            patch("tools.holyrics.prepare_sermon_plan_custom_theme", return_value={"background": {"id": "image"}}),
+            patch("tools.holyrics.cancel_holyrics_restore_timer"),
+            patch("tools.holyrics.restore_holyrics_presentation_later") as restore_later,
+            patch("tools.holyrics.post_holyrics_api", return_value=(True, "", "")),
+        ):
+            ok, reason = post_holyrics_url(args, "http://127.0.0.1:8091", payload)
+
+        self.assertTrue(ok)
+        self.assertEqual("show_quick_presentation:reference_list;temporary_list:0.0833333min", reason)
+        self.assertEqual("blank-sermon", restore_later.call_args.args[2]["text_id"])
 
     def test_sermon_plan_verse_restores_actual_current_slide_and_theme(self):
         args = SimpleNamespace(
@@ -5685,6 +6008,20 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertEqual("parser_reference_list", result.get("source"))
         refs = [item.get("ref") for item in result.get("reference_list") or []]
         self.assertEqual(["Иоанн 3:4", "Иаков 1:2"], refs)
+
+    def test_yuan_asr_alias_keeps_all_john_addresses_in_compact_list(self):
+        result = LiveReferencePipeline().process_text(
+            "иоанна три шестнадцать иоанна четыре семнадцать "
+            "ивана пять восемнадцать юан шесть девятнадцать"
+        )
+
+        self.assertTrue(result.get("matched"))
+        self.assertIsNone(result.get("parsed"))
+        self.assertEqual("parser_reference_list", result.get("source"))
+        self.assertEqual(
+            ["Иоанн 3:16", "Иоанн 4:17", "Иоанн 5:18", "Иоанн 6:19"],
+            [item.get("ref") for item in result.get("reference_list") or []],
+        )
 
     def test_fuzzy_book_names_are_kept_in_compact_list_for_confirmation(self):
         from bible_parser_core.live_pipeline import add_risk_score

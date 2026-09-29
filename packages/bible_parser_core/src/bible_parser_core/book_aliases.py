@@ -90,6 +90,10 @@ books_data = [
             "ианна",
             "от иана",
             "иана",
+            # In a compact address list Sherpa rendered «Иоанн» as «юан»;
+            # keep it as a book boundary so the following chapter/verse pair
+            # is not merged into the preceding address.
+            "юан",
             "Иранно",
         ],
     ),

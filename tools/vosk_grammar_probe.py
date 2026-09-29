@@ -81,7 +81,6 @@ from tools.holyrics import (
     DEFAULT_PORT,
     MIN_RECOMMENDED_HOLYRICS_VERSION,
     REQUIRED_HOLYRICS_PERMISSIONS,
-    THEME_HOLYRICS_PERMISSIONS,
     build_holyrics_sermon_plan_presentation,
     check_holyrics_api_server,
     control_holyrics_presentation,
@@ -90,7 +89,6 @@ from tools.holyrics import (
     ensure_holyrics_sermon_plan_presentation,
     env_setting,
     get_holyrics_current_presentation,
-    get_holyrics_theme_options,
     handle_scripture_range_reading_match,
     apply_scripture_range_operator_hint,
     liverse_config_dir,
@@ -264,7 +262,6 @@ def save_startup_settings(args: argparse.Namespace) -> None:
         ),
         "open_operator_qr": bool(getattr(args, "open_operator_qr", True)),
         "gui_auto_hide": bool(getattr(args, "gui_auto_hide", True)),
-        "holyrics_theme": str(getattr(args, "holyrics_theme", "") or ""),
         "holyrics_quick_minutes": float(getattr(args, "holyrics_quick_minutes", 0.0) or 0.0),
         "long_range_slide_mode": str(getattr(args, "long_range_slide_mode", "compact") or "compact"),
         "long_range_operator_hints": bool(getattr(args, "long_range_operator_hints", False)),
@@ -643,85 +640,6 @@ def run_holyrics_first_setup(args: argparse.Namespace) -> None:
     )
 
 
-def ask_holyrics_theme_name(args: argparse.Namespace) -> None:
-    if not holyrics_output_enabled(args) or args.text or not sys.stdin.isatty():
-        return
-
-    if getattr(args, "sermon_plan", False):
-        print("Holyrics: тема стихов будет взята из текущей презентации плана проповеди.", flush=True)
-        return
-
-    if getattr(args, "_liverse_skip_holyrics_theme_question", False):
-        theme = str(getattr(args, "holyrics_theme", "") or "").strip()
-        if theme:
-            print(f"Holyrics: используется последняя тема: {theme}", flush=True)
-        else:
-            print("Holyrics: используется тема Bible module по умолчанию.", flush=True)
-        return
-
-    print("", flush=True)
-    print("Выбор темы Holyrics", flush=True)
-    if not args.holyrics_token:
-        print("Holyrics: HOLYRICS_TOKEN не задан, список тем получить нельзя.", flush=True)
-        args.holyrics_theme = ""
-        setattr(args, "_holyrics_theme_id", "")
-        return
-
-    result = get_holyrics_theme_options(args)
-    if not result.get("ok"):
-        if result.get("permission_missing"):
-            print(
-                "Holyrics: в API token не хватает разрешения GetThemes, "
-                "поэтому список тем получить нельзя.",
-                flush=True,
-            )
-            print(
-                "Откройте Holyrics -> Settings -> API Server -> Manage permissions "
-                "и включите GetThemes, если хотите выбирать тему при запуске.",
-                flush=True,
-            )
-        else:
-            print("Holyrics: список тем получить не удалось.", flush=True)
-            print(f"Техническая причина: {result.get('reason')}", flush=True)
-        args.holyrics_theme = ""
-        setattr(args, "_holyrics_theme_id", "")
-        print("Holyrics: будет использована тема Bible module по умолчанию.", flush=True)
-        return
-
-    themes = list(result.get("themes") or [])
-    if not themes:
-        print("Holyrics: сохранённые темы не найдены.", flush=True)
-        args.holyrics_theme = ""
-        setattr(args, "_holyrics_theme_id", "")
-        print("Holyrics: будет использована тема Bible module по умолчанию.", flush=True)
-        return
-
-    print("0. Тема Bible module по умолчанию", flush=True)
-    for index, theme in enumerate(themes, start=1):
-        print(f"{index}. {theme['name']}", flush=True)
-    print("Введите номер темы. Enter - тема Bible module по умолчанию.", flush=True)
-
-    while True:
-        choice = input("> ").strip()
-        if not choice or choice == "0":
-            args.holyrics_theme = ""
-            setattr(args, "_holyrics_theme_id", "")
-            print("Holyrics: будет использована тема Bible module по умолчанию.", flush=True)
-            return
-        try:
-            index = int(choice)
-        except ValueError:
-            print("Введите номер из списка или нажмите Enter для темы по умолчанию.", flush=True)
-            continue
-        if 1 <= index <= len(themes):
-            theme = themes[index - 1]
-            args.holyrics_theme = theme["name"]
-            setattr(args, "_holyrics_theme_id", theme["id"])
-            print(f"Holyrics: выбрана тема: {theme['name']}", flush=True)
-            return
-        print("Введите номер из списка или нажмите Enter для темы по умолчанию.", flush=True)
-
-
 def parse_holyrics_quick_duration_minutes(value: str, *, default_minutes: float = 1.0) -> float | None:
     raw = value.strip().replace(",", ".").casefold()
     if not raw:
@@ -810,9 +728,6 @@ def check_holyrics_startup(args: argparse.Namespace, logger: JsonlLogger | None 
             print("Также проверьте, что API token имеет разрешения:", flush=True)
             for permission in REQUIRED_HOLYRICS_PERMISSIONS:
                 print(f"  - {permission}", flush=True)
-            if str(getattr(args, "holyrics_theme", "") or "").strip():
-                for permission in THEME_HOLYRICS_PERMISSIONS:
-                    print(f"  - {permission}", flush=True)
             print(f"Техническая причина: {result.get('token_info_reason')}", flush=True)
             return True
 
@@ -839,9 +754,6 @@ def check_holyrics_startup(args: argparse.Namespace, logger: JsonlLogger | None 
     print("Также проверьте, что API token имеет разрешения:", flush=True)
     for permission in REQUIRED_HOLYRICS_PERMISSIONS:
         print(f"  - {permission}", flush=True)
-    if str(getattr(args, "holyrics_theme", "") or "").strip():
-        for permission in THEME_HOLYRICS_PERMISSIONS:
-            print(f"  - {permission}", flush=True)
     print(f"Техническая причина: {result.get('reason')}", flush=True)
     return False
 
@@ -884,16 +796,82 @@ class ConsoleStatus:
             print(json.dumps(payload, ensure_ascii=False, indent=2), flush=True)
 
 
-def session_reference_record(payload: dict, action: str = "recognized") -> dict | None:
+def session_plan_context(args: argparse.Namespace, sermon_plan: dict | None = None) -> dict | None:
+    """Snapshot the active nonempty text-plan slide for a recognized citation."""
+    if not bool(getattr(args, "sermon_plan", False)):
+        return None
+    plan = sermon_plan or getattr(args, "_holyrics_sermon_plan_presentation", None)
+    current = get_holyrics_current_presentation(
+        args,
+        str(getattr(args, "holyrics_url", "")).rstrip("/"),
+        include_slides=True,
+    )
+    if isinstance(current, dict):
+        current_type = str(current.get("type") or "").strip()
+        if current_type == "text":
+            plan = current
+        elif current_type != "quick_presentation":
+            return None
+    if not isinstance(plan, dict):
+        return None
+    slides = list(plan.get("slides") or [])
+    try:
+        slide_number = max(
+            1,
+            int(plan.get("slide_number") or (int(plan.get("current_index") or 0) + 1)),
+        )
+    except (TypeError, ValueError):
+        slide_number = 1
+    if plan is not current:
+        slide_number = max(1, int(plan.get("current_index") or 0) + 1)
+    if slides and slide_number <= len(slides):
+        slide_text = str((slides[slide_number - 1] or {}).get("text") or "").strip()
+    else:
+        slide_text = str(plan.get("text") or "").strip()
+    if not slide_text:
+        return None
+    return {
+        "presentation_id": str(plan.get("text_id") or plan.get("id") or ""),
+        "presentation_name": str(plan.get("name") or plan.get("title") or "").strip(),
+        "slide_number": slide_number,
+        "slide_text": slide_text,
+    }
+
+
+def session_reference_record(
+    payload: dict,
+    action: str = "recognized",
+    *,
+    plan_context: dict | None = None,
+) -> dict | None:
     slide = payload.get("slide") or {}
+    references = payload.get("reference_list") or []
+    if slide.get("slide_type") == "reference_list" and references:
+        refs = [
+            str((reference or {}).get("ref") or "").strip()
+            for reference in references
+        ]
+        refs = list(dict.fromkeys(ref for ref in refs if ref))
+        if not refs:
+            return None
+        return {
+            "kind": "reference_list",
+            "collection_id": str(payload.get("reference_list_collection_id") or ""),
+            "references": refs,
+            "action": action,
+            "asr": str(payload.get("vosk_text") or payload.get("text") or "").strip(),
+            "plan_context": plan_context or payload.get("session_plan_context"),
+        }
     ref = str(slide.get("ref") or "").strip()
     if not ref:
         return None
     return {
+        "kind": "reference",
         "ref": ref,
         "action": action,
         "asr": str(payload.get("vosk_text") or payload.get("text") or "").strip(),
         "detected_text": str(slide.get("detected_text") or "").strip(),
+        "plan_context": plan_context or payload.get("session_plan_context"),
     }
 
 
@@ -906,21 +884,79 @@ def append_session_reference(records: list[dict], payload: dict, action: str = "
     record = session_reference_record(payload, action=action)
     if not record:
         return
-    if records and records[-1].get("ref") == record["ref"] and records[-1].get("action") == record["action"]:
+    if record.get("kind") == "reference_list":
+        collection_id = record.get("collection_id")
+        existing = None
+        if collection_id:
+            existing = next(
+                (
+                    row
+                    for row in records
+                    if row.get("kind") == "reference_list"
+                    and row.get("collection_id") == collection_id
+                ),
+                None,
+            )
+        if existing is None:
+            records.append(record)
+        else:
+            existing_refs = existing.setdefault("references", [])
+            existing_refs.extend(ref for ref in record["references"] if ref not in existing_refs)
+        return
+    if (
+        records
+        and records[-1].get("ref") == record["ref"]
+        and records[-1].get("action") == record["action"]
+        and records[-1].get("plan_context") == record.get("plan_context")
+    ):
         return
     records.append(record)
 
 
 def session_references_text(records: list[dict]) -> str:
-    refs: list[str] = []
+    groups: list[dict] = []
     for record in records:
-        ref = str(record.get("ref") or "").strip()
-        if ref and ref not in refs:
-            refs.append(ref)
-    if not refs:
+        context = record.get("plan_context")
+        key = (
+            str((context or {}).get("presentation_id") or ""),
+            int((context or {}).get("slide_number") or 0),
+            str((context or {}).get("slide_text") or ""),
+        )
+        group = next((item for item in groups if item["key"] == key), None)
+        if group is None:
+            group = {"key": key, "context": context, "references": [], "lists": []}
+            groups.append(group)
+        if record.get("kind") == "reference_list":
+            group["lists"].append(record)
+        else:
+            ref = str(record.get("ref") or "").strip()
+            if ref and ref not in group["references"]:
+                group["references"].append(ref)
+    groups = [group for group in groups if group["references"] or group["lists"]]
+    if not groups:
         return ""
-    lines = ["Цитаты из проповеди:"]
-    lines.extend(f"{index}. {ref}" for index, ref in enumerate(refs, start=1))
+    lines = ["Распознанные ссылки по пунктам плана проповеди:"]
+    for group in groups:
+        context = group["context"]
+        if context:
+            slide_number = int(context.get("slide_number") or 0)
+            name = str(context.get("presentation_name") or "План проповеди")
+            lines.append(f"\n{name} — пункт/слайд {slide_number}")
+            lines.append(str(context.get("slide_text") or ""))
+        else:
+            lines.append("\nВне пункта плана")
+        if group["references"]:
+            lines.append("Отдельные цитаты и диапазоны:")
+            lines.extend(
+                f"{index}. {ref}"
+                for index, ref in enumerate(group["references"], start=1)
+            )
+        for list_index, reference_list in enumerate(group["lists"], start=1):
+            lines.append(f"Список ссылок {list_index}:")
+            lines.extend(
+                f"{index}. {ref}"
+                for index, ref in enumerate(reference_list.get("references") or [], start=1)
+            )
     return "\n".join(lines)
 
 
@@ -1554,8 +1590,7 @@ def ask_priority_run_mode(settings: dict, *, sermon_plan: bool = False) -> tuple
         if sermon_plan:
             print("Тема Holyrics: из текущей презентации плана проповеди", flush=True)
         else:
-            theme = str(settings.get("holyrics_theme") or "").strip()
-            print(f"Тема Holyrics: {theme or 'Bible module по умолчанию'}", flush=True)
+            print("Тема оформления остаётся под управлением Holyrics.", flush=True)
         try:
             quick_minutes = float(settings.get("holyrics_quick_minutes") or 0.0)
         except (TypeError, ValueError):
@@ -1601,9 +1636,6 @@ def apply_saved_startup_settings(args: argparse.Namespace, settings: dict) -> No
         detection_mode = str(settings.get("citation_detection_mode") or "").strip()
         if detection_mode in {"address_only", "text_only", "hybrid_auto", "hybrid_confirm"}:
             args.citation_detection_mode = detection_mode
-    if not setting_was_explicit("--holyrics-theme", env_name="HOLYRICS_THEME"):
-        args.holyrics_theme = str(settings.get("holyrics_theme") or "")
-        setattr(args, "_holyrics_theme_id", "")
     if not setting_was_explicit("--holyrics-quick-minutes", env_name="HOLYRICS_QUICK_MINUTES"):
         try:
             args.holyrics_quick_minutes = float(settings.get("holyrics_quick_minutes") or 0.0)
@@ -1644,7 +1676,6 @@ def configure_interactive_approval_mode(args: argparse.Namespace) -> None:
 
     setattr(args, "_liverse_full_startup_setup", full_setup)
     if not full_setup:
-        setattr(args, "_liverse_skip_holyrics_theme_question", True)
         setattr(args, "_liverse_skip_holyrics_quick_question", True)
     if not full_setup:
         return
@@ -1759,18 +1790,29 @@ def add_slide_payload(payload: dict) -> dict:
 READING_LIST_CONTINUATION_SECONDS = 2.0
 
 
-def reading_list_clock(asr_result: dict | None, fallback: float | None = None) -> tuple[float, str]:
-    """Use speech timestamps when available so CPU delays do not close lists."""
+def reading_list_clock(
+    asr_result: dict | None,
+    fallback: float | None = None,
+) -> tuple[float, float, str]:
+    """Return fragment start/end so list pauses exclude the spoken phrase itself."""
     words = asr_result.get("result") if isinstance(asr_result, dict) else None
     if isinstance(words, list):
+        starts = [
+            float(word["start"])
+            for word in words
+            if isinstance(word, dict) and isinstance(word.get("start"), (int, float))
+        ]
         ends = [
             float(word["end"])
             for word in words
             if isinstance(word, dict) and isinstance(word.get("end"), (int, float))
         ]
-        if ends:
-            return max(ends), "audio"
-    return (time.monotonic() if fallback is None else float(fallback)), "monotonic"
+        if starts or ends:
+            start = min(starts) if starts else min(ends)
+            end = max(ends) if ends else start
+            return start, end, "audio"
+    current = time.monotonic() if fallback is None else float(fallback)
+    return current, current, "monotonic"
 
 
 def _reference_list_continuation_item(payload: dict, accumulated: list[dict]) -> dict | None:
@@ -1865,11 +1907,13 @@ def accumulate_reading_list(
     accumulated: list[dict],
     *,
     now: float | None = None,
+    speech_end: float | None = None,
     clock_basis: str = "monotonic",
     state: dict | None = None,
 ) -> dict:
     """Collect a live reference list and immediate continuations for two seconds."""
     current_time = time.monotonic() if now is None else float(now)
+    current_speech_end = current_time if speech_end is None else float(speech_end)
     collection_state = state if state is not None else {}
     previous_clock_basis = collection_state.get("clock_basis")
     if accumulated and previous_clock_basis and previous_clock_basis != clock_basis:
@@ -1905,7 +1949,7 @@ def accumulate_reading_list(
         if len(accumulated) >= 2:
             if not collection_state.get("collection_id"):
                 collection_state["collection_id"] = f"list_{time.monotonic_ns()}"
-            collection_state["last_item_time"] = current_time
+            collection_state["last_item_time"] = current_speech_end
             _set_reference_list_slide(payload, accumulated)
             payload["reference_list_collection_active"] = True
             payload["reference_list_collection_id"] = collection_state["collection_id"]
@@ -1918,7 +1962,7 @@ def accumulate_reading_list(
             accumulated.append(item)
             if not collection_state.get("collection_id"):
                 collection_state["collection_id"] = f"list_{time.monotonic_ns()}"
-            collection_state["last_item_time"] = current_time
+            collection_state["last_item_time"] = current_speech_end
             _set_reference_list_slide(payload, accumulated)
             payload["reference_list_collection_active"] = True
             payload["reference_list_updated"] = True
@@ -2876,6 +2920,8 @@ class PopupApprovalQueue:
                     if key in payload:
                         candidate[key] = payload[key]
                 candidate["reference_list_collection_id"] = collection_id
+                if isinstance(payload.get("session_plan_context"), dict):
+                    candidate["session_plan_context"] = dict(payload["session_plan_context"])
                 candidate["_source_payload"] = payload
                 if isinstance(payload.get("_live_latency_trace"), dict):
                     candidate["_live_latency_trace"] = dict(payload["_live_latency_trace"])
@@ -2964,21 +3010,22 @@ class PopupApprovalQueue:
                         pipeline.set_context_range(item["slide"])
                 feedback = operator_feedback(item["output"])
                 item["operator_feedback"] = feedback or {}
-                if list_id and action in {"approve", "approve_context"}:
-                    for reference in self.approved_list_refs.get(list_id, []):
-                        if not any(
-                            row.get("ref") == reference.get("ref")
-                            and row.get("action") == final_action
-                            for row in self.session_refs
-                        ):
-                            self.session_refs.append(
-                                {
-                                    "ref": reference.get("ref"),
-                                    "action": final_action,
-                                    "asr": str(item.get("vosk_text") or item.get("text") or ""),
-                                    "detected_text": "",
-                                }
-                            )
+                if list_id and (
+                    action in {"approve", "approve_context"}
+                    or action.startswith("alternative:")
+                ):
+                    accepted = self.approved_list_refs.get(list_id, [])
+                    append_session_reference(
+                        self.session_refs,
+                        {
+                            "slide": {"slide_type": "reference_list", "ref": "Ссылки для чтения"},
+                            "reference_list_collection_id": list_id,
+                            "reference_list": accepted,
+                            "vosk_text": item.get("vosk_text") or item.get("text") or "",
+                            "session_plan_context": item.get("session_plan_context"),
+                        },
+                        action=final_action,
+                    )
                 else:
                     append_session_reference(self.session_refs, item, action=final_action)
                 self.logger.write(
@@ -3986,7 +4033,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 recognition_time=recognition_time,
                                 text_detector=text_detector,
                             )
-                            list_clock_time, list_clock_basis = reading_list_clock(
+                            list_clock_start, list_clock_end, list_clock_basis = reading_list_clock(
                                 result,
                                 fallback=recognition_time,
                             )
@@ -3995,7 +4042,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 reading_list
                                 and last_list_item_time is not None
                                 and reading_list_state.get("clock_basis") == list_clock_basis
-                                and list_clock_time - float(last_list_item_time)
+                                and list_clock_start - float(last_list_item_time)
                                 <= READING_LIST_CONTINUATION_SECONDS
                             )
                             if citation_recognition_paused(
@@ -4390,18 +4437,24 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 payload = add_slide_payload(pipeline_payload)
                             reading_list_before = [dict(item) for item in reading_list]
                             reading_list_state_before = dict(reading_list_state)
-                            list_clock_time, list_clock_basis = reading_list_clock(
+                            list_clock_start, list_clock_end, list_clock_basis = reading_list_clock(
                                 result,
                                 fallback=time.monotonic(),
                             )
                             accumulate_reading_list(
                                 payload,
                                 reading_list,
-                                now=list_clock_time,
+                                now=list_clock_start,
+                                speech_end=list_clock_end,
                                 clock_basis=list_clock_basis,
                                 state=reading_list_state,
                             )
                             payload["asr"] = result
+                            if payload.get("slide"):
+                                payload["session_plan_context"] = session_plan_context(
+                                    output_args,
+                                    sermon_plan,
+                                )
                             ml_risk_started = (
                                 time.perf_counter() if performance_enabled else None
                             )
@@ -4846,11 +4899,6 @@ def main() -> int:
         default=env_setting("HOLYRICS_TOKEN"),
         help="Holyrics API token. Can also be set via HOLYRICS_TOKEN or .env.",
     )
-    parser.add_argument(
-        "--holyrics-theme",
-        default=env_setting("HOLYRICS_THEME"),
-        help="Holyrics theme name for Bible verse display. Empty uses Holyrics Bible module default.",
-    )
     parser.add_argument("--holyrics-timeout", type=float, default=float(env_setting("HOLYRICS_TIMEOUT", "1.5")))
     parser.add_argument(
         "--holyrics-quick-minutes",
@@ -4974,7 +5022,6 @@ def main() -> int:
     configure_interactive_approval_mode(args)
     load_runtime_risk_model(args)
     run_holyrics_first_setup(args)
-    ask_holyrics_theme_name(args)
     ask_holyrics_quick_presentation_minutes(args)
     save_startup_settings(args)
 

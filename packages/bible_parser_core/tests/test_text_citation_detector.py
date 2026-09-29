@@ -2521,8 +2521,8 @@ class TextCitationIntegrationTest(unittest.TestCase):
         delayed_result = {"result": [{"start": 10.35, "end": 10.8}]}
         first_clock = reading_list_clock(first_result, fallback=100.0)
         delayed_clock = reading_list_clock(delayed_result, fallback=104.0)
-        self.assertEqual((10.4, "audio"), first_clock)
-        self.assertEqual((10.8, "audio"), delayed_clock)
+        self.assertEqual((10.0, 10.4, "audio"), first_clock)
+        self.assertEqual((10.35, 10.8, "audio"), delayed_clock)
 
         accumulated: list[dict] = []
         state: dict = {}
@@ -2537,7 +2537,8 @@ class TextCitationIntegrationTest(unittest.TestCase):
             first,
             accumulated,
             now=first_clock[0],
-            clock_basis=first_clock[1],
+            speech_end=first_clock[1],
+            clock_basis=first_clock[2],
             state=state,
         )
         third = add_slide_payload({
@@ -2550,7 +2551,8 @@ class TextCitationIntegrationTest(unittest.TestCase):
             third,
             accumulated,
             now=delayed_clock[0],
-            clock_basis=delayed_clock[1],
+            speech_end=delayed_clock[1],
+            clock_basis=delayed_clock[2],
             state=state,
         )
 
@@ -2558,6 +2560,61 @@ class TextCitationIntegrationTest(unittest.TestCase):
             ["Притчи 1:10", "Притчи 2:13", "Притчи 5:8"],
             [item["ref"] for item in third["reference_list"]],
         )
+
+    def test_reading_list_two_second_pause_excludes_words_in_next_address(self) -> None:
+        from tools.vosk_grammar_probe import accumulate_reading_list, add_slide_payload
+
+        accumulated: list[dict] = []
+        state: dict = {}
+        first = add_slide_payload({
+            "text": "матфея три четырнадцать луки восемь семнадцать",
+            "reference_list": [
+                {"ref": "Матфей 3:14"},
+                {"ref": "Лука 8:17"},
+            ],
+        })
+        accumulate_reading_list(
+            first,
+            accumulated,
+            now=84.14,
+            speech_end=88.94,
+            clock_basis="audio",
+            state=state,
+        )
+
+        third = add_slide_payload({
+            "text": "марка пять четыре",
+            "vosk_text": "марка пять четыре",
+            "source": "parser",
+            "parsed": {"ref": "Марк 5:4"},
+        })
+        accumulate_reading_list(
+            third,
+            accumulated,
+            now=90.0,
+            speech_end=91.48,
+            clock_basis="audio",
+            state=state,
+        )
+
+        fourth = add_slide_payload({
+            "text": "и иоанна два десять",
+            "vosk_text": "и иоанна два десять",
+            "source": "parser",
+            "parsed": {"ref": "Иоанн 2:10"},
+        })
+        accumulate_reading_list(
+            fourth,
+            accumulated,
+            now=92.5,
+            speech_end=95.58,
+            clock_basis="audio",
+            state=state,
+        )
+
+        expected = ["Матфей 3:14", "Лука 8:17", "Марк 5:4", "Иоанн 2:10"]
+        self.assertEqual(expected, [item["ref"] for item in fourth["reference_list"]])
+        self.assertEqual("reference_list", fourth["slide"]["slide_type"])
 
     def test_reading_list_closes_after_two_second_pause(self) -> None:
         from tools.vosk_grammar_probe import accumulate_reading_list, add_slide_payload

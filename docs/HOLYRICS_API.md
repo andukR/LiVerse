@@ -27,7 +27,7 @@ Useful sections for LiVerse:
 - `hly('GetTokenInfo')` - returns current token information. In local testing it returned both Holyrics version and enabled permissions.
 - `hly('ShowVerse')` - starts a Bible verse presentation.
 - `hly('SetBibleSettings')` - changes Bible module settings, including `show_x_verses`.
-- `hly('GetThemes')` - returns saved themes. LiVerse uses it during interactive startup to show the operator a theme list.
+- `hly('GetThemes')` - returns saved themes. LiVerse does not ask the operator to choose or persist a theme; this call is only used where the active sermon-plan appearance must be reproduced.
 - `hly('GetBibleVersionsV2')` - returns available Bible versions.
 
 Practical LiVerse startup check:
@@ -35,6 +35,5 @@ Practical LiVerse startup check:
 1. Call `GetAPIServerInfo` to verify that Holyrics API Server is reachable.
 2. Call `GetTokenInfo` to read Holyrics version and current token permissions.
 3. Warn the user if `ShowVerse`, `SetBibleSettings`, or `GetAPIServerInfo` is missing.
-4. During interactive startup, if `GetThemes` is allowed, show the operator the theme list and cache the selected theme ID.
-5. If `GetThemes` is missing, warn the operator and continue with the Holyrics Bible module default theme.
-6. If a theme is selected, send it as `SetBibleSettings {"theme": {"public": "<id>"}}`.
+4. LiVerse leaves theme selection to Holyrics and does not change `SetBibleSettings.theme`.
+5. For ordinary Bible output, use the current Holyrics Bible-module settings. During a sermon-plan presentation, capture the active slide appearance only in memory for the temporary display and restoration; never reuse a saved theme name or ID from an earlier run.
