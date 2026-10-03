@@ -8,6 +8,7 @@ import os
 import re
 import threading
 import time
+from http.client import HTTPException
 from pathlib import Path
 from typing import Any, Mapping
 from urllib import request
@@ -718,16 +719,20 @@ def slide_payload_to_holyrics_body(args: Any, payload: dict) -> dict:
 
 def parse_holyrics_response(body: str) -> tuple[bool, str]:
     if not body:
-        return True, ""
+        return False, "holyrics_invalid_response:empty"
     try:
         parsed = json.loads(body)
     except json.JSONDecodeError:
-        return True, ""
+        return False, "holyrics_invalid_response:json"
+    if not isinstance(parsed, dict):
+        return False, "holyrics_invalid_response:object_required"
 
+    nested = parsed.get("response")
+    if isinstance(nested, dict) and nested.get("status") == "error":
+        return False, f"holyrics_error:{nested.get('error') or nested}"
+    if parsed.get("status") == "error":
+        return False, f"holyrics_error:{parsed.get('error') or parsed}"
     if parsed.get("status") == "ok":
-        nested = parsed.get("response")
-        if isinstance(nested, dict) and nested.get("status") == "error":
-            return False, f"holyrics_error:{nested.get('error') or nested}"
         return True, ""
 
     api_map = parsed.get("map")
@@ -821,10 +826,17 @@ def post_holyrics_api(args: Any, base_url: str, endpoint: str, body: dict) -> tu
             ok, reason = parse_holyrics_response(response_body)
             return finish(ok, reason, response_body, response.status)
     except HTTPError as exc:
-        response_body = exc.read().decode("utf-8", errors="replace").strip()
+        try:
+            response_body = exc.read().decode("utf-8", errors="replace").strip()
+        except (OSError, HTTPException):
+            # The HTTP status already establishes failure even if its body
+            # cannot be read after a connection drop or timeout.
+            response_body = ""
         return finish(False, f"holyrics_http_{exc.code}", response_body, exc.code)
     except URLError as exc:
         return finish(False, f"holyrics_unavailable:{exc.reason}", "", None)
+    except (OSError, HTTPException) as exc:
+        return finish(False, f"holyrics_unavailable:{type(exc).__name__}:{exc}", "", None)
     except Exception as exc:
         holyrics_diagnostic_event(
             args,
@@ -997,7 +1009,13 @@ def restore_sermon_plan_after_quick_presentation(
     return False, "sermon_plan_restore_not_verified", diagnostics
 
 
-def restore_holyrics_presentation(args: Any, base_url: str, previous: dict[str, Any] | None) -> None:
+def restore_holyrics_presentation(
+    args: Any,
+    base_url: str,
+    previous: dict[str, Any] | None,
+    *,
+    quick_presentation: bool = False,
+) -> None:
     presentation_type = str((previous or {}).get("type") or "").strip()
     try:
         slide_number = int((previous or {}).get("slide_number") or 1)
@@ -1017,6 +1035,11 @@ def restore_holyrics_presentation(args: Any, base_url: str, previous: dict[str, 
         holyrics_log(f"ShowText restore response={body or reason or 'ok'}")
         return
 
+    if quick_presentation:
+        ok, reason, _diagnostics = close_holyrics_quick_presentation_verified(args, base_url)
+        holyrics_log(f"temporary quick presentation close: ok={ok}; reason={reason}")
+        return
+
     close_ok, close_reason, close_body = post_holyrics_api(args, base_url, "CloseCurrentPresentation", {})
     holyrics_log(f"CloseCurrentPresentation response={close_body or close_reason or 'ok'}")
     if not close_ok:
@@ -1029,7 +1052,14 @@ def restore_holyrics_presentation(args: Any, base_url: str, previous: dict[str, 
     holyrics_log(f"восстановление презентации типа {presentation_type or '(empty)'} пока не поддержано")
 
 
-def restore_holyrics_presentation_later(args: Any, base_url: str, previous: dict[str, Any] | None, minutes: float) -> None:
+def restore_holyrics_presentation_later(
+    args: Any,
+    base_url: str,
+    previous: dict[str, Any] | None,
+    minutes: float,
+    *,
+    quick_presentation: bool = False,
+) -> None:
     if minutes <= 0:
         return
 
@@ -1047,10 +1077,14 @@ def restore_holyrics_presentation_later(args: Any, base_url: str, previous: dict
                 "elapsed_seconds": round(time.monotonic() - scheduled_at, 3),
                 "previous_type": str((previous or {}).get("type") or ""),
                 "previous_text_id": str((previous or {}).get("text_id") or (previous or {}).get("id") or ""),
+                "temporary_quick_presentation": quick_presentation,
             },
         )
         try:
-            restore_holyrics_presentation(args, base_url, previous)
+            if quick_presentation:
+                restore_holyrics_presentation(args, base_url, previous, quick_presentation=True)
+            else:
+                restore_holyrics_presentation(args, base_url, previous)
         finally:
             if getattr(args, "_holyrics_temporary_verse_display", None) is display_token:
                 setattr(args, "_holyrics_temporary_verse_display", None)
@@ -1075,6 +1109,7 @@ def restore_holyrics_presentation_later(args: Any, base_url: str, previous: dict
             "delay_seconds": delay_seconds,
             "previous_type": str((previous or {}).get("type") or ""),
             "previous_text_id": str((previous or {}).get("text_id") or (previous or {}).get("id") or ""),
+            "temporary_quick_presentation": quick_presentation,
         },
     )
 
@@ -2025,13 +2060,15 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
             return False, show_reason
         clear_scripture_range_reading(args)
         quick_minutes = holyrics_quick_minutes(args)
-        if quick_minutes > 0 and isinstance(restore_presentation, dict):
-            restore_holyrics_presentation_later(
-                args,
-                base_url,
-                restore_presentation,
-                quick_minutes,
-            )
+        if quick_minutes > 0:
+            if isinstance(restore_presentation, dict):
+                restore_holyrics_presentation_later(
+                    args, base_url, restore_presentation, quick_minutes
+                )
+            else:
+                restore_holyrics_presentation_later(
+                    args, base_url, None, quick_minutes, quick_presentation=True
+                )
         suffix = f";temporary_list:{quick_minutes:g}min" if quick_minutes > 0 else ""
         return True, f"show_quick_presentation:{payload.get('slide_type')}{suffix}"
 

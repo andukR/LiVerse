@@ -1,3 +1,5 @@
+import json
+from datetime import datetime, timedelta
 import re
 import tempfile
 import unittest
@@ -20,6 +22,7 @@ from tools.holyrics import (
     format_missing_holyrics_permissions,
     handle_scripture_range_reading_match,
     prepare_sermon_plan_custom_theme,
+    parse_holyrics_response,
     post_holyrics_api,
     post_holyrics_url,
     restore_holyrics_presentation,
@@ -167,6 +170,49 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertEqual(25.0, system_cpu_percent_between((100, 60), (200, 135)))
         self.assertIsNone(system_cpu_percent_between(None, (200, 135)))
+
+    def test_performance_summary_matches_known_correlations_and_weighted_cpu(self):
+        from tools.analyze_vosk_probe_logs import summarize_performance
+
+        with tempfile.TemporaryDirectory() as temporary:
+            session = Path(temporary) / "session"
+            session.mkdir()
+            rows = [
+                {"event": "LIVE_PROCESSING_TIMING", "system_cpu_percent": cpu,
+                 "asr_final_to_decision_ready_ms": duration, "pipeline_call_ms": duration / 2}
+                for cpu, duration in ((0, 10), (50, 20), (100, 30), (None, 40))
+            ]
+            (session / "performance.jsonl").write_text(
+                "\n".join(json.dumps(row) for row in rows), encoding="utf-8"
+            )
+            result = summarize_performance(Path(temporary))["sessions"][0]
+
+        self.assertEqual(4, result["measurements"])
+        self.assertEqual(3, result["metrics"]["system_cpu_percent"]["count"])
+        self.assertEqual(66.667, result["sampled_system_cpu_weighted_mean"])
+        self.assertEqual(0.06, result["sampled_interval_seconds"])
+        self.assertEqual(1.0, result["correlations_pearson"]["system_cpu_vs_processing"])
+        self.assertEqual(1.0, result["correlations_pearson"]["parser_vs_processing"])
+        self.assertEqual([2, 0, 1], [group["measurements"] for group in result["cpu_groups"]])
+
+    def test_performance_summary_does_not_correlate_constant_or_missing_cpu(self):
+        from tools.analyze_vosk_probe_logs import summarize_performance
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "performance.jsonl"
+            path.write_text("\n".join(json.dumps(row) for row in (
+                {"event": "LIVE_PROCESSING_TIMING", "system_cpu_percent": 80,
+                 "asr_final_to_decision_ready_ms": 10},
+                {"event": "LIVE_PROCESSING_TIMING", "system_cpu_percent": 80,
+                 "asr_final_to_decision_ready_ms": 20},
+                {"event": "ordinary_event", "system_cpu_percent": 100},
+            )), encoding="utf-8")
+            result = summarize_performance(path)["sessions"][0]
+
+        self.assertEqual(2, result["measurements"])
+        self.assertIsNone(result["correlations_pearson"]["system_cpu_vs_processing"])
+        self.assertIsNone(result["correlations_pearson"]["parser_vs_processing"])
+        self.assertEqual({"count": 0}, result["metrics"]["audio_queue_items"])
 
     def test_popup_queue_confirms_references_individually_then_builds_list(self):
         from tools.vosk_grammar_probe import JsonlLogger, PopupApprovalQueue
@@ -774,6 +820,148 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertEqual("[скрыто]", response_event["response_body"]["data"]["token"])
         self.assertNotIn("private-token", str(events))
         self.assertNotIn("private-token", urlopen.call_args.args[0].full_url.split("?")[0])
+
+    def test_holyrics_transport_failures_return_failure_and_allow_next_request(self):
+        from http.client import IncompleteRead, RemoteDisconnected
+        from urllib.error import URLError
+
+        class Response:
+            status = 200
+
+            def __init__(self, error=None):
+                self.error = error
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                if self.error is not None:
+                    raise self.error
+                return b'{"status":"ok"}'
+
+        failures = (
+            URLError("connection refused"),
+            TimeoutError("read timed out"),
+            ConnectionResetError("connection reset"),
+            RemoteDisconnected("server closed connection"),
+            IncompleteRead(b'{"status":', 20),
+        )
+        for error in failures:
+            for stage in ("connect", "read"):
+                with self.subTest(error=type(error).__name__, stage=stage):
+                    events = []
+                    args = SimpleNamespace(
+                        holyrics_token="secret",
+                        _holyrics_event_logger=lambda name, row: events.append((name, row)),
+                    )
+                    failure = error if stage == "connect" else Response(error)
+                    with patch(
+                        "tools.holyrics.request.urlopen",
+                        side_effect=[failure, Response()],
+                    ) as urlopen:
+                        ok, reason, _body = post_holyrics_api(
+                            args, "http://127.0.0.1:8091", "ShowVerse", {"id": "43003016"}
+                        )
+                        self.assertFalse(ok)
+                        self.assertTrue(reason.startswith("holyrics_unavailable:"))
+                        # A recovered connection is usable for the next explicit request.
+                        self.assertTrue(post_holyrics_api(
+                            args, "http://127.0.0.1:8091", "ShowVerse", {"id": "43003017"}
+                        )[0])
+                        self.assertEqual(2, urlopen.call_count)
+                    responses = [row for name, row in events if name == "holyrics_api_response"]
+                    self.assertEqual([False, True], [row["ok"] for row in responses])
+
+    def test_holyrics_response_requires_explicit_api_success(self):
+        replies = (
+            ('{"status":"ok"}', True),
+            ('{"status":"ok","data":null}', True),
+            ('{"map":{"key_ok":true}}', True),
+            ('{"map":{"key_ok":"true"}}', True),
+            ('{"status":"error","error":"cannot create slide"}', False),
+            ('{"status":"ok","response":{"status":"error","error":"cannot create slide"}}', False),
+            ('{"map":{"key_ok":true},"response":{"status":"error","error":"cannot create slide"}}', False),
+            ('{"status":"error","map":{"key_ok":true}}', False),
+            ('{"map":{"key_ok":false,"key_error":"not_found"}}', False),
+            ("", False),
+            ("<html>Server unavailable</html>", False),
+            ('{"status":', False),
+            ("null", False),
+            ("[]", False),
+            ('"ok"', False),
+            ("true", False),
+            ("200", False),
+            ("{}", False),
+        )
+        for reply, expected in replies:
+            with self.subTest(reply=reply):
+                ok, reason = parse_holyrics_response(reply)
+                self.assertEqual(expected, ok)
+                if not expected:
+                    self.assertTrue(reason)
+
+    def test_holyrics_invalid_reply_does_not_report_successful_display(self):
+        from tools.holyrics import set_live_latency_context
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b"<html>Server unavailable</html>"
+
+        events = []
+        args = SimpleNamespace(
+            holyrics_token="secret",
+            _holyrics_event_logger=lambda name, row: events.append((name, row)),
+        )
+        set_live_latency_context({"audio_callback_monotonic": 1.0})
+        try:
+            with patch("tools.holyrics.request.urlopen", return_value=Response()):
+                ok, _reason, _body = post_holyrics_api(
+                    args, "http://127.0.0.1:8091", "ShowQuickPresentation", {"slides": []}
+                )
+        finally:
+            set_live_latency_context(None)
+        self.assertFalse(ok)
+        self.assertEqual(
+            ["holyrics_api_request", "holyrics_api_response"],
+            [name for name, _row in events],
+        )
+        self.assertFalse(events[-1][1]["ok"])
+        self.assertEqual(200, events[-1][1]["http_status"])
+
+    def test_holyrics_http_error_body_timeout_preserves_http_failure(self):
+        from urllib.error import HTTPError
+
+        class BrokenBody:
+            def read(self):
+                raise TimeoutError("error body timed out")
+
+            def close(self):
+                pass
+
+        events = []
+        args = SimpleNamespace(
+            holyrics_token="secret",
+            _holyrics_event_logger=lambda name, row: events.append((name, row)),
+        )
+        error = HTTPError("http://127.0.0.1:8091", 401, "Unauthorized", None, BrokenBody())
+        with patch("tools.holyrics.request.urlopen", side_effect=error):
+            ok, reason, _body = post_holyrics_api(
+                args, "http://127.0.0.1:8091", "ShowVerse", {"id": "43003016"}
+            )
+        self.assertFalse(ok)
+        self.assertEqual("holyrics_http_401", reason)
+        self.assertEqual(401, events[-1][1]["http_status"])
 
     def test_phone_operator_has_fullscreen_and_wake_lock_controls(self):
         root = Path(__file__).resolve().parents[3]
@@ -1920,6 +2108,47 @@ class LiveReferencePipelineTest(unittest.TestCase):
             5 / 60.0,
         )
         api.assert_called_once()
+
+    def test_reference_list_without_active_plan_still_has_a_display_timer(self):
+        payload = {
+            "slide_type": "reference_list",
+            "ref": "Ссылки для чтения",
+            "verse": "Притчи 1:10\nПритчи 2:13",
+        }
+        for minutes, show_ok in ((5 / 60, True), (0.0, True), (5 / 60, False)):
+            with self.subTest(minutes=minutes, show_ok=show_ok):
+                args = SimpleNamespace(holyrics_quick_minutes=minutes)
+                with (
+                    patch("tools.holyrics.active_sermon_display_presentation", return_value=(None, False)),
+                    patch("tools.holyrics.cancel_holyrics_restore_timer"),
+                    patch("tools.holyrics.restore_holyrics_presentation_later") as restore_later,
+                    patch("tools.holyrics.post_holyrics_api", return_value=(show_ok, "", "")),
+                ):
+                    ok, _reason = post_holyrics_url(args, "http://127.0.0.1:8091", payload)
+                self.assertEqual(show_ok, ok)
+                if show_ok and minutes > 0:
+                    restore_later.assert_called_once_with(
+                        args, "http://127.0.0.1:8091", None, minutes, quick_presentation=True
+                    )
+                else:
+                    restore_later.assert_not_called()
+
+    def test_reference_list_return_without_plan_closes_only_quick_presentation(self):
+        args = SimpleNamespace()
+        with patch(
+            "tools.holyrics.post_holyrics_api",
+            side_effect=[
+                (True, "", '{"status":"ok"}'),
+                (True, "", '{"status":"ok","data":null}'),
+            ],
+        ) as api:
+            restore_holyrics_presentation(
+                args, "http://127.0.0.1:8091", None, quick_presentation=True
+            )
+        self.assertEqual(
+            ["CloseCurrentQuickPresentation", "GetCurrentQuickPresentation"],
+            [entry.args[2] for entry in api.call_args_list],
+        )
 
     def test_failed_quick_show_records_current_theme_and_background(self):
         args = SimpleNamespace(holyrics_token="secret")
@@ -6750,6 +6979,264 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertTrue(second.get("matched"))
         self.assertEqual("Ефесянам 5:10", second.get("parsed", {}).get("ref"))
+
+
+class LiveSessionCheckTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.session = Path(self.temporary.name)
+        self.metadata = {"liverse_version": "1.2.12", "mode": "microphone", "samplerate": 16000, "blocksize": 8000}
+        start = datetime(2026, 10, 3, 10)
+        self.events, self.timing = [], []
+        for i in range(20):
+            ts = (start + timedelta(seconds=i * 16)).isoformat()
+            self.events.append({"event": "final_raw", "ts": ts, "text": "распознанная фраза",
+                "audio_bytes_seen": (i+1)*32000, "live_timing": {"audio_callback_to_asr_final_ms": 100}})
+            self.timing.append({"event": "LIVE_PROCESSING_TIMING", "ts": ts, "audio_bytes_seen": (i+1)*32000,
+                "audio_callback_to_decision_ready_ms": 500, "asr_final_to_decision_ready_ms": 400,
+                "pipeline_call_ms": 300, "reference_parse_ms": 250, "audio_queue_items": 0, "system_cpu_percent": 99})
+        self.events.extend([
+            {"event": "parsed", "payload": {"ref": "Иоанн 3:16", "reference_list": [{"ref": "Иоанн 3:16"}]}},
+            {"event": "holyrics_api_response", "ok": True, "endpoint": "ShowVerse"},
+            {"event": "STREAMING_SLIDE_CONTROL", "ok": True, "current_index": 0, "target_index": 1},
+            {"event": "session_stopped", "reason": "operator_stop", "audio_queue_items": 0},
+        ])
+
+    def check(self):
+        from tools.analyze_vosk_probe_logs import check_live_session
+        (self.session / "session.json").write_text(json.dumps(self.metadata))
+        for name, rows in (("events.jsonl", self.events), ("performance.jsonl", self.timing)):
+            (self.session / name).write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+        return check_live_session(self.session)
+
+    def test_complete_fast_session_passes_only_conditionally_despite_high_cpu(self):
+        from tools.analyze_vosk_probe_logs import format_session_check
+        report = self.check()
+        self.assertEqual("conditional", report["status"])
+        self.assertEqual(20, report["measurements"])
+        self.assertEqual(304, report["speech_span_seconds"])
+        self.assertEqual(500, report["metrics"]["audio_callback_to_decision_ready_ms"]["p95"])
+        self.assertIn("не подтверждают изображение", format_session_check(report))
+
+    def test_a_single_large_delay_is_not_hidden_by_good_percentile(self):
+        self.timing[4]["audio_callback_to_decision_ready_ms"] = 9000
+        report = self.check()
+        self.assertEqual("failed", report["status"])
+        self.assertTrue(any("максимальная задержка" in r for r in report["failures"]))
+
+    def plan_restore_after_absent_quick(self):
+        # Recorded sequence from the live 03.10 test, including matched API IDs.
+        start = datetime(2026, 10, 3, 10, 5, 5)
+        rows = [
+            {"event": "holyrics_api_request", "endpoint": "CloseCurrentQuickPresentation", "request_id": "close", "base_url": "http://localhost:8091"},
+            {"event": "holyrics_api_response", "endpoint": "CloseCurrentQuickPresentation", "request_id": "close", "ok": False,
+             "http_status": 200, "reason": "holyrics_error:No quick presentation available",
+             "response_body": {"status": "error", "error": "No quick presentation available"}},
+            {"event": "holyrics_api_request", "endpoint": "ShowText", "request_id": "show", "base_url": "http://localhost:8091",
+             "request_body": {"id": "sermon-plan", "initial_index": 2}},
+            {"event": "holyrics_api_response", "endpoint": "ShowText", "request_id": "show", "ok": True, "http_status": 200,
+             "response_body": {"status": "ok"}},
+            {"event": "holyrics_api_request", "endpoint": "GetCurrentPresentation", "request_id": "state", "base_url": "http://localhost:8091"},
+            {"event": "holyrics_api_response", "endpoint": "GetCurrentPresentation", "request_id": "state", "ok": True, "http_status": 200,
+             "response_body": {"status": "ok", "data": {"type": "text", "text_id": "sermon-plan", "slide_number": 3}}},
+            {"event": "STREAMING_SLIDE_CONTROL", "ok": True, "reason": "sermon_plan_restore_verified", "action": "complete_range",
+             "completed": True, "restored_sermon_plan": True},
+        ]
+        for i, row in enumerate(rows):
+            row["ts"] = (start + timedelta(milliseconds=i * 30)).isoformat()
+        return rows
+
+    def test_verified_already_closed_plan_return_is_not_a_display_failure(self):
+        from tools.analyze_vosk_probe_logs import format_session_check
+        self.events[-1:-1] = self.plan_restore_after_absent_quick()
+        report = self.check()
+        self.assertEqual("conditional", report["status"])
+        self.assertEqual(1, report["api_failed_replies"])
+        self.assertEqual(1, report["api_verified_absent_quick_closes"])
+        self.assertIn("возврат к нужному слайду плана подтверждён", format_session_check(report))
+
+    def test_already_closed_does_not_hide_incomplete_wrong_or_unrelated_restore(self):
+        original = list(self.events)
+        changes = ("missing_state", "wrong_plan", "wrong_slide", "quick_still_active", "failed_show",
+                   "wrong_request_id", "other_server", "missing_completion", "unrelated_output", "late_completion",
+                   "transport_error", "other_endpoint", "missing_close_request", "unknown_result", "malformed_body",
+                   "reused_request_id", "bad_http_status")
+        for change in changes:
+            with self.subTest(change=change):
+                rows = self.plan_restore_after_absent_quick()
+                if change == "missing_state":
+                    rows.pop(5)
+                elif change in ("wrong_plan", "wrong_slide", "quick_still_active"):
+                    data = rows[5]["response_body"]["data"]
+                    field, value = {"wrong_plan": ("text_id", "other-plan"), "wrong_slide": ("slide_number", 4),
+                                    "quick_still_active": ("type", "quick_presentation")}[change]
+                    data[field] = value
+                elif change == "failed_show":
+                    rows[3]["ok"] = False
+                elif change == "wrong_request_id":
+                    rows[5]["request_id"] = "other-state"
+                elif change == "other_server":
+                    rows[4]["base_url"] = "http://other-server:8091"
+                elif change == "missing_completion":
+                    rows.pop()
+                elif change == "unrelated_output":
+                    rows.insert(6, {"event": "holyrics_api_request", "endpoint": "ShowVerse"})
+                elif change == "late_completion":
+                    rows[-1]["ts"] = "2026-10-03T10:05:11"
+                elif change == "transport_error":
+                    rows[1]["reason"], rows[1]["http_status"] = "timeout", None
+                elif change == "other_endpoint":
+                    rows[0]["endpoint"] = rows[1]["endpoint"] = "ShowVerse"
+                elif change == "missing_close_request":
+                    rows.pop(0)
+                elif change == "unknown_result":
+                    rows[1]["ok"] = None
+                elif change == "reused_request_id":
+                    rows[4]["request_id"] = rows[5]["request_id"] = "show"
+                elif change == "bad_http_status":
+                    rows[5]["http_status"] = 500
+                else:
+                    rows[1]["response_body"] = '{'
+                self.events = original[:-1] + rows + original[-1:]
+                report = self.check()
+                self.assertEqual("failed", report["status"])
+                self.assertEqual(0, report["api_verified_absent_quick_closes"])
+
+    def test_verified_close_keeps_other_failures_and_short_speech_visible(self):
+        rows = self.plan_restore_after_absent_quick()
+        self.events[-1:-1] = rows
+        for i in range(20):
+            ts = (datetime(2026, 10, 3, 10) + timedelta(seconds=279 * i / 19)).isoformat()
+            self.events[i]["ts"] = self.timing[i]["ts"] = ts
+        report = self.check()
+        self.assertEqual("insufficient", report["status"])
+        self.assertEqual(279, report["speech_span_seconds"])
+        self.assertEqual([], report["failures"])
+        self.events.insert(-1, {"event": "holyrics_api_response", "endpoint": "ShowVerse", "ok": False})
+        report = self.check()
+        self.assertEqual("failed", report["status"])
+        self.assertEqual(2, report["api_failed_replies"])
+        self.assertEqual(1, report["api_verified_absent_quick_closes"])
+        self.assertTrue(any("Holyrics: 1" in r for r in report["failures"]))
+
+    def test_growing_queue_and_undrained_stop_are_failures(self):
+        for i, row in enumerate(self.timing):
+            row["audio_queue_items"] = i // 2
+        self.events[-1]["audio_queue_items"] = 7
+        report = self.check()
+        self.assertEqual("failed", report["status"])
+        self.assertTrue(any("выросла" in r for r in report["failures"]))
+        self.assertEqual(3.5, report["queue_at_stop_seconds"])
+
+    def test_same_count_with_mismatched_or_invalid_samples_cannot_pass(self):
+        for change in ("ids", "nan", "negative"):
+            with self.subTest(change=change):
+                original = dict(self.timing[4])
+                if change == "ids":
+                    self.timing[4]["audio_bytes_seen"] = 1
+                else:
+                    self.timing[4]["audio_callback_to_decision_ready_ms"] = float("nan") if change == "nan" else -1
+                self.assertEqual("insufficient", self.check()["status"])
+                self.timing[4] = original
+
+    def test_intentionally_paused_recognition_is_not_a_missing_processing_sample(self):
+        sample = self.timing.pop(4)
+        self.events.insert(5, {"event": "TEMPORARY_VERSE_READING", "action": "recognition_paused", "audio_bytes_seen": sample["audio_bytes_seen"]})
+        self.assertEqual("conditional", self.check()["status"])
+
+    def test_replay_incomplete_scenarios_or_missing_stop_cannot_pass(self):
+        self.metadata["mode"] = "audio_replay"
+        self.assertEqual("insufficient", self.check()["status"])
+        self.metadata["mode"] = "microphone"
+        self.events[-1]["event"] = "other"
+        self.assertEqual("insufficient", self.check()["status"])
+        self.events[-1]["event"] = "session_stopped"
+        self.events[-3]["endpoint"] = "GetCurrentPresentation"
+        self.assertEqual("insufficient", self.check()["status"])
+        self.events[-3]["endpoint"] = "ShowVerse"
+        self.events[-4]["payload"]["reference_list"] = []
+        self.assertEqual("insufficient", self.check()["status"])
+
+    def test_missing_or_damaged_logs_never_pass(self):
+        from tools.analyze_vosk_probe_logs import check_live_session
+        self.check()
+        path = self.session / "performance.jsonl"
+        path.unlink()
+        self.assertEqual("insufficient", check_live_session(self.session)["status"])
+        for contents in ('{', '[1,2]', '\ufffd'):
+            path.write_text(contents, encoding="utf-8")
+            self.assertEqual("insufficient", check_live_session(self.session)["status"])
+
+    def test_output_failures_take_precedence_over_short_test(self):
+        self.events[-3]["ok"] = False
+        self.events = [r for i,r in enumerate(self.events) if i >= 10]
+        report = self.check()
+        self.assertEqual("failed", report["status"])
+        self.assertTrue(report["missing"])
+
+    def test_gui_check_requires_stop_and_one_session_without_network(self):
+        from tools.liverse_gui import LiVerseGui
+        gui = SimpleNamespace(logs_listbox=SimpleNamespace(curselection=lambda: (0,)), process=SimpleNamespace(poll=lambda: None))
+        with patch("tools.liverse_gui.messagebox.showinfo") as info, patch("tools.liverse_gui.check_live_session") as analyze:
+            LiVerseGui._check_selected_log(gui)
+        info.assert_called_once()
+        analyze.assert_not_called()
+
+    def test_diagnostic_gui_does_not_persist_test_settings(self):
+        from tools.liverse_gui import LiVerseGui, GuiConfig
+        gui = SimpleNamespace(diagnostic_test=True, _collect_config=lambda: GuiConfig(),
+            _refresh_database_status=lambda: None, process=None, start_engine=lambda: None)
+        with patch("tools.liverse_gui.save_gui_config") as save:
+            LiVerseGui.save_and_start(gui)
+        save.assert_not_called()
+
+    def test_console_guide_addresses_are_recognized_and_list_keeps_four_items(self):
+        from tools.benchmark_local import church_reading_text
+        text = church_reading_text()
+        first = next(line for line in text.splitlines() if line.startswith("Откроем Евангелие"))
+        long = next(line for line in text.splitlines() if line.startswith("Прочитаем Евангелие"))
+        self.assertEqual("Иоанн 3:16", LiveReferencePipeline().process_text(first, now_ms=0)["parsed"]["ref"])
+        self.assertEqual("Лука 15:11-24", LiveReferencePipeline().process_text(long, now_ms=0)["parsed"]["ref"])
+        lines = text.splitlines()
+        start = next(i for i,line in enumerate(lines) if line.startswith("Запишем четыре"))
+        result = LiveReferencePipeline().process_text(" ".join(lines[start:start+4]), now_ms=0)
+        self.assertEqual(["Иоанн 3:16", "Римлянам 8:1", "Ефесянам 2:8", "Матфей 5:9"], [r["ref"] for r in result["reference_list"]])
+
+    def test_gui_and_console_guides_use_the_same_spoken_text_with_correct_setup(self):
+        from tools.benchmark_local import church_reading_text
+        console = church_reading_text()
+        gui = church_reading_text(diagnostic_test=False)
+        self.assertEqual(re.sub(r"\[.*?\]", "", console, flags=re.S),
+                         re.sub(r"\[.*?\]", "", gui, flags=re.S))
+        self.assertIn("Настройки теста временные", console)
+        self.assertNotIn("Настройки теста временные", gui)
+        self.assertIn("настройки и запуск распознавания выполняет оператор", gui)
+
+    def test_cpu_selection_keeps_two_distinct_physical_cores(self):
+        from tools.benchmark_local import church_cpu_ids
+        for cpu, core in ((0,0), (1,0), (2,1), (3,1), (4,2)):
+            root = self.session / f"cpu{cpu}" / "topology"
+            root.mkdir(parents=True)
+            (root / "core_id").write_text(str(core))
+            (root / "physical_package_id").write_text("0")
+        self.assertEqual([0,1,2,3], church_cpu_ids(self.session, allowed=[0,1,2,3,4]))
+        with self.assertRaises(ValueError):
+            church_cpu_ids(self.session, allowed=[0,1])
+
+    def test_worker_refuses_unlimited_or_incorrect_cpu_quota(self):
+        from tools.benchmark_local import verify_church_limits
+        for raw in ("max 20000", "10000 20000"):
+            with self.subTest(quota=raw), patch("tools.benchmark_local.os.sched_getaffinity", return_value={0,1,2,3}), patch("tools.benchmark_local.Path.read_text", side_effect=["0::/test", raw]):
+                with self.assertRaises(ValueError):
+                    verify_church_limits([0,1,2,3], 100)
+
+    def test_corrupted_host_information_is_reported_without_crashing_renderer(self):
+        from tools.analyze_vosk_probe_logs import format_session_check
+        self.metadata["host"] = "not a hardware object"
+        report = self.check()
+        self.assertEqual("insufficient", report["status"])
+        self.assertIn("Повреждены сведения", format_session_check(report))
 
 
 if __name__ == "__main__":

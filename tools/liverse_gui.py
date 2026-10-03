@@ -14,7 +14,7 @@ import sys
 import threading
 import traceback
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,6 +44,7 @@ from tools.holyrics import (  # noqa: E402
     save_holyrics_env,
 )
 from tools import __version__  # noqa: E402
+from tools.analyze_vosk_probe_logs import check_live_session, format_session_check  # noqa: E402
 from tools.release_updater import (  # noqa: E402
     ReleaseUpdateError,
     check_windows_release_update,
@@ -547,10 +548,15 @@ def tray_needs_own_event_loop(*, platform: str | None = None, backend: str = "")
 
 
 class LiVerseGui:
-    def __init__(self, root: tk.Tk, instance_guard: SingleInstanceGuard | None = None):
+    def __init__(self, root: tk.Tk, instance_guard: SingleInstanceGuard | None = None, *, diagnostic_test: bool = False):
         self.root = root
         self.instance_guard = instance_guard
         self.config = load_gui_config()
+        self.diagnostic_test = diagnostic_test
+        if diagnostic_test:
+            self.config = replace(self.config, performance_diagnostics=True, auto_hide=False,
+                                  long_range_slide_mode="one_verse", smart_slide_streaming_control=True,
+                                  citation_detection_mode="hybrid_confirm", run_mode="semi_auto", quick_seconds=5.0)
         self.process: subprocess.Popen[str] | None = None
         self.output_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.tray_icon = None
@@ -606,7 +612,8 @@ class LiVerseGui:
         self._refresh_database_status()
         self._start_tray()
         self.root.after(100, self._poll_events)
-        self.root.after(350, self._begin_update_check)
+        if not diagnostic_test:
+            self.root.after(350, self._begin_update_check)
 
     def _create_primary_button(self, parent: tk.Misc, **kwargs):
         if os.name == "nt":
@@ -627,9 +634,13 @@ class LiVerseGui:
 
     def _configure_window(self) -> None:
         self.root.title(f"LiVerse {__version__}")
+        if self.diagnostic_test:
+            self.root.title(f"LiVerse {__version__} — диагностический тест")
         self.root.geometry("760x640")
         self.root.minsize(700, 560)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
+        if self.diagnostic_test:
+            self.root.protocol("WM_DELETE_WINDOW", self.quit_application)
         try:
             self.root.iconphoto(True, tk.PhotoImage(file=str(PROJECT_ROOT / "LiVerse.png")))
         except tk.TclError:
@@ -748,6 +759,34 @@ class LiVerseGui:
         ttk.Button(buttons, text="Проверить HoLyrics", command=self.check_holyrics).pack(side="left", padx=8)
         ttk.Button(buttons, text="Завершить LiVerse", command=self.quit_application).pack(side="right")
         ttk.Button(buttons, text="Скрыть", command=self.hide_window).pack(side="right", padx=8)
+        ttk.Button(self.status_tab, text="Текст для тестирования", command=self._show_test_text).pack(
+            anchor="w", pady=(10, 0)
+        )
+
+    def _show_test_text(self) -> None:
+        from tools.benchmark_local import church_reading_text
+
+        existing = getattr(self, "test_text_window", None)
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            return
+        rendered = church_reading_text(diagnostic_test=self.diagnostic_test)
+        window = tk.Toplevel(self.root)
+        self.test_text_window = window
+        window.title("LiVerse — текст для тестирования")
+        window.geometry("860x620")
+        window.minsize(520, 360)
+        frame = ttk.Frame(window, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Button(frame, text="Закрыть", command=window.destroy).pack(side="bottom", anchor="e", pady=(10, 0))
+        text = tk.Text(frame, wrap="word", font=("Segoe UI", 12), padx=8, pady=8)
+        scroll = ttk.Scrollbar(frame, command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        text.pack(fill="both", expand=True)
+        text.insert("1.0", rendered)
+        text.configure(state="disabled")
 
     def _build_settings_tab(self) -> None:
         self.settings_tab.columnconfigure(0, weight=3, uniform="settings_column")
@@ -939,6 +978,8 @@ class LiVerseGui:
         ttk.Button(actions, text="Выбрать последний", command=self._select_latest_log).pack(
             side="left", padx=8
         )
+        self.check_log_button = ttk.Button(actions, text="Проверить сеанс", command=self._check_selected_log)
+        self.check_log_button.pack(side="left")
         self._create_primary_button(
             actions,
             text="Создать архив…",
@@ -990,6 +1031,50 @@ class LiVerseGui:
             "LiVerse",
             f"Архив создан:\n{filename}\n\nДобавлено файлов: {count}",
         )
+
+    def _check_selected_log(self) -> None:
+        selected = self.logs_listbox.curselection()
+        if len(selected) != 1:
+            messagebox.showinfo("LiVerse", "Выберите один сеанс для проверки.")
+            return
+        if self.process is not None and self.process.poll() is None:
+            messagebox.showinfo("LiVerse", "Сначала остановите распознавание, затем проверьте журнал.")
+            return
+        session = self.log_sessions[selected[0]]
+        self.check_log_button.configure(state="disabled")
+
+        def work():
+            self.output_queue.put(("session_check", check_live_session(session)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_session_check(self, report: dict) -> None:
+        self.check_log_button.configure(state="normal")
+        window = tk.Toplevel(self.root)
+        window.title("LiVerse — проверка журнала")
+        window.geometry("820x620")
+        frame = ttk.Frame(window, padding=12)
+        frame.pack(fill="both", expand=True)
+        text = tk.Text(frame, wrap="word", font=("Segoe UI", 10))
+        scroll = ttk.Scrollbar(frame, command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        text.pack(fill="both", expand=True)
+        rendered = format_session_check(report)
+        text.insert("1.0", rendered)
+        text.configure(state="disabled")
+
+        def save():
+            filename = filedialog.asksaveasfilename(parent=window, title="Сохранить результат проверки",
+                initialfile=f"LiVerse-check-{Path(report['session']).name}.txt",
+                defaultextension=".txt", filetypes=[("Текст", "*.txt")])
+            if filename:
+                try:
+                    Path(filename).write_text(rendered + "\n", encoding="utf-8")
+                except OSError as exc:
+                    messagebox.showerror("LiVerse", f"Не удалось сохранить отчёт: {exc}", parent=window)
+
+        ttk.Button(window, text="Сохранить отчёт…", command=save).pack(pady=8)
 
     def _build_help_tab(self) -> None:
         self.help_tab.rowconfigure(0, weight=1)
@@ -1157,7 +1242,8 @@ class LiVerseGui:
         if config is None:
             return
         try:
-            save_gui_config(config)
+            if not getattr(self, "diagnostic_test", False):
+                save_gui_config(config)
         except OSError as exc:
             messagebox.showerror("LiVerse", f"Не удалось сохранить настройки:\n{exc}")
             return
@@ -1207,6 +1293,8 @@ class LiVerseGui:
             write_gui_log(f"Не удалось удалить старую команду остановки: {exc}")
         environment = os.environ.copy()
         environment["PYTHONUTF8"] = "1"
+        if self.diagnostic_test:
+            environment["HOLYRICS_TOKEN"] = self.config.holyrics_token
         kwargs: dict[str, object] = {}
         if os.name == "nt":
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
@@ -1319,6 +1407,8 @@ class LiVerseGui:
                     self._handle_holyrics_result(payload)
                 elif event == "show":
                     self.show_window()
+                elif event == "session_check":
+                    self._show_session_check(payload)
         except queue.Empty:
             pass
         self.root.after(100, self._poll_events)
@@ -1707,6 +1797,26 @@ def run_packaged_gui_smoke_test() -> int:
                     )
         if not app.tray_available:
             failures.append(f"tray backend did not start: {app.tray_backend or 'unknown'}")
+        try:
+            from tools.benchmark_local import church_reading_text
+
+            button = next(w for w in app.status_tab.winfo_children()
+                          if isinstance(w, ttk.Button) and w.cget("text") == "Текст для тестирования")
+            button.invoke()
+            window = app.test_text_window
+            window.withdraw()
+            reading = next(w for frame in window.winfo_children() for w in frame.winfo_children()
+                           if isinstance(w, tk.Text))
+            if reading.get("1.0", "end-1c") != church_reading_text(diagnostic_test=False):
+                failures.append("packaged test reading text is incomplete")
+            if reading.cget("state") != "disabled" or root.grab_current() is not None:
+                failures.append("test reading window is editable or blocks operator controls")
+            button.invoke()
+            if app.test_text_window is not window:
+                failures.append("repeated test reading button creates duplicate windows")
+            window.destroy()
+        except (ImportError, OSError, ValueError, AttributeError, StopIteration, tk.TclError) as exc:
+            failures.append(f"packaged test reading window failed: {exc}")
         if failures:
             write_gui_log("Windows package smoke test failed: " + "; ".join(failures))
         else:
@@ -1732,7 +1842,7 @@ def main() -> int:
         if not instance_guard.acquire():
             return 0
         root = tk.Tk(className="LiVerse")
-        app = LiVerseGui(root, instance_guard)
+        app = LiVerseGui(root, instance_guard, diagnostic_test="--diagnostic-test" in sys.argv[1:])
         instance_guard.on_show = lambda: app.output_queue.put(("show", None))
         signal.signal(signal.SIGTERM, lambda _signum, _frame: root.after(0, app.quit_application))
         try:

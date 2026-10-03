@@ -8,7 +8,9 @@ import csv
 import json
 import math
 import re
+import statistics
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 from bible_parser_core.live_pipeline import score_reference_risk
@@ -957,10 +959,359 @@ def summarize(log_dir: Path) -> dict:
     }
 
 
+def summarize_performance(log_dir: Path) -> dict:
+    """Describe sampled post-ASR intervals, never an entire-session CPU mean."""
+    paths = [log_dir] if log_dir.is_file() else sorted(log_dir.rglob("performance.jsonl"))
+    fields = (
+        "system_cpu_percent", "process_cpu_percent", "asr_final_to_decision_ready_ms",
+        "pipeline_call_ms", "reference_parse_ms", "other_post_asr_ms", "audio_queue_items",
+    )
+
+    def numeric(value: object) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+    def summary(values: list[float]) -> dict:
+        values = sorted(values)
+        if not values:
+            return {"count": 0}
+        return {
+            "count": len(values),
+            "median": round(statistics.median(values), 3),
+            "p95": round(values[math.ceil(len(values) * 0.95) - 1], 3),
+            "max": round(values[-1], 3),
+        }
+
+    def correlation(rows: list[dict], left: str, right: str) -> float | None:
+        pairs = [(row[left], row[right]) for row in rows
+                 if numeric(row.get(left)) and numeric(row.get(right))]
+        if len(pairs) < 2:
+            return None
+        x, y = zip(*pairs)
+        mx, my = statistics.mean(x), statistics.mean(y)
+        denominator = math.sqrt(sum((v - mx) ** 2 for v in x) * sum((v - my) ** 2 for v in y))
+        return round(sum((a - mx) * (b - my) for a, b in pairs) / denominator, 3) if denominator else None
+
+    sessions = []
+    for path in paths:
+        rows = [row for row in load_jsonl(path) if row.get("event") == "LIVE_PROCESSING_TIMING"]
+        weighted = [row for row in rows if numeric(row.get("system_cpu_percent"))
+                    and numeric(row.get("asr_final_to_decision_ready_ms"))
+                    and row["asr_final_to_decision_ready_ms"] > 0]
+        duration_ms = sum(row["asr_final_to_decision_ready_ms"] for row in weighted)
+        groups = []
+        for lower, upper in ((0, 70), (70, 90), (90, 101)):
+            group = [row for row in rows if numeric(row.get("system_cpu_percent"))
+                     and lower <= row["system_cpu_percent"] < upper]
+            groups.append({
+                "cpu_min_inclusive": lower, "cpu_max_exclusive": upper,
+                "measurements": len(group),
+                "processing_ms": summary([row["asr_final_to_decision_ready_ms"] for row in group
+                                          if numeric(row.get("asr_final_to_decision_ready_ms"))]),
+            })
+        sessions.append({
+            "session": path.parent.name, "measurements": len(rows),
+            "metrics": {field: summary([row[field] for row in rows if numeric(row.get(field))])
+                        for field in fields},
+            "correlations_pearson": {
+                "system_cpu_vs_processing": correlation(rows, "system_cpu_percent", "asr_final_to_decision_ready_ms"),
+                "system_cpu_vs_queue": correlation(rows, "system_cpu_percent", "audio_queue_items"),
+                "parser_vs_processing": correlation(rows, "pipeline_call_ms", "asr_final_to_decision_ready_ms"),
+            },
+            "cpu_groups": groups,
+            "sampled_interval_seconds": round(duration_ms / 1000, 3),
+            "sampled_system_cpu_weighted_mean": round(
+                sum(row["system_cpu_percent"] * row["asr_final_to_decision_ready_ms"]
+                    for row in weighted) / duration_ms, 3
+            ) if duration_ms else None,
+        })
+    return {
+        "scope": "CPU is sampled during post-ASR processing only; process 100% equals one busy CPU; correlation is not causation",
+        "sessions": sessions,
+    }
+
+
+def verified_absent_quick_closes(events: list[dict]) -> set[int]:
+    """Recognize only the already-closed response followed by verified plan return.
+
+    Keep raw failures intact. A later, unrelated success must not hide a failure.
+    The live restore helper already handles this exact Holyrics response.
+    """
+    recovered = set()
+    api_events = [(i, r) for i, r in enumerate(events)
+                  if r.get("event") in ("holyrics_api_request", "holyrics_api_response")]
+
+    def body(row):
+        value = row.get("response_body")
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                return {}
+        return value if isinstance(value, dict) else {}
+
+    for pos, (index, close) in enumerate(api_events):
+        if (close.get("event") != "holyrics_api_response" or close.get("ok") is not False
+                or close.get("endpoint") != "CloseCurrentQuickPresentation"
+                or close.get("http_status") != 200
+                or close.get("reason") != "holyrics_error:No quick presentation available"
+                or body(close) != {"status": "error", "error": "No quick presentation available"}
+                or pos == 0 or pos + 4 >= len(api_events)):
+            continue
+        close_request = api_events[pos - 1][1]
+        if (close_request.get("event") != "holyrics_api_request"
+                or close_request.get("endpoint") != close["endpoint"]
+                or not close.get("request_id") or close_request.get("request_id") != close["request_id"]
+                or not close_request.get("base_url")):
+            continue
+        (_, show), (_, shown), (_, get), (state_index, state) = api_events[pos + 1:pos + 5]
+        if len({close["request_id"], show.get("request_id"), get.get("request_id")}) != 3:
+            continue
+        valid_pairs = True
+        for request, response, endpoint in ((show, shown, "ShowText"), (get, state, "GetCurrentPresentation")):
+            if (request.get("event") != "holyrics_api_request" or response.get("event") != "holyrics_api_response"
+                    or request.get("endpoint") != endpoint or response.get("endpoint") != endpoint
+                    or not request.get("request_id") or request["request_id"] != response.get("request_id")
+                    or request.get("base_url") != close_request["base_url"]
+                    or response.get("ok") is not True or response.get("http_status") != 200
+                    or body(response).get("status") != "ok"):
+                valid_pairs = False
+        target = show.get("request_body")
+        current = body(state).get("data")
+        if not valid_pairs or not isinstance(target, dict) or not isinstance(current, dict):
+            continue
+        slide = target.get("initial_index")
+        if (not isinstance(slide, int) or isinstance(slide, bool) or slide < 0 or not target.get("id")
+                or current.get("type") != "text" or (current.get("text_id") or current.get("id")) != target["id"]
+                or type(current.get("slide_number")) is not int or current["slide_number"] != slide + 1):
+            continue
+        # The first subsequent control/API event must confirm this operation.
+        completion = next((r for r in events[state_index + 1:]
+                           if r.get("event") in ("STREAMING_SLIDE_CONTROL", "holyrics_api_request", "holyrics_api_response")), {})
+        if (completion.get("event") != "STREAMING_SLIDE_CONTROL" or completion.get("ok") is not True
+                or completion.get("reason") != "sermon_plan_restore_verified"
+                or completion.get("action") != "complete_range" or completion.get("completed") is not True
+                or completion.get("restored_sermon_plan") is not True):
+            continue
+        try:
+            times = [datetime.fromisoformat(r["ts"]) for r in (close_request, close, show, shown, get, state, completion)]
+            if all(a <= b for a, b in zip(times, times[1:])) and 0 <= (times[-1] - times[0]).total_seconds() <= 5:
+                recovered.add(index)
+        except (KeyError, TypeError, ValueError):
+            continue
+    return recovered
+
+
+def check_live_session(session: Path) -> dict:
+    """Conservative technical check, never proof of projector output or a whole service."""
+    report = {
+        "session": str(session), "status": "insufficient", "version": "неизвестна",
+        "failures": [], "missing": [], "notes": [], "metrics": {},
+        "policy": {"min_speech_span_seconds": 300, "min_finals": 20,
+                   "p95_delay_ms": 3000, "max_delay_ms": 6000},
+        "limitations": [
+            "Задержка измеряется от последнего аудиоблока фразы, без ожидания паузы говорящего.",
+            "Ответы Holyrics не подтверждают изображение на экране. Проверьте адреса, список и УПС лично.",
+            "Короткий тест не гарантирует устойчивость всего богослужения; нужен оператор и ручное управление.",
+        ],
+    }
+    failures, missing = report["failures"], report["missing"]
+
+    def read_rows(name):
+        path = session / name
+        if not path.is_file():
+            missing.append(f"Отсутствует {name}.")
+            return []
+        rows = []
+        for number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
+            if not line.strip():
+                continue
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                raise ValueError(f"{name}, строка {number}: ожидается запись журнала.")
+            rows.append(value)
+        return rows
+
+    def nonnegative(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+
+    def stats(values):
+        values = sorted(values)
+        if not values:
+            return {"count": 0}
+        return {"count": len(values), "median": round(statistics.median(values), 1),
+                "p95": round(values[math.ceil(.95 * len(values)) - 1], 1),
+                "max": round(values[-1], 1)}
+
+    try:
+        metadata = json.loads((session / "session.json").read_text(encoding="utf-8-sig"))
+        if not isinstance(metadata, dict):
+            raise ValueError("session.json должен содержать объект.")
+        report["version"] = str(metadata.get("liverse_version") or "неизвестна")
+        report["host"] = metadata.get("host") or {}
+        if not isinstance(report["host"], dict):
+            report["host"] = {}
+            missing.append("Повреждены сведения о компьютере в session.json.")
+        events = read_rows("events.jsonl")
+        performance = read_rows("performance.jsonl")
+        finals = [r for r in events if r.get("event") == "final_raw" and str(r.get("text") or "").strip()]
+        timing = [r for r in performance if r.get("event") == "LIVE_PROCESSING_TIMING"]
+        paused = {r.get("audio_bytes_seen") for r in events
+                  if r.get("event") == "TEMPORARY_VERSE_READING" and r.get("action") == "recognition_paused"}
+        processed = [r for r in finals if r.get("audio_bytes_seen") not in paused or r.get("audio_bytes_seen") is None]
+        report["finals"] = len(finals)
+        report["measurements"] = len(timing)
+        if metadata.get("mode") not in (None, "microphone", "live"):
+            missing.append("Это не живой сеанс с микрофоном; допуск к богослужению по нему не выдаётся.")
+        if report["version"] == "неизвестна":
+            missing.append("Не записана версия LV.")
+        if metadata.get("diagnostic_test_profile"):
+            report["limitations"].insert(0, "Сеанс с ограничением ресурсов ноутбука: имитация не откалибрована под церковный процессор.")
+        if not finals:
+            missing.append("Нет распознанных непустых фраз.")
+        if len(finals) < report["policy"]["min_finals"]:
+            missing.append("Нужно не менее 20 непустых фраз.")
+        timestamps = [datetime.fromisoformat(r["ts"]) for r in finals]
+        if any(a > b for a, b in zip(timestamps, timestamps[1:])):
+            raise ValueError("Нарушен порядок времени распознанных фраз.")
+        span = (timestamps[-1] - timestamps[0]).total_seconds() if timestamps else 0
+        report["speech_span_seconds"] = round(span, 1)
+        if span < report["policy"]["min_speech_span_seconds"]:
+            missing.append("Между первой и последней непустой фразой должно пройти не менее 5 минут; читайте непрерывно.")
+        # A stop can interrupt the final interval. Never silently treat lost
+        # processing records (or duplicated records) as successful coverage.
+        ids = [r.get("audio_bytes_seen") for r in processed]
+        measured_ids = [r.get("audio_bytes_seen") for r in timing]
+        if (len(timing) != len(processed) or any(not isinstance(v, int) or isinstance(v, bool) or v <= 0 for v in ids + measured_ids)
+                or len(set(ids)) != len(ids) or ids != measured_ids):
+            missing.append(f"Неполные или несогласованные замеры: фраз для обработки {len(processed)}, измерений {len(timing)}.")
+        if len(timing) < 10:
+            missing.append("Нужно не менее 10 измерений обработки фраз.")
+        stops = [r for r in events if r.get("event") == "session_stopped"]
+        if not stops:
+            missing.append("Нет записи штатной остановки. Остановите распознавание перед проверкой.")
+        elif stops[-1].get("reason") not in ("operator_stop", "keyboard_interrupt"):
+            failures.append("Распознавание завершилось нештатно.")
+        if stops and any(r.get("event") == "final_raw" for r in events[events.index(stops[-1]) + 1:]):
+            missing.append("После остановки появились новые фразы; выберите завершённый сеанс.")
+        for field in ("audio_callback_to_decision_ready_ms", "asr_final_to_decision_ready_ms",
+                      "pipeline_call_ms", "reference_parse_ms", "audio_queue_items", "system_cpu_percent"):
+            values = [r[field] for r in timing if nonnegative(r.get(field))]
+            report["metrics"][field] = stats(values)
+            if field in ("audio_callback_to_decision_ready_ms", "audio_queue_items") and len(values) != len(timing):
+                missing.append(f"Не все записи содержат корректное поле {field}.")
+        lag = [r.get("live_timing", {}).get("audio_callback_to_asr_final_ms") for r in events if r.get("event") == "final_raw"]
+        report["metrics"]["audio_callback_to_asr_final_ms"] = stats([v for v in lag if nonnegative(v)])
+        if not lag or any(not nonnegative(v) for v in lag):
+            missing.append("Не все финальные результаты содержат корректную задержку готовности текста.")
+        for field, label in (("audio_callback_to_decision_ready_ms", "Подготовка решения"),
+                             ("audio_callback_to_asr_final_ms", "Готовность распознанного текста")):
+            measured = report["metrics"][field]
+            if measured.get("p95", 0) > report["policy"]["p95_delay_ms"]:
+                failures.append(f"{label}: 95% значений укладываются только в {measured['p95']/1000:.1f} с (порог 3 с).")
+            if measured.get("max", 0) > report["policy"]["max_delay_ms"]:
+                failures.append(f"{label}: максимальная задержка {measured['max']/1000:.1f} с (порог 6 с).")
+        block = metadata.get("blocksize")
+        rate = metadata.get("samplerate")
+        if nonnegative(block) and nonnegative(rate) and block > 0 and rate > 0:
+            queue_seconds = [r["audio_queue_items"] * block / rate for r in timing if nonnegative(r.get("audio_queue_items"))]
+            report["metrics"]["queue_seconds"] = stats(queue_seconds)
+            if queue_seconds and max(queue_seconds) > 6:
+                failures.append(f"В очереди накопилось до {max(queue_seconds):.1f} с звука (порог 6 с).")
+            third = max(1, len(queue_seconds) // 3)
+            if len(queue_seconds) >= 6 and statistics.median(queue_seconds[-third:]) > statistics.median(queue_seconds[:third]) + 2:
+                failures.append("Очередь к концу теста выросла более чем на 2 секунды по медианам первой и последней трети.")
+            if stops and nonnegative(stops[-1].get("audio_queue_items")):
+                tail = stops[-1]["audio_queue_items"] * block / rate
+                report["queue_at_stop_seconds"] = round(tail, 1)
+                if tail > 2:
+                    failures.append(f"При остановке оставалось {tail:.1f} с необработанного звука.")
+            elif stops:
+                missing.append("Не записан остаток очереди при остановке.")
+        else:
+            missing.append("Не записаны корректные частота звука и размер блока; очередь нельзя перевести в секунды.")
+        api = [r for r in events if r.get("event") == "holyrics_api_response"]
+        verified_closes = verified_absent_quick_closes(events)
+        raw_bad_api = [r for r in api if r.get("ok") is not True]
+        bad_api = [r for i, r in enumerate(events)
+                   if r.get("event") == "holyrics_api_response" and r.get("ok") is not True and i not in verified_closes]
+        report["api_replies"] = len(api)
+        report["api_failed_replies"] = len(raw_bad_api)
+        report["api_verified_absent_quick_closes"] = len(verified_closes)
+        if verified_closes:
+            report["notes"].append(f"Ответов Holyrics «быстрая презентация уже отсутствует»: {len(verified_closes)}. "
+                                   "Последующий возврат к нужному слайду плана подтверждён; эти ответы не считаются сбоем показа.")
+        if bad_api:
+            failures.append(f"Неуспешных ответов Holyrics: {len(bad_api)}. Возможен сбой или неизвестный результат показа.")
+        if not api:
+            missing.append("Нет ответов Holyrics; вывод на презентацию не проверялся.")
+        if not any(r.get("endpoint") in ("ShowVerse", "ShowText", "ShowQuickPresentation") and r.get("ok") is True for r in api):
+            missing.append("Нет успешной команды показа; одних запросов состояния Holyrics недостаточно.")
+        critical = [r for r in events if r.get("event") in (
+            "audio_open_error", "audio_stream_error", "asr_startup_error", "audio_callback_error",
+            "audio_status", "text_detection_startup_error",
+        ) or (r.get("event") == "STREAMING_SLIDE_CONTROL" and r.get("ok") is False)]
+        if critical:
+            failures.append(f"Ошибок звука, распознавания или управления УПС: {len(critical)}.")
+        # Actual display remains an operator check. These are only logged
+        # indications that the requested scenarios were exercised.
+        parsed = [r.get("payload") or {} for r in events if r.get("event") == "parsed"]
+        report["coverage"] = {
+            "references": sum(bool(p.get("ref")) for p in parsed),
+            "reference_lists": sum(bool(p.get("reference_list")) for p in parsed),
+            "slide_transitions": sum(r.get("event") == "STREAMING_SLIDE_CONTROL" and r.get("ok") is True
+                                     and isinstance(r.get("target_index"), int) and isinstance(r.get("current_index"), int)
+                                     and r["target_index"] > r["current_index"] for r in events),
+        }
+        if not report["coverage"]["references"]:
+            missing.append("Не проверено распознавание адресов.")
+        if not report["coverage"]["reference_lists"]:
+            missing.append("Не проверен список ссылок.")
+        if not report["coverage"]["slide_transitions"]:
+            missing.append("Не проверены переходы УПС при чтении длинного отрывка.")
+        report["limitations"].append("Пороговые значения — правило предварительной проверки, а не измеренная граница возможностей церковного ПК.")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        missing.append(f"Не удалось полностью прочитать диагностические данные: {exc}")
+    report["status"] = "failed" if failures else "insufficient" if missing else "conditional"
+    return report
+
+
+def format_session_check(report: dict) -> str:
+    titles = {"conditional": "УСЛОВНО МОЖНО ИСПОЛЬЗОВАТЬ ПОД КОНТРОЛЕМ ОПЕРАТОРА",
+              "failed": "НЕ РЕКОМЕНДУЕТСЯ ЗАПУСКАТЬ НА БОГОСЛУЖЕНИИ",
+              "insufficient": "НЕДОСТАТОЧНО ДАННЫХ ДЛЯ РЕШЕНИЯ"}
+    lines = [titles[report["status"]], f"LV {report['version']}; сеанс: {report['session']}",
+             f"Непустых фраз: {report.get('finals', 0)}; замеров: {report.get('measurements', 0)}; интервал речи: {report.get('speech_span_seconds', 0)} с."]
+    if report.get("host"):
+        host = report["host"]
+        lines.append(f"Компьютер: {host.get('cpu_name', 'неизвестен')}; логических CPU: {host.get('logical_cpu_count', '?')}; ОС: {host.get('os', '?')}.")
+    for field, label, divisor, unit in (
+        ("audio_callback_to_asr_final_ms", "Готовность текста", 1000, "с"),
+        ("audio_callback_to_decision_ready_ms", "Подготовка решения", 1000, "с"),
+        ("reference_parse_ms", "Разбор адреса", 1000, "с"),
+        ("queue_seconds", "Очередь звука", 1, "с"),
+        ("system_cpu_percent", "Загрузка всего компьютера в измеренных интервалах", 1, "%"),
+    ):
+        values = report["metrics"].get(field, {})
+        if values.get("count"):
+            lines.append(f"{label}: медиана {values['median']/divisor:.2f} {unit}; 95% ≤ {values['p95']/divisor:.2f} {unit}; максимум {values['max']/divisor:.2f} {unit}.")
+    lines.extend(f"Проблема: {reason}" for reason in report["failures"])
+    lines.extend(f"Не проверено: {reason}" for reason in report["missing"])
+    lines.extend(f"Примечание: {reason}" for reason in report.get("notes", []))
+    coverage = report.get("coverage", {})
+    lines.append(f"В журнале: ссылки {coverage.get('references', 0)}, списки {coverage.get('reference_lists', 0)}, успешные команды перехода УПС {coverage.get('slide_transitions', 0)}.")
+    lines.extend(report["limitations"])
+    return "\n".join(lines)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Summarize vosk_grammar_probe JSONL logs.")
     parser.add_argument("--log-dir", type=Path, default=DEFAULT_LOG_DIR)
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    parser.add_argument("--check-session", action="store_true", help="Offline readiness check of one stopped live session.")
+    parser.add_argument(
+        "--performance", action="store_true",
+        help="Print JSON statistics and CPU correlations for saved performance.jsonl intervals.",
+    )
     parser.add_argument(
         "--export-training-data",
         type=Path,
@@ -1011,6 +1362,15 @@ def main() -> int:
         help="Where to write --train-smart-slide-model validation report.",
     )
     args = parser.parse_args()
+
+    if args.check_session:
+        report = check_live_session(args.log_dir)
+        print(json.dumps(report, ensure_ascii=False, indent=2) if args.json else format_session_check(report))
+        return {"conditional": 0, "failed": 1, "insufficient": 2}[report["status"]]
+
+    if args.performance:
+        print(json.dumps(summarize_performance(args.log_dir), ensure_ascii=False, indent=2))
+        return 0
 
     if args.export_training_data:
         export = export_training_data(

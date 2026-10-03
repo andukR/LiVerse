@@ -8,6 +8,7 @@ import getpass
 import json
 import math
 import os
+import platform
 import queue
 import re
 import shutil
@@ -246,6 +247,22 @@ def load_startup_settings(
             return {}
         return data if isinstance(data, dict) else {}
     return {}
+
+
+def host_processor_info() -> dict:
+    """Read-only processor identity; no subprocess or internet at startup."""
+    name = os.environ.get("PROCESSOR_IDENTIFIER", "")
+    try:
+        if os.name == "nt":
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as key:
+                name = str(winreg.QueryValueEx(key, "ProcessorNameString")[0]).strip()
+        elif sys.platform.startswith("linux"):
+            name = next((line.split(":", 1)[1].strip() for line in Path("/proc/cpuinfo").read_text().splitlines()
+                         if line.startswith("model name")), name)
+    except (OSError, StopIteration):
+        pass
+    return {"cpu_name": name, "logical_cpu_count": os.cpu_count(), "os": platform.system()}
 
 
 def save_startup_settings(args: argparse.Namespace) -> None:
@@ -3608,6 +3625,8 @@ def run_microphone(args: argparse.Namespace) -> int:
             "packaged": bool(getattr(sys, "frozen", False)),
             "python_version": sys.version.split()[0],
             "process_id": os.getpid(),
+            "diagnostic_test_profile": os.environ.get("LIVERSE_DIAGNOSTIC_TEST_PROFILE", ""),
+            "host": host_processor_info(),
             "asr_engine": args.asr_engine,
             "model": str(
                 args.sherpa_model if args.asr_engine == "sherpa-0.54" else args.model
@@ -3942,6 +3961,7 @@ def run_microphone(args: argparse.Namespace) -> int:
             audio_log.setframerate(audio_input["samplerate"])
             logger.write("audio_log", {"path": audio_path})
 
+        stop_reason = "unexpected_end"
         try:
             with stream:
                 last_audio_level_at = 0.0
@@ -3981,6 +4001,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                             {
                                 "result": result,
                                 "text": text,
+                                "audio_bytes_seen": audio_bytes_seen,
                                 "audio": final_audio_stats,
                                 "live_timing": {
                                     "audio_callback_to_asr_final_ms": round(
@@ -4058,6 +4079,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 logger.write(
                                     "TEMPORARY_VERSE_READING",
                                     {
+                                        "audio_bytes_seen": audio_bytes_seen,
                                         "vosk_text": text,
                                         "action": "recognition_paused",
                                     },
@@ -4482,6 +4504,10 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 logger.write_performance(
                                     "LIVE_PROCESSING_TIMING",
                                     {
+                                        "audio_bytes_seen": audio_bytes_seen,
+                                        "audio_callback_to_decision_ready_ms": round(
+                                            (decision_ready_monotonic - audio_callback_monotonic) * 1000, 3,
+                                        ),
                                         "reference": str(
                                             (payload.get("slide") or {}).get("ref") or ""
                                         ),
@@ -4667,16 +4693,19 @@ def run_microphone(args: argparse.Namespace) -> int:
                             if args.debug_console:
                                 print("...", partial, flush=True)
         except GracefulStopRequested as request:
+            stop_reason = "operator_stop"
             print("\nОстановлено.", flush=True)
             if args.session_summary_popup and request.action != "restart":
                 show_session_summary_popup(session_refs)
             return 0
         except KeyboardInterrupt:
+            stop_reason = "keyboard_interrupt"
             print("\nОстановлено.", flush=True)
             if args.session_summary_popup:
                 show_session_summary_popup(session_refs)
             return 0
         finally:
+            logger.write("session_stopped", {"reason": stop_reason, "audio_queue_items": audio_queue.qsize()})
             close_popup_tk_root()
             if audio_log:
                 audio_log.close()

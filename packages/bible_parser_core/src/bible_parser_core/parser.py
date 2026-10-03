@@ -8,6 +8,7 @@ import json
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher, get_close_matches
+from functools import lru_cache
 from pathlib import Path
 
 from bible_parser_core.book_aliases import book_lookup, books_data
@@ -1487,6 +1488,14 @@ def is_first_n_chapters_discussion(normalized: str) -> bool:
 
 
 def book_candidates(normalized: str) -> list[BookCandidate]:
+    # Callers receive their own list; cached candidates themselves are frozen.
+    return list(_cached_book_candidates(normalized))
+
+
+@lru_cache(maxsize=256)
+def _cached_book_candidates(normalized: str) -> tuple[BookCandidate, ...]:
+    # Live parsing inspects the same text in several context checks. Bound the
+    # retained windows so long services do not accumulate every spoken phrase.
     candidates: list[BookCandidate] = []
     seen: dict[tuple[str, int, int], BookCandidate] = {}
     for variant, canonical, pattern in _BOOK_VARIANT_PATTERNS:
@@ -1565,7 +1574,7 @@ def book_candidates(normalized: str) -> list[BookCandidate]:
 
     candidates = sorted(seen.values(), key=lambda item: (-item.score, item.start, item.end))
     exact_candidates = [candidate for candidate in candidates if candidate.score >= 0.999]
-    return [
+    return tuple(
         candidate
         for candidate in candidates
         if not any(
@@ -1574,7 +1583,7 @@ def book_candidates(normalized: str) -> list[BookCandidate]:
             and candidate.end >= exact.end
             for exact in exact_candidates
         )
-    ]
+    )
 
 
 def detect_book(normalized: str) -> tuple[str | None, float]:
