@@ -7227,7 +7227,7 @@ class LiveSessionCheckTest(unittest.TestCase):
     def test_worker_refuses_unlimited_or_incorrect_cpu_quota(self):
         from tools.benchmark_local import verify_church_limits
         for raw in ("max 20000", "10000 20000"):
-            with self.subTest(quota=raw), patch("tools.benchmark_local.os.sched_getaffinity", return_value={0,1,2,3}), patch("tools.benchmark_local.Path.read_text", side_effect=["0::/test", raw]):
+            with self.subTest(quota=raw), patch("tools.benchmark_local.os.sched_getaffinity", return_value={0,1,2,3}, create=True), patch("tools.benchmark_local.Path.read_text", side_effect=["0::/test", raw]):
                 with self.assertRaises(ValueError):
                     verify_church_limits([0,1,2,3], 100)
 
