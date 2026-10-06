@@ -7433,13 +7433,21 @@ class LiveSessionCheckTest(unittest.TestCase):
             LiVerseGui.save_and_start(gui)
         save.assert_not_called()
 
-    def test_console_guide_addresses_are_recognized_and_list_keeps_four_items(self):
+    def test_release_guide_is_compact_and_leaves_ups_for_general_test(self):
         from tools.benchmark_local import church_reading_text
         text = church_reading_text()
         first = next(line for line in text.splitlines() if line.startswith("Откроем Евангелие"))
-        long = next(line for line in text.splitlines() if line.startswith("Прочитаем Евангелие"))
         self.assertEqual("Иоанн 3:16", LiveReferencePipeline().process_text(first, now_ms=0)["parsed"]["ref"])
+        self.assertNotIn("УПС должен переходить", text)
+        self.assertNotIn("Лука, пятнадцатую главу", text)
+        self.assertIn("тест последнего релиза", text)
+
+    def test_general_church_guide_keeps_ups_and_list_coverage(self):
+        from tools.benchmark_local import church_general_reading_text
+        text = church_general_reading_text()
+        long = next(line for line in text.splitlines() if line.startswith("Прочитаем Евангелие"))
         self.assertEqual("Лука 15:11-24", LiveReferencePipeline().process_text(long, now_ms=0)["parsed"]["ref"])
+        self.assertIn("УПС должен переходить", text)
         lines = text.splitlines()
         start = next(i for i,line in enumerate(lines) if line.startswith("Запишем четыре"))
         result = LiveReferencePipeline().process_text(" ".join(lines[start:start+4]), now_ms=0)
@@ -7454,6 +7462,7 @@ class LiveSessionCheckTest(unittest.TestCase):
         self.assertIn("Настройки теста временные", console)
         self.assertNotIn("Настройки теста временные", gui)
         self.assertIn("настройки и запуск распознавания выполняет оператор", gui)
+        self.assertNotIn("длинный отрывок", gui)
 
     def test_cpu_selection_keeps_two_distinct_physical_cores(self):
         from tools.benchmark_local import church_cpu_ids

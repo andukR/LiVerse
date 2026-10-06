@@ -759,22 +759,28 @@ class LiVerseGui:
         ttk.Button(buttons, text="Проверить HoLyrics", command=self.check_holyrics).pack(side="left", padx=8)
         ttk.Button(buttons, text="Завершить LiVerse", command=self.quit_application).pack(side="right")
         ttk.Button(buttons, text="Скрыть", command=self.hide_window).pack(side="right", padx=8)
-        ttk.Button(self.status_tab, text="Текст для тестирования", command=self._show_test_text).pack(
-            anchor="w", pady=(10, 0)
+        guides = ttk.Frame(self.status_tab)
+        guides.pack(anchor="w", pady=(10, 0))
+        ttk.Button(guides, text="Тест последнего релиза", command=self._show_test_text).pack(side="left")
+        ttk.Button(guides, text="Общий тест", command=lambda: self._show_test_text(general=True)).pack(
+            side="left", padx=(8, 0)
         )
 
-    def _show_test_text(self) -> None:
-        from tools.benchmark_local import church_reading_text
+    def _show_test_text(self, *, general: bool = False) -> None:
+        from tools.benchmark_local import church_general_reading_text, church_reading_text
 
-        existing = getattr(self, "test_text_window", None)
+        attribute = "general_test_text_window" if general else "test_text_window"
+        existing = getattr(self, attribute, None)
         if existing is not None and existing.winfo_exists():
             existing.deiconify()
             existing.lift()
             return
-        rendered = church_reading_text(diagnostic_test=self.diagnostic_test)
+        rendered = (church_general_reading_text if general else church_reading_text)(
+            diagnostic_test=self.diagnostic_test
+        )
         window = tk.Toplevel(self.root)
-        self.test_text_window = window
-        window.title("LiVerse — текст для тестирования")
+        setattr(self, attribute, window)
+        window.title("LiVerse — общий тест" if general else "LiVerse — тест последнего релиза")
         window.geometry("860x620")
         window.minsize(520, 360)
         frame = ttk.Frame(window, padding=12)
@@ -1800,8 +1806,10 @@ def run_packaged_gui_smoke_test() -> int:
         try:
             from tools.benchmark_local import church_reading_text
 
-            button = next(w for w in app.status_tab.winfo_children()
-                          if isinstance(w, ttk.Button) and w.cget("text") == "Текст для тестирования")
+            buttons = {w.cget("text"): w for frame in app.status_tab.winfo_children()
+                       for w in (frame.winfo_children() if isinstance(frame, ttk.Frame) else [frame])
+                       if isinstance(w, ttk.Button)}
+            button = buttons["Тест последнего релиза"]
             button.invoke()
             window = app.test_text_window
             window.withdraw()
@@ -1815,6 +1823,17 @@ def run_packaged_gui_smoke_test() -> int:
             if app.test_text_window is not window:
                 failures.append("repeated test reading button creates duplicate windows")
             window.destroy()
+            general_button = buttons["Общий тест"]
+            general_button.invoke()
+            general_window = app.general_test_text_window
+            general_reading = next(w for frame in general_window.winfo_children()
+                                   for w in frame.winfo_children() if isinstance(w, tk.Text))
+            from tools.benchmark_local import church_general_reading_text
+            if general_reading.get("1.0", "end-1c") != church_general_reading_text(diagnostic_test=False):
+                failures.append("packaged general test reading text is incomplete")
+            if "УПС должен переходить" not in general_reading.get("1.0", "end-1c"):
+                failures.append("general test does not contain the UPS regression")
+            general_window.destroy()
         except (ImportError, OSError, ValueError, AttributeError, StopIteration, tk.TclError) as exc:
             failures.append(f"packaged test reading window failed: {exc}")
         if failures:
