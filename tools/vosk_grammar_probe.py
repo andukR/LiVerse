@@ -2272,6 +2272,7 @@ def payload_summary(payload: dict) -> dict:
         "risk": payload.get("risk") or {},
         "ml_risk": payload.get("ml_risk") or {},
         "ambiguous_alternatives": payload.get("ambiguous_alternatives") or [],
+        "address_text_correction": payload.get("address_text_correction") or {},
         # Keep the accepted text-search evidence in trigger_cases.jsonl so the
         # reviewer can see which ASR window produced the displayed reference.
         "text_citation": text_citation,
@@ -2609,11 +2610,13 @@ def popup_approval_decision(slide: dict, *, event_callback=None, on_decision=Non
     return decision["action"]
 
 
-def show_popup_message(title: str, message: str) -> None:
+def show_popup_message(title: str, message: str, *, on_decision=None) -> None:
     try:
         import tkinter as tk
         from tkinter import font as tkfont
     except Exception:
+        if on_decision is not None:
+            on_decision(None)
         return
 
     root = popup_tk_window(tk, title)
@@ -2653,8 +2656,12 @@ def show_popup_message(title: str, message: str) -> None:
     closed = tk.BooleanVar(master=root, value=False)
 
     def close() -> None:
+        if bool(closed.get()):
+            return
         root.withdraw()
         closed.set(True)
+        if on_decision is not None:
+            on_decision(None)
 
     ok = tk.Button(
         buttons,
@@ -2676,7 +2683,8 @@ def show_popup_message(title: str, message: str) -> None:
     root.protocol("WM_DELETE_WINDOW", close)
     root.after(100, root.focus_force)
     root.after(150, root.lift)
-    root.wait_variable(closed)
+    if on_decision is None:
+        root.wait_variable(closed)
 
 
 def complete_incomplete_reference(
@@ -2715,7 +2723,7 @@ def complete_incomplete_reference(
     return add_slide_payload(payload)
 
 
-def popup_missing_chapter(hint: dict, bible_path: Path = DEFAULT_BIBLE) -> dict | None:
+def popup_missing_chapter(hint: dict, bible_path: Path = DEFAULT_BIBLE, *, on_decision=None) -> dict | None:
     """Ask for one missing chapter without inventing a complete reference."""
     try:
         import tkinter as tk
@@ -2767,11 +2775,15 @@ def popup_missing_chapter(hint: dict, bible_path: Path = DEFAULT_BIBLE) -> dict 
     ).pack(fill="x", padx=30)
 
     def close(payload: dict | None = None) -> None:
+        if bool(closed.get()):
+            return
         result["payload"] = payload
         root.unbind_all("<Return>")
         root.unbind_all("<Escape>")
         root.withdraw()
         closed.set(True)
+        if on_decision is not None:
+            on_decision(payload)
 
     def submit() -> None:
         value = chapter_var.get().strip()
@@ -2822,7 +2834,8 @@ def popup_missing_chapter(hint: dict, bible_path: Path = DEFAULT_BIBLE) -> dict 
 
     root.after_idle(claim_focus)
     root.after(100, claim_focus)
-    root.wait_variable(closed)
+    if on_decision is None:
+        root.wait_variable(closed)
     return result["payload"] if isinstance(result["payload"], dict) else None
 
 
@@ -2834,7 +2847,14 @@ def notify_operator_message(args: argparse.Namespace, payload: dict) -> None:
         return
     if not (args.require_approval or args.semi_auto_approval):
         return
-    show_popup_message("LiVerse", message)
+    approval_queue = getattr(args, "_popup_approval_queue", None)
+    if approval_queue is not None:
+        approval_queue.submit_operator_prompt(
+            "message", {"ref": message, "message": message},
+            lambda _value: approval_queue.logger.write("operator_message_closed", {"message": message}),
+        )
+    else:
+        show_popup_message("LiVerse", message)
 
 
 def publish_after_approval(args: argparse.Namespace, payload: dict) -> dict:
@@ -2910,6 +2930,50 @@ class PopupApprovalQueue:
         self.next_id = 1
         self.enqueued_list_refs: dict[str, set[str]] = {}
         self.approved_list_refs: dict[str, list[dict]] = {}
+
+    def submit_operator_prompt(self, kind: str, candidate: dict, on_decision) -> dict:
+        """Use the same FIFO and Tk pump for chapter and plan decisions."""
+        key = (kind, str(candidate.get("ref") or candidate))
+        for item in ([self.active] if self.active else []) + self.pending:
+            if item.get("_operator_prompt_key") == key:
+                return {"enabled": True, "ok": True, "action": "waiting"}
+        return self._enqueue_one(self.args, {
+            "slide": candidate,
+            "_operator_prompt_key": key,
+            "_operator_prompt_kind": kind,
+            "_operator_prompt_callback": on_decision,
+        })
+
+    def submit_missing_chapter(self, hint: dict, latency_trace: dict, *, plan_context=None) -> dict:
+        hint = dict(hint)
+        trace = dict(latency_trace)
+        trace["decision_ready_monotonic"] = time.monotonic()
+        trace["approval_queued_monotonic"] = trace["decision_ready_monotonic"]
+        context = dict(plan_context or {})
+
+        def completed(payload) -> None:
+            self.logger.write("INCOMPLETE_REFERENCE_OPERATOR_RESULT", {
+                "incomplete_reference": hint,
+                "completed_ref": ((payload or {}).get("parsed") or {}).get("ref"),
+            })
+            if payload is None:
+                return
+            payload = add_slide_payload(payload)
+            payload["session_plan_context"] = context
+            trace["approval_decided_monotonic"] = time.monotonic()
+            trace["reference"] = str((payload.get("slide") or {}).get("ref") or "")
+            set_live_latency_context(trace)
+            payload["output"] = publish_after_approval(self.args, payload)
+            action = approval_action(payload["output"])
+            pipeline = getattr(self.args, "_live_reference_pipeline", None)
+            if pipeline is not None and action_selects_context(action, payload.get("slide") or {}):
+                pipeline.set_context_range(payload["slide"])
+            append_session_reference(self.session_refs, payload, action=action)
+            self.logger.write("incomplete_reference_output", {
+                "ref": trace["reference"], "action": action, "output": payload["output"],
+            })
+
+        return self.submit_operator_prompt("missing_chapter", hint, completed)
 
     def submit(self, args: argparse.Namespace, payload: dict) -> dict:
         slide = payload.get("slide") or {}
@@ -2988,6 +3052,40 @@ class PopupApprovalQueue:
         if self.active is None and self.pending:
             payload = self.pending.pop(0)
             self.active = payload
+
+            if payload.get("_operator_prompt_kind"):
+                def prompt_decided(value, item=payload) -> None:
+                    # Release the slot even when publishing or a callback fails.
+                    if self.active is not item:
+                        return
+                    try:
+                        item["_operator_prompt_callback"](value)
+                    except Exception as exc:
+                        self.logger.write("operator_prompt_error", {
+                            "kind": item["_operator_prompt_kind"], "error": str(exc),
+                        })
+                    finally:
+                        self.active = None
+
+                try:
+                    if payload["_operator_prompt_kind"] == "missing_chapter":
+                        popup_missing_chapter(payload["slide"], bible_path=self.args.bible,
+                                              on_decision=prompt_decided)
+                    elif payload["_operator_prompt_kind"] == "message":
+                        show_popup_message("LiVerse", payload["slide"]["message"],
+                                           on_decision=prompt_decided)
+                    else:
+                        popup_approval_decision(payload["slide"],
+                                               event_callback=getattr(self.args, "_popup_event_logger", None),
+                                               on_decision=prompt_decided)
+                except Exception as exc:
+                    self.logger.write("operator_prompt_error", {
+                        "kind": payload["_operator_prompt_kind"], "error": str(exc),
+                    })
+                    self.active = None
+                # Pump the shared root below, without opening a second window.
+                self._pump_root()
+                return
 
             def decided(action: str, item=payload) -> None:
                 approval_decided_at = time.monotonic()
@@ -3088,6 +3186,9 @@ class PopupApprovalQueue:
                 )
                 self.active = None
 
+        self._pump_root()
+
+    def _pump_root(self) -> None:
         if _POPUP_TK_ROOT is not None:
             try:
                 count = len(self.pending)
@@ -3613,8 +3714,7 @@ def run_microphone(args: argparse.Namespace) -> int:
     logger = JsonlLogger(Path(args.log_dir), enabled=not args.no_log)
     setattr(args, "_holyrics_event_logger", logger.write)
     setattr(args, "_popup_event_logger", logger.write)
-    if args.approval_ui == "popup":
-        setattr(args, "_popup_approval_queue", PopupApprovalQueue(args, logger, session_refs))
+    setattr(args, "_popup_approval_queue", PopupApprovalQueue(args, logger, session_refs))
     command_argv = safe_command_argv(list(sys.argv))
     logger.write_session(
         {
@@ -4031,6 +4131,67 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 "asr_final_monotonic": asr_final_monotonic,
                                 "decision_ready_monotonic": asr_final_monotonic,
                             }
+                            def record_processing_timing(measured_payload, ml_risk_ms=0.0):
+                                payload = measured_payload
+                                decision_ready_monotonic = time.monotonic()
+                                if performance_enabled and post_asr_started is not None:
+                                    post_asr_total_ms = (time.perf_counter() - post_asr_started) * 1000.0
+                                    pipeline_call_ms = float(
+                                        pipeline_timings.get("pipeline_call_ms") or 0.0
+                                    )
+                                    process_cpu_ms = (
+                                        (time.process_time() - process_cpu_started) * 1000.0
+                                        if process_cpu_started is not None
+                                        else 0.0
+                                    )
+                                    system_cpu_percent = system_cpu_percent_between(
+                                        system_cpu_started,
+                                        system_cpu_snapshot(),
+                                    )
+                                    logger.write_performance(
+                                        "LIVE_PROCESSING_TIMING",
+                                        {
+                                            "audio_bytes_seen": audio_bytes_seen,
+                                            "audio_callback_to_decision_ready_ms": round(
+                                                (decision_ready_monotonic - audio_callback_monotonic) * 1000, 3,
+                                            ),
+                                            "reference": str(
+                                                (payload.get("slide") or {}).get("ref") or ""
+                                            ),
+                                            "source": str(payload.get("source") or ""),
+                                            "asr_final_to_decision_ready_ms": round(
+                                                post_asr_total_ms, 3
+                                            ),
+                                            "reference_parse_ms": pipeline_timings.get(
+                                                "reference_parse_ms", 0.0
+                                            ),
+                                            "rule_risk_ms": pipeline_timings.get(
+                                                "rule_risk_ms", 0.0
+                                            ),
+                                            "pipeline_total_ms": pipeline_timings.get(
+                                                "pipeline_total_ms", 0.0
+                                            ),
+                                            "pipeline_call_ms": round(pipeline_call_ms, 3),
+                                            "ml_risk_ms": round(ml_risk_ms, 3),
+                                            "other_post_asr_ms": round(
+                                                max(0.0, post_asr_total_ms - pipeline_call_ms - ml_risk_ms),
+                                                3,
+                                            ),
+                                            "process_cpu_ms": round(process_cpu_ms, 3),
+                                            "process_cpu_percent": round(
+                                                process_cpu_ms / post_asr_total_ms * 100.0
+                                                if post_asr_total_ms > 0
+                                                else 0.0,
+                                                1,
+                                            ),
+                                            "system_cpu_percent": system_cpu_percent,
+                                            "audio_queue_items": audio_queue.qsize(),
+                                            "process_cpu_percent_scope": "LiVerse process; may exceed 100 with multiple busy threads",
+                                            "system_cpu_percent_scope": "whole system during post-ASR processing interval",
+                                        },
+                                    )
+                                return decision_ready_monotonic
+
                             setattr(args, "_active_live_latency_trace", latency_trace)
                             set_live_latency_context(latency_trace)
                             print(f"Распознано: {text}", flush=True)
@@ -4087,6 +4248,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 console.status(
                                     "показываю стих; поиск новых ссылок приостановлен"
                                 )
+                                record_processing_timing({"source": "temporary_verse_reading"})
                                 continue
                             if address_recognition_allowed(
                                 address_detection_enabled,
@@ -4197,6 +4359,10 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 if text_detector is not None:
                                     text_detector.clear()
                                 if plan_requires_approval:
+                                    record_processing_timing({
+                                        "slide": {"ref": latency_trace["reference"]},
+                                        "source": "sermon_plan",
+                                    })
                                     plan_candidate = {
                                         "ref": f"План: слайд {plan_match['slide_number']}",
                                         "verse": str(plan_match["text"]),
@@ -4208,29 +4374,35 @@ def run_microphone(args: argparse.Namespace) -> int:
                                         "score": float(plan_match["score"]),
                                     }
                                     if args.approval_ui == "popup":
-                                        plan_action = popup_approval_decision(
-                                            plan_candidate,
-                                            event_callback=getattr(
-                                                args, "_popup_event_logger", None
-                                            ),
-                                        )
-                                        if plan_action == "approve":
-                                            plan_ok, plan_reason = show_holyrics_text_slide(
-                                                args,
-                                                str(args.holyrics_url).rstrip("/"),
-                                                sermon_plan,
-                                                int(plan_match["slide_index"]),
+                                        def decided_plan(action, match=dict(plan_match), plan=sermon_plan,
+                                                         trace=dict(latency_trace)):
+                                            if action != "approve":
+                                                logger.write("sermon_plan_rejected", {
+                                                    **match, "reason": "operator_rejected",
+                                                })
+                                                return
+                                            trace["approval_decided_monotonic"] = time.monotonic()
+                                            set_live_latency_context(trace)
+                                            ok, reason = show_holyrics_text_slide(
+                                                args, str(args.holyrics_url).rstrip("/"),
+                                                plan, int(match["slide_index"]),
                                             )
-                                        else:
-                                            sermon_plan["speech_parts"] = []
-                                            logger.write(
-                                                "sermon_plan_rejected",
-                                                {**plan_match, "reason": "operator_rejected"},
-                                            )
+                                            logger.write("sermon_plan_match", {**match, "ok": ok, "reason": reason})
+                                            if ok:
+                                                plan["current_index"] = int(match["slide_index"])
+                                                plan["next_index"] = int(match["slide_index"]) + 1
+                                                plan["speech_parts"] = []
+                                                pipeline.text_buffer.clear()
                                             console.status(
-                                                f"план проповеди: слайд {plan_match['slide_number']} отклонён"
+                                                f"план проповеди: слайд {match['slide_number']}"
+                                                if ok else f"ошибка показа плана: {reason}"
                                             )
-                                            continue
+
+                                        args._popup_approval_queue.submit_operator_prompt(
+                                            "sermon_plan", plan_candidate, decided_plan
+                                        )
+                                        logger.write("sermon_plan_candidate", plan_candidate)
+                                        continue
                                     else:
                                         from tools.slide_server import submit_candidate
                                         submit_candidate(plan_candidate)
@@ -4251,6 +4423,10 @@ def run_microphone(args: argparse.Namespace) -> int:
                                     {**plan_match, "ok": plan_ok, "reason": plan_reason},
                                 )
                                 if plan_ok:
+                                    record_processing_timing({
+                                        "slide": {"ref": latency_trace["reference"]},
+                                        "source": "sermon_plan",
+                                    })
                                     sermon_plan["current_index"] = int(plan_match["slide_index"])
                                     sermon_plan["next_index"] = int(plan_match["slide_index"]) + 1
                                     sermon_plan["speech_parts"] = []
@@ -4424,33 +4600,21 @@ def run_microphone(args: argparse.Namespace) -> int:
                                         "не удалось закрыть длинный отрывок; LiVerse повторит попытку: "
                                         f"{range_reading_action.get('reason')}"
                                     )
-                            operator_completed_payload = None
                             if (
                                 pending_incomplete_reference is not None
                                 and pending_incomplete_fragments >= 2
                                 and not long_passage_reading
                                 and not (text_decision is not None and text_decision.accepted)
                             ):
-                                operator_completed_payload = popup_missing_chapter(
-                                    pending_incomplete_reference,
-                                    bible_path=args.bible,
-                                )
-                                logger.write(
-                                    "INCOMPLETE_REFERENCE_OPERATOR_RESULT",
-                                    {
-                                        "incomplete_reference": pending_incomplete_reference,
-                                        "completed_ref": (
-                                            (operator_completed_payload or {}).get("parsed") or {}
-                                        ).get("ref"),
-                                    },
+                                args._popup_approval_queue.submit_missing_chapter(
+                                    pending_incomplete_reference, latency_trace,
+                                    plan_context=session_plan_context(args, sermon_plan),
                                 )
                                 pending_incomplete_reference = None
                                 pending_incomplete_fragments = 0
                                 if text_detector is not None:
                                     text_detector.clear()
-                            if operator_completed_payload is not None:
-                                payload = operator_completed_payload
-                            elif long_passage_reading:
+                            if long_passage_reading:
                                 payload = add_slide_payload(pipeline_payload)
                             elif text_decision is not None and text_decision.accepted:
                                 payload = text_citation_payload(text_decision, text)
@@ -4481,68 +4645,11 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 time.perf_counter() if performance_enabled else None
                             )
                             apply_ml_risk(output_args, payload, asr_result=result)
-                            decision_ready_monotonic = time.monotonic()
-                            if performance_enabled and post_asr_started is not None:
-                                post_asr_total_ms = (time.perf_counter() - post_asr_started) * 1000.0
-                                ml_risk_ms = (
-                                    (time.perf_counter() - ml_risk_started) * 1000.0
-                                    if ml_risk_started is not None
-                                    else 0.0
-                                )
-                                pipeline_call_ms = float(
-                                    pipeline_timings.get("pipeline_call_ms") or 0.0
-                                )
-                                process_cpu_ms = (
-                                    (time.process_time() - process_cpu_started) * 1000.0
-                                    if process_cpu_started is not None
-                                    else 0.0
-                                )
-                                system_cpu_percent = system_cpu_percent_between(
-                                    system_cpu_started,
-                                    system_cpu_snapshot(),
-                                )
-                                logger.write_performance(
-                                    "LIVE_PROCESSING_TIMING",
-                                    {
-                                        "audio_bytes_seen": audio_bytes_seen,
-                                        "audio_callback_to_decision_ready_ms": round(
-                                            (decision_ready_monotonic - audio_callback_monotonic) * 1000, 3,
-                                        ),
-                                        "reference": str(
-                                            (payload.get("slide") or {}).get("ref") or ""
-                                        ),
-                                        "source": str(payload.get("source") or ""),
-                                        "asr_final_to_decision_ready_ms": round(
-                                            post_asr_total_ms, 3
-                                        ),
-                                        "reference_parse_ms": pipeline_timings.get(
-                                            "reference_parse_ms", 0.0
-                                        ),
-                                        "rule_risk_ms": pipeline_timings.get(
-                                            "rule_risk_ms", 0.0
-                                        ),
-                                        "pipeline_total_ms": pipeline_timings.get(
-                                            "pipeline_total_ms", 0.0
-                                        ),
-                                        "pipeline_call_ms": round(pipeline_call_ms, 3),
-                                        "ml_risk_ms": round(ml_risk_ms, 3),
-                                        "other_post_asr_ms": round(
-                                            max(0.0, post_asr_total_ms - pipeline_call_ms - ml_risk_ms),
-                                            3,
-                                        ),
-                                        "process_cpu_ms": round(process_cpu_ms, 3),
-                                        "process_cpu_percent": round(
-                                            process_cpu_ms / post_asr_total_ms * 100.0
-                                            if post_asr_total_ms > 0
-                                            else 0.0,
-                                            1,
-                                        ),
-                                        "system_cpu_percent": system_cpu_percent,
-                                        "audio_queue_items": audio_queue.qsize(),
-                                        "process_cpu_percent_scope": "LiVerse process; may exceed 100 with multiple busy threads",
-                                        "system_cpu_percent_scope": "whole system during post-ASR processing interval",
-                                    },
-                                )
+                            decision_ready_monotonic = record_processing_timing(
+                                payload,
+                                (time.perf_counter() - ml_risk_started) * 1000.0
+                                if ml_risk_started is not None else 0.0,
+                            )
                             latency_trace.update(
                                 {
                                     "decision_ready_monotonic": decision_ready_monotonic,
@@ -4551,10 +4658,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                             )
                             payload["_live_latency_trace"] = latency_trace
                             set_live_latency_context(latency_trace)
-                            if operator_completed_payload is not None:
-                                payload["output"] = publish_after_approval(output_args, payload)
-                            else:
-                                payload["output"] = publish_payload(output_args, payload)
+                            payload["output"] = publish_payload(output_args, payload)
                             if approval_action(payload["output"]) in {
                                 "reject",
                                 "not_citation",

@@ -1,4 +1,5 @@
 import json
+import sys
 from datetime import datetime, timedelta
 import re
 import tempfile
@@ -37,6 +38,218 @@ from tools.holyrics import (
 
 
 class LiveReferencePipelineTest(unittest.TestCase):
+    def test_low_confidence_chapter_word_is_resolved_by_full_quoted_verse(self):
+        address = "и павел говорит послание римляну четырнадцати два двенадцатый стих"
+        quote = "итак каждый из нас за себя даст отчёт богу"
+        words = [
+            {"word": "четырнадцати", "conf": 0.608367},
+            {"word": "два", "conf": 0.147535},
+            {"word": "двенадцатый", "conf": 0.749157},
+        ]
+        result = LiveReferencePipeline().process_text(
+            f"{address} {quote}", asr_result={"result": words},
+        )
+        self.assertEqual("Римлянам 14:12", result["parsed"]["ref"])
+        self.assertEqual("Римлянам 14:2-12", result["address_text_correction"]["original_ref"])
+        self.assertEqual([], result["ambiguous_alternatives"])
+
+        for text, asr in (
+            (address, {"result": words}),
+            (f"{address} итак каждый из нас", {"result": words}),
+            (f"{address} совсем другой прочитанный текст", {"result": words}),
+            (f"{address} {quote}", None),
+            (f"{address} {quote}", {"result": [words[0], {"word": "два", "conf": 0.9}, words[2]]}),
+            (f"послание римляну четырнадцати с два по двенадцатый стих {quote}", {"result": words}),
+            (f"послание римляну четырнадцати глава два двенадцатый стих {quote}", {"result": words}),
+        ):
+            with self.subTest(text=text, asr=asr):
+                unchanged = LiveReferencePipeline().process_text(text, asr_result=asr)
+                self.assertEqual("Римлянам 14:2-12", unchanged["parsed"]["ref"])
+                self.assertNotIn("address_text_correction", unchanged)
+
+    def test_generic_epistle_phrase_does_not_override_revelation_reference(self):
+        result = parse_live_reference(
+            "иисуса обращается к сэр к верующим филадельфии давайте сейчас "
+            "откроем послание книгу откровений третью главу и прочитаем "
+            "с седьмого по тринадцатый стих"
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual("Откровение 3:7-13", result.ref)
+        self.assertEqual("Откровение", result.book)
+
+    @unittest.skipUnless(sys.platform == "win32", "Real Tk popup regression on Windows")
+    def test_missing_chapter_window_returns_without_wait_and_validates_chapter(self):
+        import tkinter as tk
+        from tools import vosk_grammar_probe as probe
+
+        decisions = []
+        hint = {"book": "Иаков", "start_verse": 6, "end_verse": 6}
+        try:
+            with patch.object(tk.Misc, "wait_variable", side_effect=AssertionError("blocks audio")):
+                probe.popup_missing_chapter(hint, on_decision=decisions.append)
+            root = probe._POPUP_TK_ROOT
+            root.update()
+            entry = next(w for w in root.winfo_children() if isinstance(w, tk.Entry))
+            submit = next(w for w in root.winfo_children()
+                          if isinstance(w, tk.Button) and "показать" in str(w.cget("text")))
+            entry.insert(0, "999")
+            submit.invoke()
+            self.assertEqual([], decisions)
+            entry.delete(0, "end")
+            entry.insert(0, "5")
+            submit.invoke()
+            submit.invoke()
+            self.assertEqual(1, len(decisions))
+            self.assertEqual("Иаков 5:6", decisions[0]["parsed"]["ref"])
+            closed_messages = []
+            with patch.object(tk.Misc, "wait_variable", side_effect=AssertionError("blocks audio")):
+                probe.show_popup_message("LiVerse", "Неверный адрес", on_decision=closed_messages.append)
+            root.update()
+            message_button = next(
+                button for frame in root.winfo_children() for button in frame.winfo_children()
+                if isinstance(button, tk.Button)
+            )
+            message_button.invoke()
+            root.update()
+            self.assertEqual([None], closed_messages)
+        finally:
+            probe.close_popup_tk_root()
+
+    def test_failed_new_verse_or_list_keeps_previous_restore_timer(self):
+        for slide_type in ("verse", "reference_list"):
+            with self.subTest(slide_type=slide_type):
+                args = SimpleNamespace(sermon_plan=True, holyrics_quick_minutes=20 / 60,
+                    _holyrics_sermon_plan_presentation={"type": "text", "text_id": "plan"})
+                payload = {"ref": "1 Коринфянам 11:25-26", "verse": "Текст"}
+                if slide_type == "reference_list":
+                    payload["slide_type"] = slide_type
+                with (
+                    patch("tools.holyrics.get_holyrics_current_presentation", return_value=None),
+                    patch("tools.holyrics.prepare_sermon_plan_custom_theme", return_value=None),
+                    patch("tools.holyrics.capture_holyrics_current_appearance"),
+                    patch("tools.holyrics.post_holyrics_api", return_value=(False, "holyrics_error", "")),
+                    patch("tools.holyrics.cancel_holyrics_restore_timer") as cancel,
+                    patch("tools.holyrics.restore_holyrics_presentation_later") as schedule,
+                ):
+                    self.assertFalse(post_holyrics_url(args, "http://localhost:8091", payload)[0])
+                cancel.assert_not_called()
+                schedule.assert_not_called()
+
+    def test_chapter_prompt_and_plan_share_nonblocking_queue(self):
+        from tools.vosk_grammar_probe import JsonlLogger, PopupApprovalQueue
+        from bible_parser_core.parser import DEFAULT_BIBLE
+
+        args = SimpleNamespace(bible=DEFAULT_BIBLE, _popup_event_logger=None)
+        queue = PopupApprovalQueue(args, JsonlLogger(None, enabled=False), [])
+        hint = {"book": "Иаков", "start_verse": 6, "end_verse": 6}
+        queue.submit_missing_chapter(hint, {})
+        chapter_callbacks, plan_callbacks, message_callbacks, decisions = [], [], [], []
+        with (
+            patch("tools.vosk_grammar_probe.popup_missing_chapter",
+                  side_effect=lambda *a, on_decision, **kw: chapter_callbacks.append(on_decision)),
+            patch("tools.vosk_grammar_probe.popup_approval_decision",
+                  side_effect=lambda *a, on_decision, **kw: plan_callbacks.append(on_decision)),
+            patch("tools.vosk_grammar_probe.show_popup_message",
+                  side_effect=lambda *a, on_decision, **kw: message_callbacks.append(on_decision)),
+            patch("tools.vosk_grammar_probe.publish_after_approval") as publish,
+        ):
+            queue.pump()
+            active = queue.active
+            # New recognition can enqueue a plan while chapter entry stays open.
+            queue.submit_operator_prompt("sermon_plan", {"ref": "План: слайд 5"}, decisions.append)
+            queue.submit_operator_prompt("sermon_plan", {"ref": "План: слайд 5"}, decisions.append)
+            queue.submit_operator_prompt("message", {"ref": "Ошибка", "message": "Ошибка"}, decisions.append)
+            for _ in range(10):
+                queue.pump()
+            self.assertIs(active, queue.active)
+            self.assertEqual(2, len(queue.pending))
+            self.assertEqual([], plan_callbacks)
+            self.assertEqual([], message_callbacks)
+            chapter_callbacks[0](None)
+            publish.assert_not_called()
+            queue.pump()
+            plan_callbacks[0]("approve")
+            plan_callbacks[0]("approve")
+            self.assertEqual(["approve"], decisions)
+            self.assertIsNone(queue.active)
+            queue.pump()
+            message_callbacks[0](None)
+            self.assertEqual(["approve", None], decisions)
+
+    def test_chapter_completion_publishes_once_and_queue_survives_failure(self):
+        from tools.vosk_grammar_probe import JsonlLogger, PopupApprovalQueue, complete_incomplete_reference
+        from bible_parser_core.parser import DEFAULT_BIBLE
+
+        args = SimpleNamespace(bible=DEFAULT_BIBLE, _popup_event_logger=None)
+        queue = PopupApprovalQueue(args, JsonlLogger(None, enabled=False), [])
+        hint = {"book": "Иаков", "start_verse": 6, "end_verse": 6}
+        payload = complete_incomplete_reference(hint, 5)
+        self.assertIsNotNone(payload)
+        callbacks = []
+        with (
+            patch("tools.vosk_grammar_probe.popup_missing_chapter",
+                  side_effect=lambda *a, on_decision, **kw: callbacks.append(on_decision)),
+            patch("tools.vosk_grammar_probe.publish_after_approval", side_effect=RuntimeError("network failure")) as publish,
+        ):
+            queue.submit_missing_chapter(hint, {})
+            queue.pump()
+            callbacks[0](payload)
+            callbacks[0](payload)
+            publish.assert_called_once()
+            self.assertIsNone(queue.active)
+            queue.submit_missing_chapter(hint, {})
+            queue.pump()
+            self.assertEqual(2, len(callbacks))
+
+    def test_church_song_and_quick_verse_discard_missing_plan_theme(self):
+        args = SimpleNamespace(
+            sermon_plan=True, holyrics_quick_minutes=0,
+            _holyrics_sermon_plan_theme_id="1791089311750",
+            _holyrics_sermon_plan_presentation={
+                "type": "text", "text_id": "plan",
+                "slides": [{"text": "План", "theme_id": "1791089311750"}],
+            },
+        )
+        payload = {"ref": "1 Коринфянам 11:23", "verse": "Ибо я от Самого Господа принял",
+                   "book": "1 Коринфянам", "chapter": 11, "start_verse": 23, "end_verse": 23}
+        shown = []
+        current = {"type": "song", "id": "song"}
+        def api(_args, _url, endpoint, body):
+            data = {
+                "GetCurrentPresentation": current,
+                "GetCurrentTheme": {"id": "temporary", "name": "Тема 9"},
+                "GetCurrentBackground": {"id": "1E1E1E", "type": "color", "name": "Color #1E1E1E"},
+                "GetThemes": [{"id": "bible-theme", "name": "Holyrics 01"}],
+                "GetBackgrounds": [],
+                "GetBibleSettings": {"theme": {"public": "bible-theme"}},
+            }
+            if endpoint == "ShowQuickPresentation":
+                shown.append(body)
+                self.assertEqual({"id": "bible-theme"}, body["slides"][0]["theme"])
+            return True, "", json.dumps({"status": "ok", "data": data.get(endpoint, {})})
+
+        with patch("tools.holyrics.post_holyrics_api", side_effect=api):
+            self.assertTrue(post_holyrics_url(args, "http://localhost:8091", payload)[0])
+            current = {"type": "quick_presentation", "id": "temporary-verse"}
+            payload = {**payload, "ref": "1 Коринфянам 11:25-26", "start_verse": 25, "end_verse": 26}
+            self.assertTrue(post_holyrics_url(args, "http://localhost:8091", payload)[0])
+        self.assertEqual(2, len(shown))
+
+    def test_missing_theme_and_unavailable_bible_theme_never_send_stale_id(self):
+        args = SimpleNamespace(_holyrics_sermon_plan_theme_id="missing")
+        responses = [
+            (True, "", '{"data":{"name":"Transient"}}'),
+            (True, "", '{"data":{"name":"Color","type":"color"}}'),
+            (True, "", '{"data":[]}'),
+            (True, "", '{"data":[]}'),
+            (False, "timeout", ""),
+        ]
+        with patch("tools.holyrics.post_holyrics_api", side_effect=responses):
+            self.assertIsNone(prepare_sermon_plan_custom_theme(args, "http://localhost:8091"))
+        body = slide_payload_to_holyrics_body(args, {"ref": "Иаков 5:6"})
+        self.assertNotIn("theme", body["slides"][0])
+
     def test_live_presentation_latency_reports_each_observable_stage(self):
         from tools.holyrics import build_live_presentation_latency_event
 
@@ -2036,7 +2249,10 @@ class LiveReferencePipelineTest(unittest.TestCase):
         }
 
         with (
-            patch("tools.holyrics.get_holyrics_current_presentation", return_value=None),
+            patch("tools.holyrics.get_holyrics_current_presentation", return_value={
+                "type": "text", "text_id": "sermon-plan", "slide_number": 1,
+                "slides": [{"text": "План", "theme_id": "plan-theme"}],
+            }),
             patch("tools.holyrics.prepare_sermon_plan_custom_theme", return_value=None),
             patch("tools.holyrics.post_holyrics_api", return_value=(True, "", "")) as api,
         ):
@@ -2651,6 +2867,20 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertEqual("1 Иоанна 2:12", result.get("parsed", {}).get("ref"))
         self.assertEqual("context_range", result.get("source"))
+
+    def test_standalone_ordinal_in_speech_is_not_a_contextual_verse(self):
+        pipeline = LiveReferencePipeline()
+        context = pipeline.process_text("послание иакова пятая глава с первого по шестой стих")
+        self.assertEqual("Иаков 5:1-6", context.get("parsed", {}).get("ref"))
+        self.assertTrue(pipeline.set_context_range(context))
+
+        ordinary_numbering = pipeline.process_text("третье")
+        self.assertIsNone(ordinary_numbering.get("parsed"))
+        self.assertFalse(ordinary_numbering.get("matched"))
+
+        explicit_verse = pipeline.process_text("третье стих")
+        self.assertEqual("Иаков 5:3", explicit_verse.get("parsed", {}).get("ref"))
+        self.assertEqual("context_range", explicit_verse.get("source"))
 
     def test_context_range_resolves_compound_ordinals_above_twenty_as_single_verses(self):
         for verse, ordinal in (
@@ -3825,14 +4055,26 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertEqual("Судьи 6:7", result.get("parsed", {}).get("ref"))
 
     def test_one_verse_epistle_mention_without_address_is_ignored(self):
-        result = LiveReferencePipeline().process_text(
+        samples = (
             "но всегда когда вопрос касается веры я могу сказать одну простую "
-            "вещь я всегда привожу один стиха послание иакова веру"
+            "вещь я всегда привожу один стиха послание иакова веру",
+            "месяц назад мы вместе с вами начали разбирать послание иакова "
+            "послание одного из первых руководителей церкви одного из первых "
+            "пасторов послание апостола якова оно явля",
         )
 
-        self.assertFalse(result.get("matched"))
-        self.assertIsNone(result.get("parsed"))
-        self.assertEqual("ordinary_verse_mention", result.get("blocked_weak_context"))
+        for text in samples:
+            with self.subTest(text=text):
+                result = LiveReferencePipeline().process_text(text)
+                self.assertFalse(result.get("matched"))
+                self.assertIsNone(result.get("parsed"))
+                self.assertEqual(
+                    "ordinary_verse_mention",
+                    result.get("blocked_weak_context"),
+                )
+
+        compact = LiveReferencePipeline().process_text("послание иакова один один")
+        self.assertEqual("Иаков 1:1", compact.get("parsed", {}).get("ref"))
 
     def test_failed_numbered_colossians_attempt_is_not_a_reference_list_item(self):
         result = LiveReferencePipeline().process_text(

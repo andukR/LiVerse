@@ -1525,6 +1525,10 @@ def _cached_book_candidates(normalized: str) -> tuple[BookCandidate, ...]:
             # elsewhere in the same ASR window.
             if re.fullmatch(r"послани\w*", candidate_text):
                 continue
+            # In «послание книгу Откровений» the generic phrase «послание книгу»
+            # can fuzzy-match «послание к Титу» and steal the following address.
+            if candidate_text == "послание книгу":
+                continue
             # Обычные слова «бы» и «быть» фонетически близки к сокращению
             # «Быт», но сами по себе не должны означать книгу Бытие.
             if candidate_text in {"бы", "быть"}:

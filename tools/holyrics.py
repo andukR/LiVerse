@@ -1270,6 +1270,10 @@ def prepare_sermon_plan_custom_theme(
     transient ID back as a ThemeFilter.
     """
     setattr(args, "_holyrics_sermon_plan_custom_theme", None)
+    # A slide may expose a transient ID absent from GetThemes. Never retain
+    # that ID as the fallback when resolving its appearance fails.
+    candidate_theme_id = str(getattr(args, "_holyrics_sermon_plan_theme_id", "") or "").strip()
+    setattr(args, "_holyrics_sermon_plan_theme_id", "")
     blank_restore = getattr(args, "_holyrics_blank_text_restore_presentation", None)
     blank_text_id = str(
         (blank_restore or {}).get("text_id") or (blank_restore or {}).get("id") or ""
@@ -1319,6 +1323,9 @@ def prepare_sermon_plan_custom_theme(
 
     theme_records = extract_holyrics_data_list(themes_body)
     background_records = extract_holyrics_data_list(backgrounds_body)
+    saved_ids = {str(item.get("id") or "").strip() for item in theme_records}
+    if candidate_theme_id and candidate_theme_id in saved_ids:
+        setattr(args, "_holyrics_sermon_plan_theme_id", candidate_theme_id)
 
     matching_themes = [item for item in theme_records if str(item.get("name") or "").strip() == theme_name]
     matching_backgrounds = [
@@ -1338,6 +1345,18 @@ def prepare_sermon_plan_custom_theme(
                 "background_matches": len(matching_backgrounds),
             },
         )
+        if not getattr(args, "_holyrics_sermon_plan_theme_id", "") and not blank_presentation:
+            # Respect the operator's current Bible-module choice; do not
+            # blindly retry an ambiguous ShowQuickPresentation response.
+            theme_filter = current_bible_theme_filter(args, base_url)
+            fallback_id = str(theme_filter.get("id") or "").strip()
+            if fallback_id and fallback_id in saved_ids:
+                setattr(args, "_holyrics_sermon_plan_theme_id", fallback_id)
+            holyrics_diagnostic_event(args, "holyrics_theme_fallback", {
+                "reason": "current_appearance_unavailable",
+                "discarded_theme_id": candidate_theme_id,
+                "bible_theme_id": fallback_id if fallback_id in saved_ids else "",
+            })
         return None
 
     custom_theme = {
@@ -1415,6 +1434,9 @@ def refresh_sermon_plan_restore_snapshot(
         presentation.get("text_id") or presentation.get("id") or ""
     ).strip()
     if current_type != "text" or current_text_id != presentation_text_id:
+        # A cached plan's theme does not describe a song or a temporary verse
+        # currently selected by the operator.
+        setattr(args, "_holyrics_sermon_plan_theme_id", "")
         return snapshot
 
     snapshot.update(current)
@@ -2048,7 +2070,6 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
             )
             if blank_presentation and custom_theme is None:
                 return False, "holyrics_blank_presentation_theme_unavailable"
-        cancel_holyrics_restore_timer(args, reason="show_temporary_reference_list")
         show_ok, show_reason, show_body = post_holyrics_api(
             args,
             base_url,
@@ -2058,6 +2079,7 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
         holyrics_log(f"ShowQuickPresentation response={show_body or show_reason or 'ok'}")
         if not show_ok:
             return False, show_reason
+        cancel_holyrics_restore_timer(args, reason="show_temporary_reference_list")
         clear_scripture_range_reading(args)
         quick_minutes = holyrics_quick_minutes(args)
         if quick_minutes > 0:
@@ -2139,7 +2161,6 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
         quick_body = slide_payload_to_holyrics_body(args, payload)
         if not str((quick_body.get("slides") or [{}])[0].get("text") or "").strip():
             return False, "holyrics_quick_presentation_empty"
-        cancel_holyrics_restore_timer(args, reason="show_temporary_verse")
         show_ok, show_reason, show_body = post_holyrics_api(
             args,
             base_url,
@@ -2150,6 +2171,7 @@ def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, st
         if not show_ok:
             capture_holyrics_current_appearance(args, base_url)
             return False, show_reason
+        cancel_holyrics_restore_timer(args, reason="show_temporary_verse")
         clear_scripture_range_reading(args)
         quick_minutes = holyrics_quick_minutes(args)
         if quick_minutes > 0:

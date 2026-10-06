@@ -34,12 +34,14 @@ usage() {
     cat <<'EOF'
 Использование:
   tools/replay_rodnik_sermons.sh next
+  tools/replay_rodnik_sermons.sh download-latest
   tools/replay_rodnik_sermons.sh training-next [--plan]
   tools/replay_rodnik_sermons.sh batch AUDIO_1 [AUDIO_2] [AUDIO_3]
   tools/replay_rodnik_sermons.sh audit AUDIO_1 [AUDIO_2] [AUDIO_3]
   tools/replay_rodnik_sermons.sh subtitles
   tools/replay_rodnik_sermons.sh subtitles --run
   tools/replay_rodnik_sermons.sh review
+  tools/replay_rodnik_sermons.sh review --current-batch
   tools/replay_rodnik_sermons.sh review-slides [--browser]
   tools/replay_rodnik_sermons.sh [--run] [--engine sherpa-0.54|vosk-0.22]
 
@@ -47,6 +49,8 @@ next                  Автоматически выбрать до трёх е
                       проповедей и запустить для них всю эмуляцию. Когда
                       локальная очередь закончилась, скачать до трёх новых
                       воскресных записей с YouTube и продолжить.
+download-latest      Скачать последнюю воскресную запись канала Родник
+                      в .cache/liverse/replay_audio без субтитров и эмуляции.
 training-next         Выбрать три уже обработанные локальные проповеди,
                       скачанные до появления категории 0 (07.09.2026 20:05),
                       и повторно прогнать их текущим кодом для новой разметки
@@ -62,6 +66,7 @@ subtitles             Показать записи без SRT/VTT; с --run с�
                       субтитры YouTube, без загрузки аудио и без эмуляции.
 review                Открыть аннотатор для пяти последних файлов с неразмеченными
                       случаями из всех сохранённых replay-пачек.
+  --current-batch     Показать все неразмеченные случаи последней replay-пачки.
 review-slides         Разметить решения умного перелистывателя из этой пачки.
   --browser            Показать слайд и WAV в локальном браузере.
 
@@ -330,12 +335,18 @@ run_training_refresh_batch() {
 }
 
 download_next_rodnik_sermons() {
+    local requested_limit="${1:-$AUTO_DOWNLOAD_LIMIT}"
+    local download_only="${2:-false}"
     if [[ ! -x "$PYTHON" ]]; then
         echo "Не найдено виртуальное окружение Python: $PYTHON" >&2
         return 1
     fi
 
-    echo "Локальная очередь закончилась. Ищу до $AUTO_DOWNLOAD_LIMIT новых воскресных записей на YouTube..."
+    if [[ "$download_only" == true ]]; then
+        echo "Ищу последнюю воскресную запись канала «Родник» на YouTube..."
+    else
+        echo "Локальная очередь закончилась. Ищу до $requested_limit новых воскресных записей на YouTube..."
+    fi
     local listing
     if ! listing="$("$PYTHON" -m yt_dlp --flat-playlist --playlist-end 500 --print '%(id)s|%(title)s' "$RODNIK_CHANNEL_URL")"; then
         echo "Не удалось получить список роликов канала YouTube." >&2
@@ -347,12 +358,16 @@ download_next_rodnik_sermons() {
     while IFS='|' read -r video_id title; do
         [[ "$title" == *"Воскресн"* ]] || continue
         [[ "$video_id" =~ ^[A-Za-z0-9_-]{11}$ ]] || continue
-        if find "$AUDIO_ROOT" -maxdepth 1 -type f -name "*${video_id}*" -print -quit | grep -q .; then
+        if [[ "$download_only" == true ]]; then
+            selected_ids+=("$video_id")
+            download_urls+=("https://www.youtube.com/watch?v=$video_id")
+            break
+        elif find "$AUDIO_ROOT" -maxdepth 1 -type f -name "*${video_id}*" -print -quit | grep -q .; then
             continue
         fi
         selected_ids+=("$video_id")
         download_urls+=("https://www.youtube.com/watch?v=$video_id")
-        if ((${#selected_ids[@]} >= AUTO_DOWNLOAD_LIMIT)); then
+        if ((${#selected_ids[@]} >= requested_limit)); then
             break
         fi
     done <<< "$listing"
@@ -360,6 +375,17 @@ download_next_rodnik_sermons() {
     if ((${#download_urls[@]} == 0)); then
         echo "На канале не найдено отсутствующих локально воскресных записей."
         return 0
+    fi
+
+    if [[ "$download_only" == true ]]; then
+        shopt -s nullglob
+        local existing=("$AUDIO_ROOT"/*"${selected_ids[0]}"*)
+        shopt -u nullglob
+        for audio_file in "${existing[@]}"; do
+            [[ -f "$audio_file" && "$audio_file" != *.part ]] || continue
+            echo "Последняя запись уже скачана: $audio_file"
+            return 0
+        done
     fi
 
     echo "Скачиваю ${#download_urls[@]} новых записей:"
@@ -385,6 +411,11 @@ download_next_rodnik_sermons() {
     if ((${#downloaded_audio[@]} == 0)); then
         echo "Ни одна новая аудиозапись не была скачана." >&2
         return 1
+    fi
+
+    if [[ "$download_only" == true ]]; then
+        echo "Аудио скачано: ${downloaded_audio[0]}"
+        return 0
     fi
 
     echo "Докачиваю русские субтитры с таймкодами для новых записей..."
@@ -422,6 +453,23 @@ review_recent_unreviewed() {
         --recent-unreviewed-files 5
 }
 
+review_current_batch_unreviewed() {
+    if [[ ! -s "$LATEST_BATCH_FILE" ]]; then
+        echo "Нет последней успешной пачки. Сначала выполните next или batch." >&2
+        return 1
+    fi
+    local logs_dir
+    logs_dir="$(<"$LATEST_BATCH_FILE")"
+    if [[ ! -d "$logs_dir" ]]; then
+        echo "Папка логов последней пачки не найдена: $logs_dir" >&2
+        return 1
+    fi
+    exec "$PYTHON" tools/review_trigger_cases.py \
+        --runs-dir "$logs_dir" \
+        --all-unreviewed \
+        --no-resume
+}
+
 review_latest_smart_slides() {
     if [[ ! -s "$LATEST_BATCH_FILE" ]]; then
         echo "Нет последней успешной пачки. Сначала выполните next или batch." >&2
@@ -441,6 +489,15 @@ review_latest_smart_slides() {
 }
 
 case "${1:-}" in
+    download-latest)
+        if (($# != 1)); then
+            echo "У download-latest нет дополнительных параметров." >&2
+            exit 2
+        fi
+        cd "$PROJECT_ROOT"
+        download_next_rodnik_sermons 1 true
+        exit $?
+        ;;
     subtitles)
         if (($# > 2)) || { (($# == 2)) && [[ "$2" != "--run" ]]; }; then
             echo "Допустимый параметр subtitles: --run" >&2
@@ -496,12 +553,16 @@ case "${1:-}" in
         exit $?
         ;;
     review)
-        if (($# != 1)); then
-            echo "У review нет дополнительных параметров." >&2
+        if (($# > 2)) || { (($# == 2)) && [[ "$2" != "--current-batch" ]]; }; then
+            echo "Допустимый параметр review: --current-batch" >&2
             exit 2
         fi
         cd "$PROJECT_ROOT"
-        review_recent_unreviewed
+        if [[ "${2:-}" == "--current-batch" ]]; then
+            review_current_batch_unreviewed
+        else
+            review_recent_unreviewed
+        fi
         ;;
     review-slides)
         if (($# > 2)) || { (($# == 2)) && [[ "$2" != "--browser" ]]; }; then

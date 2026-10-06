@@ -1658,14 +1658,29 @@ def should_block_matched_payload(payload: dict) -> str | None:
     ref = str(parsed.get("ref") or "")
     source = str(payload.get("source") or "")
 
-    # «один стих [из] послания Иакова» can introduce a paraphrase, not a
-    # request to show a verse.  Without a chapter or verse number it must not
-    # become the fabricated address Иаков 1:1.
-    if (
-        re.search(r"\bодин\s+стих\w*\b", raw_text)
-        and re.search(r"\b(?:из\s+)?послани\w*\b", raw_text)
-        and not re.search(r"\bглав\w*\b", raw_text)
+    # A mention of an epistle is not itself a reference. The existing first
+    # branch handles paraphrases introduced as «один стих из послания ...»;
+    # the second blocks the observed false default Иаков 1:1 when James is
+    # discussed without an address (for example, «послание одного из первых
+    # руководителей церкви»).
+    epistle_mention_without_address = bool(
+        re.search(r"\bпослани\w*\b", raw_text)
         and not re.search(r"\b\d{1,3}\s*:\s*\d{1,3}\b", raw_text)
+        and not compact_numbers_follow_book(text, str(parsed.get("book") or ""))
+    )
+    if (
+        epistle_mention_without_address
+        and (
+            re.search(r"\bодин\s+стих\w*\b", raw_text)
+            and not re.search(r"\bглав\w*\b", raw_text)
+            or (
+                parsed.get("chapter") == 1
+                and parsed.get("start_verse") == 1
+                and parsed.get("end_verse") == 1
+                and parsed.get("book") == "Иаков"
+                and not re.search(r"\b(?:глав\w*|стих\w*)\b", raw_text)
+            )
+        )
     ):
         return "ordinary_verse_mention"
 
@@ -2551,6 +2566,12 @@ def contextual_short_reference(
     # remain unaffected.
     if re.search(r"\b(?:в|во|на)\s+(?:этих?\s+)?\d+\s+стих(?:ах|ами)\b", normalized):
         return None
+    raw_words = re.findall(r"[а-я]+", text.lower().replace("ё", "е"))
+    if len(raw_words) == 1 and raw_words[0] in ORDINALS:
+        # An ordinal by itself is common in spoken lists ("first", "second",
+        # "third"). A confirmed passage supplies book/chapter context, but
+        # does not turn every standalone ordinal into a verse reference.
+        return None
 
     chapter: int | None = None
     start_verse: int | None = None
@@ -2879,6 +2900,63 @@ def parsed_payload_from_candidates(
     return payload
 
 
+def correct_chapter_word_from_verse_text(payload: dict, asr_result: dict | None, bible_path: Path) -> dict:
+    """Resolve low-confidence «глава» -> «два» only with a complete verse quote."""
+    parsed = payload.get("parsed") or {}
+    if not isinstance(asr_result, dict) or payload.get("reference_list"):
+        return payload
+    chapter = int(parsed.get("chapter") or 0)
+    verse = int(parsed.get("end_verse") or 0)
+    if parsed.get("start_verse") != 2 or verse <= 2 or int(parsed.get("end_chapter") or chapter) != chapter:
+        return payload
+    normalized = normalize_text(str(payload.get("text") or ""))
+    match = re.search(rf"\b{chapter}\s+2\s+{verse}\s+стих\b", normalized)
+    if match is None or re.search(r"\b(?:глава|с|со|от|по|до)\b|[-–—:]", normalized[:match.end()]):
+        return payload
+    words = asr_result.get("result") or []
+    suspect_confidence = None
+    for index in range(1, len(words) - 1):
+        item = words[index]
+        if (
+            item.get("word") == "два"
+            and normalize_text(str(words[index - 1].get("word") or "")) == str(chapter)
+            and normalize_text(str(words[index + 1].get("word") or "")) == str(verse)
+        ):
+            try:
+                confidence = float(item.get("conf", 1.0))
+            except (TypeError, ValueError):
+                continue
+            if 0 <= confidence < 0.3:
+                suspect_confidence = confidence
+                break
+    if suspect_confidence is None:
+        return payload
+    book = str(parsed.get("book") or "")
+    verse_text = bible_map(bible_path).get(book, {}).get(chapter, {}).get(verse, "")
+    verse_words = re.findall(r"[а-я]+", verse_text.lower().replace("ё", "е"))
+    spoken_words = re.findall(r"[а-я]+", normalized[match.end():])
+    # Full ordered wording is required; a short shared phrase cannot narrow a range.
+    if len(verse_words) < 6 or not any(
+        spoken_words[index:index + len(verse_words)] == verse_words
+        for index in range(len(spoken_words) - len(verse_words) + 1)
+    ):
+        return payload
+    corrected = parse_live_reference(f"{book} {chapter}:{verse}", bible_path=bible_path)
+    if corrected is None:
+        return payload
+    payload = dict(payload)
+    payload["parsed"] = asdict(corrected)
+    payload["parsed"]["source_text"] = payload.get("text")
+    payload["ambiguous_alternatives"] = []
+    payload["address_text_correction"] = {
+        "reason": "low_confidence_chapter_word_confirmed_by_full_verse",
+        "original_ref": parsed.get("ref"),
+        "confirmed_ref": corrected.ref,
+        "suspect_word_confidence": suspect_confidence,
+    }
+    return payload
+
+
 def asr_word_time_bounds(asr_result: dict | None) -> tuple[int | None, int | None]:
     if not isinstance(asr_result, dict):
         return None, None
@@ -3096,6 +3174,7 @@ class LiveReferencePipeline:
         )
         if context_payload and not keep_explicit_buffered_reference:
             payload = context_payload
+        payload = correct_chapter_word_from_verse_text(payload, asr_result, self.bible_path)
         if timing is not None:
             timing["reference_parse_ms"] = round(
                 (time.perf_counter() - parse_started) * 1000.0,
