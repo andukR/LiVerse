@@ -35,7 +35,7 @@ _LIVE_LATENCY_CONTEXT = threading.local()
 SCRIPTURE_RANGE_STARTUP_SYNC_GRACE_SECONDS = 1.5
 # Keep the live Holyrics threshold unchanged.  The browser review timeline has
 # its own slightly wider rule for four-verse announcements.
-DEFAULT_LONG_RANGE_MIN_VERSES = 5
+DEFAULT_LONG_RANGE_MIN_VERSES = 3
 MIN_RECOMMENDED_HOLYRICS_VERSION = "2.28.1"
 HOLYRICS_JSLIB_DOC_URL = "https://github.com/holyrics/jslib/blob/main/README-en.md"
 REQUIRED_HOLYRICS_PERMISSIONS = (

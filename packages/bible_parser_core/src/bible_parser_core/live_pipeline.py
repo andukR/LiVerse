@@ -2432,12 +2432,13 @@ def nearby_context_chapter_for_verse_range(
     *,
     preferred_chapter: int | None = None,
 ) -> int | None:
-    """Allow a small, immediately following same-chapter reference.
+    """Allow a bounded overlapping or immediately following same-chapter reference.
 
     A preacher can accidentally cite a couple of verses just after an
     announced reading range.  This is deliberately not a general extension:
-    it is only one or two verses, in a single-chapter context, with at most
-    three omitted verses between the announced end and the new start.
+    A range starting within the context may extend at most two verses beyond
+    its end. A separate following reference remains limited to one or two
+    verses with at most three omitted verses before it.
     """
     try:
         chapter = int(context["chapter"])
@@ -2447,7 +2448,11 @@ def nearby_context_chapter_for_verse_range(
         return None
     if chapter != end_chapter or (preferred_chapter is not None and preferred_chapter != chapter):
         return None
-    if start_verse > end_verse or end_verse - start_verse > 1:
+    if start_verse > end_verse:
+        return None
+    if int(context["start_verse"]) <= start_verse <= context_end < end_verse:
+        return chapter if end_verse - context_end <= 2 else None
+    if end_verse - start_verse > 1:
         return None
     if start_verse <= context_end or start_verse - context_end > 4:
         return None
@@ -2666,12 +2671,15 @@ def contextual_short_reference(
             preferred_chapter=preferred_chapter,
         )
     nearby_context = False
-    if chapter is None:
+    if chapter is None or not (
+        context_range_contains(context, chapter, start_verse)
+        and context_range_contains(context, chapter, end_verse)
+    ):
         chapter = nearby_context_chapter_for_verse_range(
             context,
             start_verse,
             end_verse,
-            preferred_chapter=preferred_chapter,
+            preferred_chapter=chapter if chapter is not None else preferred_chapter,
         )
         nearby_context = chapter is not None
     if (
@@ -2998,7 +3006,15 @@ class LiveReferencePipeline:
         context = reference_range_context(reference)
         if not context:
             return False
-        self.context_range = context
+        previous = self.context_range
+        contained = (
+            previous is not None
+            and previous["book"] == context["book"]
+            and context_range_contains(previous, int(context["chapter"]), int(context["start_verse"]))
+            and context_range_contains(previous, int(context["end_chapter"]), int(context["end_verse"]))
+        )
+        if not contained:
+            self.context_range = context
         self.context_current_chapter = int(context["chapter"])
         return True
 

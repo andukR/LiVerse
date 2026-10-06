@@ -115,7 +115,7 @@ MAX_REPLAY_WINDOW_SECONDS = 120.0
 REPLAY_WINDOW_OVERLAP_SECONDS = 5.0
 MARKER_PADDING_BEFORE_SECONDS = 15.0
 MARKER_PADDING_AFTER_SECONDS = 45.0
-LONG_RANGE_REPLAY_MIN_VERSES = 5
+LONG_RANGE_REPLAY_MIN_VERSES = DEFAULT_LONG_RANGE_MIN_VERSES
 # The ordinary 45-second tail normally contains the address, a short pause,
 # and roughly the first three verses.  Keep enough additional source audio for
 # each remaining verse of an announced long reading.

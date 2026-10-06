@@ -2171,11 +2171,50 @@ class LiveReferencePipelineTest(unittest.TestCase):
             "chapter": 2,
             "start_verse": 10,
             "end_chapter": 2,
-            "end_verse": 13,
+            "end_verse": 11,
         }
 
         self.assertFalse(action_selects_context("sent", slide))
         self.assertTrue(action_selects_context("approve_context", slide))
+
+    def test_nested_reading_preserves_broad_context_and_restores_overlapping_range(self):
+        pipeline = LiveReferencePipeline()
+        broad = pipeline.process_text("Иаков пятая глава с первого по шестой стих")
+        self.assertTrue(pipeline.set_context_range(broad))
+        nested = pipeline.process_text("Иаков пятая глава с первого по третий стих")
+        self.assertTrue(pipeline.set_context_range(nested))
+        self.assertEqual("Иаков 5:1-6", pipeline.context_range["ref"])
+        self.assertEqual("Иаков 5:1-3", nested["parsed"]["ref"])
+        self.assertEqual("Иаков 5:4", pipeline.process_text("четвёртый стих")["parsed"]["ref"])
+        for phrase in ("с четвёртого по восьмой стих", "пятая глава с четвёртого по восьмой стих"):
+            with self.subTest(phrase=phrase):
+                result = pipeline.process_text(phrase)
+                self.assertEqual("Иаков 5:4-8", result["parsed"]["ref"])
+                self.assertTrue(result["context_reference"])
+
+    def test_overlapping_context_does_not_guess_far_end_or_other_chapter(self):
+        for phrase in ("с четвёртого по девятый стих", "шестая глава с четвёртого по восьмой стих"):
+            with self.subTest(phrase=phrase):
+                pipeline = LiveReferencePipeline()
+                pipeline.set_context_range({"book": "Иаков", "chapter": 5,
+                                            "start_verse": 1, "end_verse": 6})
+                result = pipeline.process_text(phrase)
+                self.assertFalse(result.get("context_reference"))
+
+    def test_new_book_or_noncontained_range_replaces_context(self):
+        for reference in (
+            {"book": "Иаков", "chapter": 5, "start_verse": 4, "end_verse": 8},
+            {"book": "Иаков", "chapter": 4, "start_verse": 1, "end_verse": 3},
+            {"book": "Иоанн", "chapter": 5, "start_verse": 1, "end_verse": 3},
+        ):
+            with self.subTest(reference=reference):
+                pipeline = LiveReferencePipeline()
+                pipeline.set_context_range({"book": "Иаков", "chapter": 5,
+                                            "start_verse": 1, "end_verse": 6})
+                self.assertTrue(pipeline.set_context_range(reference))
+                self.assertEqual(reference["book"], pipeline.context_range["book"])
+                self.assertEqual(reference["chapter"], pipeline.context_range["chapter"])
+                self.assertEqual(reference["end_verse"], pipeline.context_range["end_verse"])
 
     def test_operator_feedback_keeps_only_unambiguous_training_labels(self):
         from tools.vosk_grammar_probe import approval_action, operator_feedback
@@ -5147,6 +5186,20 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertTrue(slides[0]["text"].startswith("Иоанн 3:16-36\n\n3:16."))
         self.assertNotIn("Иоанн 3:16-36", slides[1]["text"])
         self.assertTrue(any("3:36." in slide["text"] for slide in slides))
+
+    def test_three_verse_reading_builds_ups_slides_but_two_verses_remain_temporary(self):
+        from tools.vosk_grammar_probe import action_selects_context
+        from tools.replay_audio_files import replay_long_passage
+        for end_verse, expected_count in ((2, 0), (3, 3)):
+            with self.subTest(end_verse=end_verse):
+                result = LiveReferencePipeline().process_text(f"Иаков 5:1-{end_verse}")
+                slides = scripture_range_quick_presentation_slides(result["parsed"], max_verses=1)
+                self.assertEqual(expected_count, len(slides))
+                self.assertEqual(bool(expected_count), action_selects_context("sent", result["parsed"]))
+                self.assertEqual(bool(expected_count), replay_long_passage(result) is not None)
+                if slides:
+                    state = scripture_range_reading_state(result["parsed"], slides)
+                    self.assertEqual([1, 2, 3], [t["verse"] for t in state["targets"]])
 
     def test_long_range_one_verse_mode_builds_one_verse_per_slide(self):
         pipeline = LiveReferencePipeline()

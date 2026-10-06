@@ -4690,6 +4690,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                                         "context_range_selected",
                                         {
                                             "ref": payload["slide"].get("ref"),
+                                            "context_ref": (pipeline.context_range or {}).get("ref"),
                                             "source": (
                                                 "operator"
                                                 if action == "approve_context"
