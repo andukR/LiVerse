@@ -516,7 +516,7 @@ if [[ "$PREPARE_ONLY" == false ]]; then
         if [[ "$VM_STATE" == 'running' ]]; then
             VM_CDROM_SOURCE=$(
                 virsh -c "$VM_URI" domblklist "$VM_NAME" --details |
-                    awk -v target="$VM_CDROM" '$3 == target {print $4; exit}'
+                    awk -v target="$VM_CDROM" '$3 == target {print $4}'
             )
             # The ISO is atomically replaced at the same path. Explicitly eject
             # it first so QEMU cannot keep serving the previous open file. An
