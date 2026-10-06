@@ -44,9 +44,8 @@ windows-vm-inspect-holyrics:
 
 windows-release:
 	@if [ -z "$(VERSION)" ]; then echo 'Укажите VERSION, например: make windows-release VERSION=1.2.0' >&2; exit 2; fi
-	@if [ -z "$(PREVIOUS_INSTALLER)" ]; then echo 'Укажите PREVIOUS_INSTALLER — путь к установщику предыдущей версии.' >&2; exit 2; fi
 	$(MAKE) test
-	./tools/sync_windows_build.sh --build-installer --release-version "$(VERSION)" --upgrade-from-installer "$(PREVIOUS_INSTALLER)"
+	./tools/sync_windows_build.sh --build-installer --release-version "$(VERSION)" $(if $(PREVIOUS_INSTALLER),--upgrade-from-installer "$(PREVIOUS_INSTALLER)")
 
 liverse:
 	@if [ -x "$(PY)" ]; then \
