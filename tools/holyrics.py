@@ -749,7 +749,34 @@ def parse_holyrics_response(body: str) -> tuple[bool, str]:
     return False, f"holyrics_error:{error}"
 
 
+def song_text_is_protected(current: dict | None) -> bool:
+    """Only positively identified empty song screens allow scripture display."""
+    if not current or current.get("type") != "song":
+        return False
+    if current.get("slide_type") in {"wallpaper", "blank"}:
+        return False
+    try:
+        index = int(current.get("slide_number") or 1) - 1
+        slides = current.get("slides")
+        if isinstance(slides, list) and 0 <= index < len(slides):
+            slide = slides[index]
+            if isinstance(slide, dict) and isinstance(slide.get("text"), str):
+                return bool(slide["text"].strip())
+    except (TypeError, ValueError):
+        pass
+    # Unknown slide contents (including final_slide) are protected too.
+    return True
+
+
 def post_holyrics_api(args: Any, base_url: str, endpoint: str, body: dict) -> tuple[bool, str, str]:
+    if endpoint in {"ShowQuickPresentation", "ShowVerse", "ShowText"}:
+        ok, current, reason = get_holyrics_presentation_state(
+            args, base_url, "GetCurrentPresentation", {"include_slides": True}
+        )
+        if not ok or song_text_is_protected(current):
+            blocked = "holyrics_song_text_protected" if ok else "holyrics_current_display_unavailable"
+            holyrics_diagnostic_event(args, "scripture_display_blocked", {"reason": blocked, "endpoint": endpoint})
+            return False, blocked, ""
     base_url = str(base_url).rstrip("/")
     query = urlencode({"token": getattr(args, "holyrics_token", "")})
     url = f"{base_url}/api/{endpoint}?{query}"
@@ -1065,10 +1092,13 @@ def restore_holyrics_presentation_later(
 
     delay_seconds = max(1.0, minutes * 60.0)
     display_token = object()
+    scripture_owner = getattr(args, "_holyrics_owned_scripture_presentation", None)
     scheduled_at = time.monotonic()
     setattr(args, "_holyrics_temporary_verse_display", display_token)
 
     def restore() -> None:
+        if getattr(args, "_holyrics_temporary_verse_display", None) is not display_token:
+            return
         holyrics_diagnostic_event(
             args,
             "temporary_presentation_restore_timer_fired",
@@ -1081,7 +1111,10 @@ def restore_holyrics_presentation_later(
             },
         )
         try:
-            if quick_presentation:
+            if isinstance(scripture_owner, dict):
+                ok, reason, _diagnostics = restore_owned_scripture_presentation(args, base_url, scripture_owner)
+                holyrics_diagnostic_event(args, "scripture_temporary_restore", {"ok": ok, "reason": reason})
+            elif quick_presentation:
                 restore_holyrics_presentation(args, base_url, previous, quick_presentation=True)
             else:
                 restore_holyrics_presentation(args, base_url, previous)
@@ -1143,7 +1176,6 @@ def show_holyrics_text_slide(
     presentation: dict[str, Any],
     slide_index: int,
 ) -> tuple[bool, str]:
-    clear_scripture_range_reading(args)
     text_id = str(presentation.get("text_id") or presentation.get("id") or "").strip()
     if not text_id:
         return False, "sermon_plan_text_id_missing"
@@ -1152,6 +1184,11 @@ def show_holyrics_text_slide(
     current_type = str((current or {}).get("type") or "").strip()
     current_text_id = str((current or {}).get("text_id") or (current or {}).get("id") or "").strip()
     current_index = max(0, int((current or {}).get("slide_number") or 1) - 1)
+    if str(getattr(args, "holyrics_scripture_theme", "") or "").strip() and (
+        current_type != "text" or current_text_id != text_id or (current or {}).get("slide_type") == "black"
+    ):
+        return False, "sermon_plan_not_active"
+    clear_scripture_range_reading(args)
     if current_type == "text" and current_text_id == text_id:
         if current_index == slide_index:
             return True, "sermon_plan_already_current"
@@ -1510,7 +1547,7 @@ def blank_holyrics_text_presentation(active: dict[str, Any] | None) -> bool:
 
 def ensure_holyrics_sermon_plan_presentation(args: Any, base_url: str) -> dict[str, Any] | None:
     sermon_plan = getattr(args, "_holyrics_sermon_plan_presentation", None)
-    if isinstance(sermon_plan, dict):
+    if isinstance(sermon_plan, dict) and not str(getattr(args, "holyrics_scripture_theme", "") or "").strip():
         return sermon_plan
     if not getattr(args, "sermon_plan", False):
         return None
@@ -1519,6 +1556,10 @@ def ensure_holyrics_sermon_plan_presentation(args: Any, base_url: str) -> dict[s
         base_url,
         include_slides=True,
     )
+    if (active or {}).get("slide_type") == "black":
+        return None
+    if isinstance(sermon_plan, dict) and (active or {}).get("type") == "text" and str((active or {}).get("text_id") or (active or {}).get("id") or "") == str(sermon_plan.get("text_id") or sermon_plan.get("id") or ""):
+        return sermon_plan
     return build_holyrics_sermon_plan_presentation(args, active or {})
 
 
@@ -1621,6 +1662,9 @@ def extract_holyrics_permissions(info: dict[str, Any] | None) -> set[str]:
 
 def required_holyrics_permissions(args: Any) -> tuple[str, ...]:
     permissions = list(REQUIRED_HOLYRICS_PERMISSIONS)
+    if str(getattr(args, "holyrics_scripture_theme", "") or "").strip():
+        permissions.extend(("GetThemes", "GetF10", "GetCurrentTheme", "GetCurrentBackground",
+                            "GetBackgrounds", "GetWallpaperSettings", "ShowLyrics", "SetF8", "SetF9"))
     if bool(getattr(args, "sermon_plan", False)):
         permissions.extend(SERMON_PLAN_HOLYRICS_PERMISSIONS)
     return tuple(dict.fromkeys(permissions))
@@ -1810,9 +1854,21 @@ def sync_scripture_range_reading(args: Any) -> dict:
     current = get_holyrics_current_presentation(
         args,
         str(getattr(args, "holyrics_url", "")).rstrip("/"),
+        include_slides=isinstance(state.get("scripture_owner"), dict),
     )
     if current is None:
         return {"active": True, "reason": "current_presentation_unavailable"}
+
+    owner = state.get("scripture_owner")
+    if isinstance(owner, dict) and (
+        not owned_scripture_presentation(current, owner) or current.get("slide_type") == "black"
+    ):
+        if current.get("slide_type") != "black" and time.monotonic() - state.get("started_at_monotonic", 0) < SCRIPTURE_RANGE_STARTUP_SYNC_GRACE_SECONDS:
+            return {"active": True, "reason": "waiting_for_quick_presentation"}
+        clear_scripture_range_reading(args)
+        setattr(args, "_holyrics_owned_scripture_presentation", None)
+        cancel_holyrics_restore_timer(args, reason="operator_changed_display")
+        return {"active": False, "manual_restore": True, "reason": "operator_changed_display"}
 
     current_type = str(current.get("type") or "").strip()
     current_text_id = str(current.get("text_id") or current.get("id") or "").strip()
@@ -1866,6 +1922,10 @@ def handle_scripture_range_reading_match(args: Any, candidate: Any) -> dict:
     state = getattr(args, "_holyrics_scripture_range_reading", None)
     if not isinstance(state, dict):
         return {"active": False, "matched_boundary": False, "reason": "inactive"}
+    if isinstance(state.get("scripture_owner"), dict):
+        sync = sync_scripture_range_reading(args)
+        if not sync.get("active") or sync.get("reason") in {"current_presentation_unavailable", "waiting_for_quick_presentation"}:
+            return {"active": bool(sync.get("active")), "matched_boundary": False, "reason": sync.get("reason")}
     targets = list(state.get("targets") or [])
     current_index = int(state.get("current_index") or 0)
     if current_index < 0 or current_index >= len(targets):
@@ -1936,7 +1996,11 @@ def handle_scripture_range_reading_match(args: Any, candidate: Any) -> dict:
             presentation = state.get("restore_presentation")
         if not isinstance(presentation, dict):
             presentation = getattr(args, "_holyrics_last_sermon_plan_presentation", None)
-        if isinstance(presentation, dict):
+        if isinstance(state.get("scripture_owner"), dict):
+            restored, restore_reason, restore_diagnostics = restore_owned_scripture_presentation(
+                args, base_url, state["scripture_owner"]
+            )
+        elif isinstance(presentation, dict):
             try:
                 return_index = max(0, int(presentation.get("current_index") or 0))
             except (TypeError, ValueError):
@@ -1973,7 +2037,7 @@ def handle_scripture_range_reading_match(args: Any, candidate: Any) -> dict:
             "active": False,
             "matched_boundary": True,
             "completed": True,
-            "restored_sermon_plan": isinstance(presentation, dict),
+            "restored_sermon_plan": isinstance(presentation, dict) and not isinstance(state.get("scripture_owner"), dict),
             "reason": restore_reason if isinstance(presentation, dict) else "long_passage_completed",
             "restore_diagnostics": restore_diagnostics,
             "current_index": current_index,
@@ -2048,7 +2112,227 @@ def apply_scripture_range_operator_hint(
     return True, "operator_moved_long_passage"
 
 
+def scripture_black_screen_state(args: Any, base_url: str) -> tuple[bool, bool]:
+    ok, _reason, response = post_holyrics_api(args, base_url, "GetF10", {})
+    try:
+        value = json.loads(response).get("data")
+    except (ValueError, AttributeError, TypeError):
+        return False, False
+    return ok and isinstance(value, bool), value is True
+
+
+def owned_scripture_presentation(current: dict | None, owner: dict) -> bool:
+    if not current or current.get("type") != "quick_presentation":
+        return False
+    slides = current.get("slides")
+    return isinstance(slides, list) and [str(s.get("text") or "").strip() for s in slides] == owner["texts"]
+
+
+def restore_owned_scripture_presentation(args: Any, base_url: str, owner: dict) -> tuple[bool, str, dict]:
+    if getattr(args, "_holyrics_owned_scripture_presentation", None) is not owner:
+        return True, "scripture_presentation_replaced", {}
+    state_ok, current, reason = get_holyrics_presentation_state(
+        args, base_url, "GetCurrentPresentation", {"include_slides": True}
+    )
+    if not state_ok:
+        return False, "scripture_restore_state_unavailable", {"reason": reason}
+    black_ok, black = scripture_black_screen_state(args, base_url)
+    if not black_ok:
+        return False, "holyrics_black_screen_state_unavailable", {}
+    if not owned_scripture_presentation(current, owner) or black or (current or {}).get("slide_type") == "black":
+        setattr(args, "_holyrics_owned_scripture_presentation", None)
+        holyrics_diagnostic_event(args, "scripture_restore_skipped", {"reason": "operator_changed_display"})
+        return True, "operator_changed_display", {}
+    previous = owner.get("previous") or {}
+    kind = previous.get("type")
+    if kind in {"song", "text"}:
+        item_id = str(previous.get("song_id" if kind == "song" else "text_id") or previous.get("id") or "")
+        if not item_id:
+            return False, "scripture_restore_id_missing", {}
+        index = max(0, int(previous.get("slide_number") or 1) - 1)
+        endpoint = "ShowLyrics" if kind == "song" else "ShowText"
+        body = {"id": item_id, "initial_index": index}
+    elif not previous:
+        endpoint, body = "CloseCurrentPresentation", {}
+    else:
+        return False, "scripture_restore_type_unsupported", {"type": kind}
+    # ShowQuickPresentation is a current text presentation, unlike a Bible
+    # quick overlay. Restore the saved item directly; do not treat the Bible
+    # overlay's 'No quick presentation available' as a successful return.
+    ok, reason, _response = post_holyrics_api(args, base_url, endpoint, body)
+    if not ok:
+        return False, reason or "scripture_restore_request_failed", {}
+    if previous.get("slide_type") in {"wallpaper", "blank"}:
+        mode = "SetF8" if previous["slide_type"] == "wallpaper" else "SetF9"
+        ok, reason, _response = post_holyrics_api(args, base_url, mode, {"enable": True})
+        if not ok:
+            return False, reason, {}
+    verified, restored, reason = get_holyrics_presentation_state(args, base_url, "GetCurrentPresentation")
+    diagnostics = {"restored": restored, "response": reason}
+    if not verified:
+        return False, "scripture_restore_state_unavailable", diagnostics
+    if previous:
+        restored = restored or {}
+        restored_id = str(restored.get("song_id" if kind == "song" else "text_id") or restored.get("id") or "")
+        matches = (restored.get("type") == kind and restored_id == item_id
+                   and int(restored.get("slide_number") or 1) == index + 1
+                   and restored.get("slide_type", "default") == previous.get("slide_type", "default"))
+    else:
+        matches = restored is None
+    if not matches:
+        return False, "scripture_restore_not_verified", diagnostics
+    if getattr(args, "_holyrics_owned_scripture_presentation", None) is owner:
+        setattr(args, "_holyrics_owned_scripture_presentation", None)
+    return True, "scripture_restore_verified", diagnostics
+
+
+def scripture_presentation_appearance(
+    args: Any, base_url: str, current: dict | None,
+) -> tuple[dict | None, str]:
+    """Select styling from the operator's display, never from our own overlay."""
+    ok, reason, response = post_holyrics_api(args, base_url, "GetThemes", {})
+    if not ok:
+        return None, reason
+    themes = extract_holyrics_data_list(response)
+    blank = not current or current.get("slide_type") in {"wallpaper", "blank", "final_slide"}
+    if current and not blank:
+        slides = current.get("slides")
+        index = max(0, int(current.get("slide_number") or 1) - 1)
+        blank = isinstance(slides, list) and index < len(slides) and not str(slides[index].get("text") or "").strip()
+    use_current_text = current and current.get("type") == "text" and not blank
+    fallback = None
+    if not use_current_text:
+        name = str(args.holyrics_scripture_theme).strip()
+        matches = [t for t in themes if t.get("name") == name and t.get("id")]
+        if len(matches) != 1:
+            return None, f"holyrics_scripture_theme_not_unique:{name};matches:{len(matches)}"
+        fallback = matches[0]
+        if current and current.get("type") == "song" and not blank:
+            return {"theme": {"id": str(fallback["id"])}}, "song_scripture_theme"
+
+    if not current or current.get("slide_type") == "wallpaper":
+        ok, _reason, raw = post_holyrics_api(args, base_url, "GetWallpaperSettings", {})
+        try:
+            wallpaper = json.loads(raw).get("data") if ok else None
+        except (ValueError, TypeError, AttributeError):
+            wallpaper = None
+        # The API provides image bytes, but no reusable image-library ID.
+        # Only a plain fill can be reproduced without creating/importing files.
+        if isinstance(wallpaper, dict):
+            screens = wallpaper.get("by_screen") or {}
+            screen = screens.get("public") or screens.get("default") or wallpaper
+            color = screen.get("fill_color")
+            if screen.get("enabled") is True and not wallpaper.get("image_base64") and isinstance(color, str) and re.fullmatch(r"#?[0-9a-fA-F]{6}", color):
+                return {"theme": {"id": str(fallback["id"]), "edit": {
+                    "background": {"type": "color", "id": color.lstrip("#")},
+                }}}, "wallpaper_fill"
+        return {"theme": {"id": str(fallback["id"])}}, "wallpaper_fallback"
+
+    appearance = capture_holyrics_current_appearance(args, base_url, include_records=False)
+    theme_info = appearance.get("theme", {}).get("data")
+    background_info = appearance.get("background", {}).get("data")
+    if not appearance.get("background", {}).get("ok") or not isinstance(background_info, dict):
+        return None, "holyrics_current_background_unavailable"
+    active_theme = None
+    if isinstance(theme_info, dict) and appearance.get("theme", {}).get("ok"):
+        matches = [t for t in themes if t.get("name") == theme_info.get("name") and theme_info.get("name")]
+        if len(matches) == 1:
+            active_theme = matches[0]
+    if use_current_text and active_theme is None:
+        return None, "holyrics_current_theme_not_unique"
+    background_type = str(background_info.get("type") or "")
+    if background_type == "theme":
+        matches = [t for t in themes if t.get("name") == background_info.get("name") and background_info.get("name")]
+        background = dict(matches[0].get("background") or {}) if len(matches) == 1 else {}
+    elif background_type == "color":
+        background = {"type": "color", "id": background_info.get("id")}
+    else:
+        ok, _reason, raw = post_holyrics_api(args, base_url, "GetBackgrounds", {})
+        records = extract_holyrics_data_list(raw) if ok else []
+        matches = [b for b in records if b.get("name") == background_info.get("name")
+                   and background_info.get("name") and b.get("type") == background_type and b.get("id")]
+        background = {"type": background_type, "id": matches[0]["id"]} if len(matches) == 1 else {}
+    if not background.get("id") or background.get("type") not in {
+        "color", "my_video", "my_image", "video", "image", "pattern", "transparent", "image_file", "video_file",
+    }:
+        return None, "holyrics_current_background_not_unique"
+    source = active_theme if use_current_text else fallback
+    custom = {key: value for key, value in source.items() if key not in {"id", "name", "metadata"}}
+    visible_background = dict((active_theme or {}).get("background") or {})
+    visible_background.pop("adjust_type", None)
+    visible_background.update(background)
+    custom["background"] = visible_background
+    if active_theme and "base_color" in active_theme:
+        custom["base_color"] = active_theme["base_color"]
+    return {"custom_theme": custom}, "current_text_theme" if use_current_text else "empty_slide_background"
+
+
+def post_holyrics_scripture_theme(args: Any, base_url: str, payload: dict) -> tuple[bool, str]:
+    """Show scripture with styling selected from the operator's current screen."""
+    state_ok, current, reason = get_holyrics_presentation_state(
+        args, base_url, "GetCurrentPresentation", {"include_slides": True}
+    )
+    if not state_ok:
+        return False, "holyrics_current_display_unavailable"
+    if song_text_is_protected(current):
+        holyrics_diagnostic_event(args, "scripture_display_blocked", {"reason": "holyrics_song_text_protected"})
+        return False, "holyrics_song_text_protected: на экране текст песни"
+    black_ok, black = scripture_black_screen_state(args, base_url)
+    if not black_ok:
+        return False, "holyrics_black_screen_state_unavailable"
+    if black or (current or {}).get("slide_type") == "black":
+        return False, "holyrics_black_screen_active: отключите F10 в Holyrics для показа цитаты"
+    prior_owner = getattr(args, "_holyrics_owned_scripture_presentation", None)
+    if (current or {}).get("type") == "quick_presentation" and not (
+        isinstance(prior_owner, dict) and owned_scripture_presentation(current, prior_owner)
+    ):
+        return False, "holyrics_foreign_quick_presentation_active"
+    replacing_own = isinstance(prior_owner, dict) and owned_scripture_presentation(current, prior_owner)
+    if replacing_own:
+        styling, appearance_source = prior_owner["styling"], prior_owner["appearance_source"]
+    else:
+        styling, appearance_source = scripture_presentation_appearance(args, base_url, current)
+    if styling is None:
+        return False, appearance_source
+    selected_range = scripture_range(payload)
+    if selected_range:
+        slides = scripture_range_quick_presentation_slides(
+            payload, max_verses=holyrics_long_range_slide_max_verses(args, DEFAULT_LONG_RANGE_SLIDE_MAX_VERSES)
+        )
+    else:
+        text = slide_payload_to_holyrics_text(payload)
+        slides = [{"text": text}] if text else []
+    if not slides:
+        return False, "holyrics_quick_presentation_empty"
+    # A second citation replaces the LV overlay, not the operator's underlying screen.
+    previous = prior_owner["previous"] if isinstance(prior_owner, dict) and owned_scripture_presentation(current, prior_owner) else current
+    body = {"slides": slides, **styling}
+    ok, reason, _response = post_holyrics_api(args, base_url, "ShowQuickPresentation", body)
+    if not ok:
+        return False, reason
+    cancel_holyrics_restore_timer(args, reason="show_scripture_theme")
+    clear_scripture_range_reading(args)
+    owner = {"texts": [str(s["text"]).strip() for s in slides], "previous": previous,
+             "styling": styling, "appearance_source": appearance_source}
+    setattr(args, "_holyrics_owned_scripture_presentation", owner)
+    holyrics_diagnostic_event(args, "scripture_theme_presentation_shown", {
+        "fallback_theme_name": str(args.holyrics_scripture_theme).strip(), "appearance_source": appearance_source, "reference": payload.get("ref"),
+        "previous": previous, "slides": len(slides),
+    })
+    if selected_range:
+        state = scripture_range_reading_state(payload, slides)
+        state["scripture_owner"] = owner
+        setattr(args, "_holyrics_scripture_range_reading", state)
+        return True, f"show_quick_presentation:long_range;slides:{len(slides)};appearance:{appearance_source}"
+    minutes = holyrics_quick_minutes(args)
+    if minutes > 0:
+        restore_holyrics_presentation_later(args, base_url, previous, minutes, quick_presentation=True)
+    return True, f"show_quick_presentation:appearance:{appearance_source};temporary_verse:{minutes:g}min"
+
+
 def post_holyrics_url(args: Any, base_url: str, payload: dict) -> tuple[bool, str]:
+    if str(getattr(args, "holyrics_scripture_theme", "") or "").strip():
+        return post_holyrics_scripture_theme(args, base_url, payload)
     clear_scripture_range_reading(args)
     setattr(args, "_holyrics_sermon_plan_custom_theme", None)
     if str(payload.get("slide_type") or "").strip() in {"reference_list", "chapter_reference"}:

@@ -12,6 +12,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import zipfile
 from dataclasses import dataclass, replace
@@ -49,6 +50,9 @@ from tools.release_updater import (  # noqa: E402
     ReleaseUpdateError,
     check_windows_release_update,
     download_windows_release_installer,
+    ReleaseDownloadCancelled,
+    log_update,
+    update_log_path,
     launch_windows_release_installer,
 )
 from tools.vosk_grammar_probe import (  # noqa: E402
@@ -156,6 +160,7 @@ def create_log_archive(
     destination: Path,
     *,
     include_audio: bool = False,
+    update_log: Path | None = None,
 ) -> int:
     """Create a reviewable archive without settings, passwords, or HoLyrics token."""
     names = (*LOG_EXPORT_NAMES, "audio.wav") if include_audio else LOG_EXPORT_NAMES
@@ -172,6 +177,9 @@ def create_log_archive(
                     else:
                         archive.writestr(archive_name, sanitized_log_bytes(source))
                     written += 1
+        if update_log is not None and update_log.is_file():
+            archive.writestr("updates/updates.jsonl", sanitized_log_bytes(update_log))
+            written += 1
     if written == 0:
         try:
             destination.unlink()
@@ -250,6 +258,7 @@ class GuiConfig:
     holyrics_token: str = ""
     holyrics_port: int = DEFAULT_PORT
     quick_seconds: float = 5.0
+    holyrics_scripture_theme: str = "For_LiVerse"
     long_range_slide_mode: str = "compact"
     long_range_operator_hints: bool = False
     smart_slide_streaming_control: bool = True
@@ -373,6 +382,7 @@ def load_gui_config() -> GuiConfig:
         holyrics_token=env_setting("HOLYRICS_TOKEN"),
         holyrics_port=port,
         quick_seconds=quick_seconds,
+        holyrics_scripture_theme=str(settings.get("holyrics_scripture_theme", "For_LiVerse")),
         long_range_slide_mode=long_range_slide_mode,
         long_range_operator_hints=bool(settings.get("long_range_operator_hints", False)),
         smart_slide_streaming_control=bool(
@@ -401,6 +411,7 @@ def save_gui_config(config: GuiConfig) -> None:
         open_operator_qr=config.open_operator_qr,
         gui_auto_hide=config.auto_hide,
         holyrics_quick_minutes=config.quick_seconds / 60.0,
+        holyrics_scripture_theme=config.holyrics_scripture_theme,
         long_range_slide_mode=config.long_range_slide_mode,
         long_range_operator_hints=config.long_range_operator_hints,
         smart_slide_streaming_control=config.smart_slide_streaming_control,
@@ -440,6 +451,8 @@ def engine_command(
         f"http://localhost:{config.holyrics_port}",
         "--holyrics-quick-minutes",
         f"{config.quick_seconds / 60.0:g}",
+        "--holyrics-scripture-theme",
+        config.holyrics_scripture_theme,
         "--long-range-slide-mode",
         config.long_range_slide_mode,
         "--text-detection-db",
@@ -584,6 +597,7 @@ class LiVerseGui:
         self.microphone_var = tk.StringVar(value=self.config.audio_device_name or "Автоматический выбор")
         self.detection_var = tk.StringVar(value=DETECTION_LABELS[self.config.citation_detection_mode])
         self.quick_seconds_var = tk.StringVar(value=f"{self.config.quick_seconds:g}")
+        self.scripture_theme_var = tk.StringVar(value=self.config.holyrics_scripture_theme)
         self.long_range_slide_var = tk.StringVar(
             value=LONG_RANGE_SLIDE_LABELS[self.config.long_range_slide_mode]
         )
@@ -865,6 +879,9 @@ class LiVerseGui:
         ).grid(row=mode_row, column=0, sticky="w", pady=2)
 
         right_row = 0
+        ttk.Label(holyrics, text="Запасная тема цитат").grid(row=right_row, column=0, sticky="w", pady=3)
+        ttk.Entry(holyrics, textvariable=self.scripture_theme_var).grid(row=right_row, column=1, sticky="ew", pady=3)
+        right_row += 1
         ttk.Checkbutton(
             holyrics,
             text="Спрашивать через пульт\nпри слабом совпадении текста",
@@ -1029,6 +1046,7 @@ class LiVerseGui:
                 selected,
                 Path(filename),
                 include_audio=bool(self.include_audio_logs_var.get()),
+                update_log=update_log_path(),
             )
         except (OSError, ValueError) as exc:
             messagebox.showerror("LiVerse", f"Не удалось создать архив:\n{exc}")
@@ -1228,6 +1246,7 @@ class LiVerseGui:
             holyrics_token=self.token_var.get().strip(),
             holyrics_port=port,
             quick_seconds=quick_seconds,
+            holyrics_scripture_theme=self.scripture_theme_var.get().strip(),
             long_range_slide_mode=LONG_RANGE_SLIDE_VALUES.get(
                 self.long_range_slide_var.get(),
                 "compact",
@@ -1404,6 +1423,8 @@ class LiVerseGui:
                     write_gui_log(message)
                 elif event == "update_result":
                     self._handle_update_result(payload)
+                elif event == "update_status":
+                    self._handle_download_status(payload)
                 elif event == "update_installed":
                     self._handle_update_installed(payload)
                 elif event == "update_progress":
@@ -1593,7 +1614,9 @@ class LiVerseGui:
         threading.Thread(target=self._update_check_worker, daemon=True).start()
 
     def _update_check_worker(self) -> None:
-        self.output_queue.put(("update_result", check_gui_update()))
+        result = check_gui_update()
+        log_update("release_check_result", status=result.get("status"), remote_version=result.get("remote_version"), reason=result.get("reason"))
+        self.output_queue.put(("update_result", result))
 
     def _handle_update_result(self, payload: object) -> None:
         update = payload if isinstance(payload, dict) else {}
@@ -1621,6 +1644,8 @@ class LiVerseGui:
             if install:
                 self.state_var.set("Обновляется")
                 self.activity_var.set("Устанавливаю обновление LiVerse…")
+                if update.get("kind") == "binary":
+                    self._open_download_window(update)
                 threading.Thread(target=self._install_update_worker, args=(update,), daemon=True).start()
                 return
         elif update.get("status") not in {"current", "current_with_changes", "no_release"}:
@@ -1632,14 +1657,20 @@ class LiVerseGui:
             try:
                 installer = download_windows_release_installer(
                     update,
+                    status=lambda state: self.output_queue.put(("update_status", state)),
+                    cancelled=self._download_cancel.is_set,
                     progress=lambda downloaded, total: self.output_queue.put(
                         ("update_progress", (downloaded, total))
                     ),
                 )
+                if self._download_cancel.is_set():
+                    raise ReleaseDownloadCancelled("Загрузка отменена; установщик не запущен.")
                 launch_windows_release_installer(installer)
                 result = {"ok": True, "kind": "binary", "installer": str(installer)}
             except (OSError, ReleaseUpdateError) as exc:
-                result = {"ok": False, "kind": "binary", "reason": str(exc)}
+                log_update("update_not_installed", reason=str(exc), cancelled=isinstance(exc, ReleaseDownloadCancelled))
+                result = {"ok": False, "kind": "binary", "reason": str(exc),
+                          "cancelled": isinstance(exc, ReleaseDownloadCancelled)}
             self.output_queue.put(("update_installed", result))
             return
         installed = apply_startup_update(update, hide_console=True)
@@ -1647,21 +1678,105 @@ class LiVerseGui:
             ("update_installed", {"ok": installed, "kind": "source"})
         )
 
+    def _open_download_window(self, update: dict) -> None:
+        self._download_update = update
+        self._download_cancel = threading.Event()
+        self._download_samples = []
+        self._download_phase = "connecting"
+        self._download_received = 0
+        self._download_total = int(update.get("installer_size") or 0)
+        window = tk.Toplevel(self.root)
+        self._download_window = window
+        window.title("Скачивание обновления LiVerse")
+        window.transient(self.root)
+        window.geometry("540x200")
+        ttk.Label(window, text=f"LiVerse {update.get('remote_version', '')}").pack(pady=(12, 5))
+        self._download_bar = ttk.Progressbar(window, maximum=100, mode="determinate")
+        self._download_bar.pack(fill="x", padx=18, pady=5)
+        self._download_text = tk.StringVar(value="Подключаюсь к серверу…")
+        ttk.Label(window, textvariable=self._download_text, justify="center").pack(pady=5)
+        self._download_button = ttk.Button(window, text="Отменить загрузку", command=self._cancel_download)
+        self._download_button.pack(pady=5)
+        window.protocol("WM_DELETE_WINDOW", self._cancel_download)
+        self._download_tick_id = self.root.after(300, self._download_tick)
+
+    def _cancel_download(self) -> None:
+        self._download_cancel.set()
+        self._download_button.configure(state="disabled")
+        self._download_text.set("Отменяю загрузку… Полученная часть будет сохранена.")
+
+    def _handle_download_status(self, payload: object) -> None:
+        if not isinstance(payload, dict) or not getattr(self, "_download_window", None):
+            return
+        self._download_phase = str(payload.get("phase") or "downloading")
+        if self._download_phase == "retrying":
+            self._download_retry_text = f"Связь прервалась. Попытка {payload.get('attempt')}; повтор через {payload.get('delay'):g} с."
+
+    def _download_tick(self) -> None:
+        window = getattr(self, "_download_window", None)
+        if window is None or not window.winfo_exists():
+            return
+        if not self._download_cancel.is_set():
+            samples = self._download_samples
+            speed = 0.0
+            if len(samples) > 1:
+                elapsed = time.monotonic() - samples[0][0]
+                speed = max(0, samples[-1][1] - samples[0][1]) / max(0.001, elapsed)
+            received, total = self._download_received, self._download_total
+            percent = received * 100 / total if total else 0
+            self._download_bar["value"] = percent
+            detail = f"{percent:.1f}% — {received / 1048576:.1f} из {total / 1048576:.1f} МБ"
+            if self._download_phase == "verifying":
+                text = "Проверяю контрольную сумму установщика…"
+            elif self._download_phase == "complete":
+                text = "Проверка завершена. Запускаю установщик…"
+            elif self._download_phase == "retrying":
+                text = self._download_retry_text
+            else:
+                eta = f"Осталось примерно {max(1, round((total - received) / speed / 60))} мин." if speed > 0 else "Ожидаю данные…"
+                text = f"Скорость: {speed / 1024:.1f} КБ/с. {eta}"
+            self._download_text.set(detail + "\n" + text)
+        self._download_tick_id = self.root.after(300, self._download_tick)
+
     def _handle_update_progress(self, downloaded: int, total: int) -> None:
         if total > 0:
             percent = min(100, max(0, round(downloaded * 100 / total)))
             self.activity_var.set(f"Скачиваю обновление: {percent}%")
+        if getattr(self, "_download_window", None):
+            now = time.monotonic()
+            if downloaded < self._download_received:
+                self._download_samples.clear()
+            self._download_received, self._download_total = downloaded, total
+            samples = self._download_samples
+            samples.append((now, downloaded))
+            while len(samples) > 2 and samples[1][0] < now - 5:
+                samples.pop(0)
 
     def _handle_update_installed(self, payload: object) -> None:
         result = payload if isinstance(payload, dict) else {"ok": bool(payload)}
+        window = getattr(self, "_download_window", None)
+        if window is not None:
+            tick = getattr(self, "_download_tick_id", None)
+            if tick is not None:
+                self.root.after_cancel(tick)
+            window.destroy()
+            self._download_window = None
+        if result.get("cancelled"):
+            self.activity_var.set("Загрузка отменена; полученная часть сохранена.")
+            self._start_after_update_check()
+            return
         if not result.get("ok"):
             reason = str(result.get("reason") or "неизвестная ошибка")
             write_gui_log(f"Обновление не установлено: {reason}")
-            messagebox.showerror(
-                "LiVerse",
-                "Обновление не завершилось. Установленная версия не повреждена.\n\n"
-                f"Причина: {reason}\n\nПодробности находятся в журнале LiVerse.",
+            retry = messagebox.askretrycancel(
+                "Обновление LiVerse",
+                "Обновление не завершилось. Полученная часть сохранена, если она пригодна для продолжения.\n\n"
+                f"Причина: {reason}\n\nПовторить загрузку? Подробности: logs/updates.jsonl.",
             )
+            if retry and result.get("kind") == "binary":
+                self._open_download_window(self._download_update)
+                threading.Thread(target=self._install_update_worker, args=(self._download_update,), daemon=True).start()
+                return
             self._start_after_update_check()
             return
         if result.get("kind") == "binary":
@@ -1746,6 +1861,9 @@ class LiVerseGui:
         self._finalize_quit(restart=restart)
 
     def _finalize_quit(self, *, restart: bool = False) -> None:
+        cancel = getattr(self, "_download_cancel", None)
+        if cancel is not None:
+            cancel.set()
         if self.tray_icon is not None:
             try:
                 self.tray_icon.stop()

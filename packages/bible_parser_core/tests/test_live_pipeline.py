@@ -966,7 +966,8 @@ class LiveReferencePipelineTest(unittest.TestCase):
             safe,
         )
 
-    def test_holyrics_api_diagnostics_include_request_and_full_response_without_token(self):
+    @patch("tools.holyrics.get_holyrics_presentation_state", return_value=(True, None, "ok"))
+    def test_holyrics_api_diagnostics_include_request_and_full_response_without_token(self, _display_state):
         from tools.holyrics import set_live_latency_context
 
         events: list[tuple[str, dict]] = []
@@ -1034,7 +1035,8 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertNotIn("private-token", str(events))
         self.assertNotIn("private-token", urlopen.call_args.args[0].full_url.split("?")[0])
 
-    def test_holyrics_transport_failures_return_failure_and_allow_next_request(self):
+    @patch("tools.holyrics.get_holyrics_presentation_state", return_value=(True, None, "ok"))
+    def test_holyrics_transport_failures_return_failure_and_allow_next_request(self, _display_state):
         from http.client import IncompleteRead, RemoteDisconnected
         from urllib.error import URLError
 
@@ -1116,7 +1118,8 @@ class LiveReferencePipelineTest(unittest.TestCase):
                 if not expected:
                     self.assertTrue(reason)
 
-    def test_holyrics_invalid_reply_does_not_report_successful_display(self):
+    @patch("tools.holyrics.get_holyrics_presentation_state", return_value=(True, None, "ok"))
+    def test_holyrics_invalid_reply_does_not_report_successful_display(self, _display_state):
         from tools.holyrics import set_live_latency_context
 
         class Response:
@@ -1152,7 +1155,8 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertFalse(events[-1][1]["ok"])
         self.assertEqual(200, events[-1][1]["http_status"])
 
-    def test_holyrics_http_error_body_timeout_preserves_http_failure(self):
+    @patch("tools.holyrics.get_holyrics_presentation_state", return_value=(True, None, "ok"))
+    def test_holyrics_http_error_body_timeout_preserves_http_failure(self, _display_state):
         from urllib.error import HTTPError
 
         class BrokenBody:
@@ -7541,6 +7545,333 @@ class LiveSessionCheckTest(unittest.TestCase):
         report = self.check()
         self.assertEqual("insufficient", report["status"])
         self.assertIn("Повреждены сведения", format_session_check(report))
+
+
+
+class ScriptureThemeTest(unittest.TestCase):
+    def setUp(self):
+        self.args = SimpleNamespace(holyrics_scripture_theme="For_LiVerse", holyrics_quick_minutes=0,
+                                    holyrics_url="http://localhost", sermon_plan=False)
+        self.current = {"type": "song", "id": "song1", "slide_number": 1, "slide_type": "final_slide", "slides": [{"text": ""}] }
+        self.quick = None
+        self.black = False
+        self.themes = [{"id": "lv-theme", "name": "For_LiVerse", "font": {"size": 8}, "background": {"type": "color", "id": "222222"}},
+                       {"id": "plan-theme", "name": "План", "font": {"size": 6}, "align": {"vertical": "top"}}]
+        self.background = {"id": "transient", "name": "Фон плана", "type": "my_image"}
+        self.wallpaper = {"enabled": True, "image_base64": "encoded", "fill_color": "#111111"}
+        self.requests = []
+        self.payload = {"ref": "Иоанн 3:16", "verse": "Ибо так возлюбил Бог мир"}
+        self.mock = patch("tools.holyrics.post_holyrics_api", side_effect=self.api)
+        self.mock.start()
+        self.addCleanup(self.mock.stop)
+
+    def api(self, args, base, method, body):
+        self.requests.append((method, body))
+        if method == "GetCurrentPresentation":
+            data = self.quick or self.current
+        elif method == "GetCurrentQuickPresentation":
+            data = self.quick
+        elif method == "GetF10":
+            data = self.black
+        elif method == "GetThemes":
+            data = self.themes
+        elif method == "GetCurrentTheme":
+            data = {"id": "transient-theme", "name": "План"}
+        elif method == "GetCurrentBackground":
+            data = self.background
+        elif method == "GetBackgrounds":
+            data = [{"id": "saved-background", "name": "Фон плана", "type": "my_image"}]
+        elif method == "GetWallpaperSettings":
+            data = self.wallpaper
+        elif method in {"ShowLyrics", "ShowText"}:
+            self.quick = None
+            self.current = {**self.current, "type": "song" if method == "ShowLyrics" else "text",
+                            "id": body["id"], "slide_number": body["initial_index"] + 1}
+            data = None
+        elif method == "CloseCurrentPresentation":
+            self.quick, self.current = None, None
+            data = None
+        elif method in {"SetF8", "SetF9"}:
+            self.current["slide_type"] = "wallpaper" if method == "SetF8" else "blank"
+            data = None
+        elif method == "ShowQuickPresentation":
+            self.quick = {"type": "quick_presentation", "slides": body["slides"], "slide_number": 1}
+            data = None
+        elif method == "CloseCurrentQuickPresentation":
+            self.quick = None
+            data = None
+        else:
+            self.fail("Unexpected API method " + method)
+        return True, "ok", json.dumps({"status": "ok", "data": data})
+
+    def test_song_uses_fallback_text_uses_current_appearance_and_close_overlay(self):
+        from tools.holyrics import restore_owned_scripture_presentation
+        for kind in ("text",):
+            with self.subTest(kind=kind):
+                self.current.update(type=kind, slide_type="default", slides=[{"text": "План"}])
+                previous = dict(self.current)
+                self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+                body = next(body for method, body in reversed(self.requests) if method == "ShowQuickPresentation")
+                if kind == "song":
+                    self.assertEqual({"id": "lv-theme"}, body["theme"])
+                else:
+                    self.assertEqual({"size": 6}, body["custom_theme"]["font"])
+                    self.assertEqual({"type": "my_image", "id": "saved-background"}, body["custom_theme"]["background"])
+                owner = self.args._holyrics_owned_scripture_presentation
+                self.assertEqual(previous, owner["previous"])
+                self.assertTrue(restore_owned_scripture_presentation(self.args, self.args.holyrics_url, owner)[0])
+                self.assertIsNone(self.quick)
+                self.assertEqual(previous, self.current)
+
+    def test_missing_duplicate_theme_or_black_screen_never_show(self):
+        for themes, black, current in (([], False, self.current), (self.themes * 2, False, self.current),
+                                       (self.themes, True, None)):
+            with self.subTest(themes=themes, black=black):
+                self.themes, self.black, self.current = themes, black, current
+                self.requests.clear()
+                self.assertFalse(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+                self.assertNotIn("ShowQuickPresentation", [m for m, b in self.requests])
+
+    def test_manual_switch_or_black_screen_prevents_restore(self):
+        from tools.holyrics import restore_owned_scripture_presentation
+        for manual in (True, False):
+            self.black = False
+            self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+            owner = self.args._holyrics_owned_scripture_presentation
+            if manual:
+                self.quick = None
+                self.current = {"type": "text", "id": "operator-choice"}
+            else:
+                self.black = True
+            self.requests.clear()
+            self.assertTrue(restore_owned_scripture_presentation(self.args, self.args.holyrics_url, owner)[0])
+            self.assertNotIn("CloseCurrentQuickPresentation", [m for m, b in self.requests])
+
+    def test_chained_citations_keep_original_screen_and_ignore_old_owner(self):
+        from tools.holyrics import restore_owned_scripture_presentation
+        previous = dict(self.current)
+        self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+        old = self.args._holyrics_owned_scripture_presentation
+        self.payload.update(ref="Иоанн 3:17", verse="Ибо не послал Бог Сына")
+        self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+        self.assertEqual(previous, self.args._holyrics_owned_scripture_presentation["previous"])
+        self.requests.clear()
+        self.assertTrue(restore_owned_scripture_presentation(self.args, self.args.holyrics_url, old)[0])
+        self.assertEqual([], self.requests)
+
+    def test_foreign_quick_presentation_is_preserved(self):
+        self.quick = {"type": "quick_presentation", "slides": [{"text": "оператор"}]}
+        self.assertFalse(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+        self.assertNotIn("ShowQuickPresentation", [m for m, b in self.requests])
+
+    def test_three_verse_reading_uses_theme_and_stops_on_manual_switch(self):
+        self.args.long_range_slide_mode = "one_verse"
+        payload = {"ref": "Иаков 5:1-3", "book": "Иаков", "chapter": 5,
+                   "start_verse": 1, "end_verse": 3}
+        self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, payload)[0])
+        state = self.args._holyrics_scripture_range_reading
+        self.assertEqual(3, len(self.quick["slides"]))
+        self.assertIs(state["scripture_owner"], self.args._holyrics_owned_scripture_presentation)
+        self.assertTrue(sync_scripture_range_reading(self.args)["active"])
+        state["started_at_monotonic"] = 0
+        self.quick = None
+        self.current = {"type": "song", "id": "next-song"}
+        self.requests.clear()
+        self.assertFalse(sync_scripture_range_reading(self.args)["active"])
+        self.assertNotIn("ActionGoToIndex", [m for m, b in self.requests])
+
+    def test_plan_matching_does_not_reuse_plan_during_song(self):
+        from tools.vosk_grammar_probe import ensure_sermon_plan_for_recognition
+        old = {"type": "text", "id": "old-plan", "slides": [{"text": "Старый план"}]}
+        self.args.sermon_plan = True
+        self.args._holyrics_sermon_plan_presentation = old
+        self.assertIsNone(ensure_sermon_plan_for_recognition(
+            self.args, old, pipeline_matched=False, long_passage_reading=False))
+        self.current = {"type": "text", "id": "new-plan", "slides": [{"text": "Новый план"}]}
+        plan = ensure_sermon_plan_for_recognition(
+            self.args, old, pipeline_matched=False, long_passage_reading=False)
+        self.assertEqual("new-plan", plan["id"])
+
+    def test_pending_plan_approval_cannot_interrupt_reading_after_screen_switch(self):
+        from tools.holyrics import show_holyrics_text_slide
+        reading = {"targets": ["reading"]}
+        self.args._holyrics_scripture_range_reading = reading
+        plan = {"type": "text", "id": "plan"}
+        self.assertFalse(show_holyrics_text_slide(self.args, self.args.holyrics_url, plan, 1)[0])
+        self.assertIs(reading, self.args._holyrics_scripture_range_reading)
+        self.assertNotIn("ActionGoToIndex", [m for m, b in self.requests])
+
+    def test_gui_passes_theme_and_temporary_quote_keeps_detection(self):
+        from tools.liverse_gui import GuiConfig, engine_command
+        from tools.vosk_grammar_probe import citation_recognition_paused
+        command = engine_command(GuiConfig(), project_root=Path.cwd(), frozen=False)
+        self.assertEqual("For_LiVerse", command[command.index("--holyrics-scripture-theme") + 1])
+        self.args._holyrics_temporary_verse_display = object()
+        self.assertFalse(citation_recognition_paused(self.args, False))
+
+    def test_empty_song_slide_preserves_background_with_fallback_font(self):
+        for mode in ("final_slide", "blank", "default"):
+            with self.subTest(mode=mode):
+                self.quick = None
+                self.current.update(slide_type=mode, slide_number=1, slides=[{"text": ""}])
+                self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+                body = next(b for m, b in reversed(self.requests) if m == "ShowQuickPresentation")
+                self.assertEqual({"size": 8}, body["custom_theme"]["font"])
+                self.assertEqual("saved-background", body["custom_theme"]["background"]["id"])
+
+    def test_wallpaper_image_falls_back_fill_is_preserved(self):
+        self.current = None
+        for image, expected in (("encoded", "wallpaper_fallback"), ("", "wallpaper_fill")):
+            self.quick = None
+            self.wallpaper["image_base64"] = image
+            self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+            self.assertEqual(expected, self.args._holyrics_owned_scripture_presentation["appearance_source"])
+        body = next(b for m, b in reversed(self.requests) if m == "ShowQuickPresentation")
+        self.assertEqual("111111", body["theme"]["edit"]["background"]["id"])
+
+    def test_unknown_background_blocks_show_and_keeps_previous_state(self):
+        self.current.update(slide_type="final_slide")
+        self.background["name"] = "Неизвестный фон"
+        owner = {"previous": None}
+        self.args._holyrics_owned_scripture_presentation = owner
+        self.assertFalse(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+        self.assertIs(owner, self.args._holyrics_owned_scripture_presentation)
+        self.assertNotIn("ShowQuickPresentation", [m for m, b in self.requests])
+
+    def test_next_citation_reuses_appearance_without_reading_own_theme(self):
+        self.current.update(type="text", slide_type="default", slides=[{"text": "План"}])
+        self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+        styling = self.args._holyrics_owned_scripture_presentation["styling"]
+        self.requests.clear()
+        self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+        self.assertEqual(styling, self.args._holyrics_owned_scripture_presentation["styling"])
+        self.assertNotIn("GetCurrentTheme", [m for m, b in self.requests])
+        self.assertNotIn("GetThemes", [m for m, b in self.requests])
+
+    def test_text_presentation_does_not_require_unused_fallback_theme(self):
+        self.current.update(type="text", slide_type="default", slides=[{"text": "План"}])
+        self.themes = self.themes[1:]
+        self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+        self.assertEqual("current_text_theme", self.args._holyrics_owned_scripture_presentation["appearance_source"])
+
+    def test_current_text_style_keeps_background_opacity_and_layout(self):
+        self.current.update(type="text", slide_type="default", slides=[{"text": "План"}])
+        self.themes[1].update(background={"opacity": 75, "adjust_type": "extend"}, base_color="000000")
+        self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+        custom = self.args._holyrics_owned_scripture_presentation["styling"]["custom_theme"]
+        self.assertEqual(75, custom["background"]["opacity"])
+        self.assertEqual({"vertical": "top"}, custom["align"])
+        self.assertEqual("000000", custom["base_color"])
+        self.assertNotIn("adjust_type", custom["background"])
+
+    def test_range_on_empty_background_preserves_font_choice_and_background(self):
+        self.current.update(slide_type="final_slide")
+        payload = {"ref": "Иаков 5:1-3", "book": "Иаков", "chapter": 5,
+                   "start_verse": 1, "end_verse": 3}
+        self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, payload)[0])
+        owner = self.args._holyrics_scripture_range_reading["scripture_owner"]
+        self.assertEqual({"size": 8}, owner["styling"]["custom_theme"]["font"])
+        self.assertEqual("saved-background", owner["styling"]["custom_theme"]["background"]["id"])
+
+    def test_background_api_failure_never_shows_with_unexpected_theme(self):
+        self.current.update(type="text", slide_type="default", slides=[{"text": "План"}])
+        original = self.api
+        def unavailable(args, base, method, body):
+            if method == "GetCurrentBackground":
+                return False, "timeout", ""
+            return original(args, base, method, body)
+        with patch("tools.holyrics.post_holyrics_api", side_effect=unavailable):
+            self.assertFalse(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+        self.assertNotIn("ShowQuickPresentation", [m for m, b in self.requests])
+
+    def test_real_song_id_is_restored_on_same_slide_not_runtime_id(self):
+        from tools.holyrics import restore_owned_scripture_presentation
+        self.current.update(id="runtime-id", song_id="saved-song-id", slide_number=3, slides=[{"text": ""}] * 3)
+        self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+        owner = self.args._holyrics_owned_scripture_presentation
+        self.assertTrue(restore_owned_scripture_presentation(self.args, self.args.holyrics_url, owner)[0])
+        self.assertIn(("ShowLyrics", {"id": "saved-song-id", "initial_index": 2}), self.requests)
+        self.assertNotIn("CloseCurrentQuickPresentation", [m for m, b in self.requests])
+
+    def test_false_successful_restore_is_reported_as_failure(self):
+        from tools.holyrics import restore_owned_scripture_presentation
+        self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+        owner = self.args._holyrics_owned_scripture_presentation
+        original = self.api
+        def no_effect(args, base, method, body):
+            return (True, "ok", '{"status":"ok"}') if method == "ShowLyrics" else original(args, base, method, body)
+        with patch("tools.holyrics.post_holyrics_api", side_effect=no_effect):
+            ok, reason, _ = restore_owned_scripture_presentation(self.args, self.args.holyrics_url, owner)
+        self.assertFalse(ok)
+        self.assertEqual("scripture_restore_not_verified", reason)
+
+    def test_return_to_no_presentation_closes_current_text_presentation(self):
+        from tools.holyrics import restore_owned_scripture_presentation
+        self.current = None
+        self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+        self.assertTrue(restore_owned_scripture_presentation(
+            self.args, self.args.holyrics_url, self.args._holyrics_owned_scripture_presentation)[0])
+        self.assertIn(("CloseCurrentPresentation", {}), self.requests)
+
+    def test_five_second_timer_restores_saved_song(self):
+        self.args.holyrics_quick_minutes = 5 / 60
+        with patch("tools.holyrics.threading.Timer") as timer, patch("tools.holyrics._TEMPORARY_VERSE_RESTORE_TIMER", None):
+            self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+            delay, callback = timer.call_args.args
+            self.assertAlmostEqual(5, delay)
+            callback()
+        self.assertIsNone(self.quick)
+        self.assertEqual("song", self.current["type"])
+        self.assertIn(("ShowLyrics", {"id": "song1", "initial_index": 0}), self.requests)
+        self.assertIsNone(self.args._holyrics_temporary_verse_display)
+
+    def test_delayed_old_timer_cannot_restore_over_new_citation(self):
+        self.args.holyrics_quick_minutes = 5 / 60
+        with patch("tools.holyrics.threading.Timer") as timer, patch("tools.holyrics._TEMPORARY_VERSE_RESTORE_TIMER", None):
+            self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+            old_callback = timer.call_args.args[1]
+            self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+            self.requests.clear()
+            old_callback()
+        self.assertEqual([], self.requests)
+        self.assertIsNotNone(self.quick)
+
+    def test_song_text_blocks_single_list_and_range_without_any_display_write(self):
+        self.current.update(slide_type="default", slides=[{"text": "Поём песню"}])
+        payloads = [self.payload, {**self.payload, "slide_type": "reference_list"},
+                    {"ref": "Иаков 5:1-3", "book": "Иаков", "chapter": 5, "start_verse": 1, "end_verse": 3}]
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                self.requests.clear()
+                self.assertFalse(post_holyrics_url(self.args, self.args.holyrics_url, payload)[0])
+                self.assertEqual(["GetCurrentPresentation"], [m for m, b in self.requests])
+
+    def test_transport_guard_blocks_song_even_if_operator_approved(self):
+        self.current.update(slide_type="default", slides=[{"text": "Поём песню"}])
+        self.mock.stop()
+        with patch("tools.holyrics.get_holyrics_presentation_state", return_value=(True, self.current, "ok")), patch("tools.holyrics.request.urlopen") as send:
+            for endpoint in ("ShowVerse", "ShowQuickPresentation", "ShowText"):
+                self.assertFalse(post_holyrics_api(self.args, self.args.holyrics_url, endpoint, {})[0])
+            send.assert_not_called()
+        self.mock.start()
+
+    def test_unknown_song_contents_are_protected_even_at_final_slide(self):
+        from tools.holyrics import song_text_is_protected
+        for current in ({"type": "song", "slide_type": "final_slide"},
+                        {"type": "song", "slides": [{"text": "текст"}], "slide_number": "invalid"},
+                        {"type": "song", "slides": [], "slide_number": 5}):
+            self.assertTrue(song_text_is_protected(current))
+
+    def test_transport_blocks_if_display_state_is_unavailable(self):
+        self.mock.stop()
+        with patch("tools.holyrics.get_holyrics_presentation_state", return_value=(False, None, "timeout")), patch("tools.holyrics.request.urlopen") as send:
+            self.assertFalse(post_holyrics_api(self.args, self.args.holyrics_url, "ShowQuickPresentation", {})[0])
+            send.assert_not_called()
+        self.mock.start()
+
+    def test_required_permissions_include_theme_and_black_state(self):
+        from tools.holyrics import required_holyrics_permissions
+        self.assertTrue({"GetThemes", "GetF10"}.issubset(required_holyrics_permissions(self.args)))
 
 
 if __name__ == "__main__":

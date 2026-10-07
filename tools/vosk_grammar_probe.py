@@ -280,6 +280,7 @@ def save_startup_settings(args: argparse.Namespace) -> None:
         "open_operator_qr": bool(getattr(args, "open_operator_qr", True)),
         "gui_auto_hide": bool(getattr(args, "gui_auto_hide", True)),
         "holyrics_quick_minutes": float(getattr(args, "holyrics_quick_minutes", 0.0) or 0.0),
+        "holyrics_scripture_theme": str(getattr(args, "holyrics_scripture_theme", "For_LiVerse")),
         "long_range_slide_mode": str(getattr(args, "long_range_slide_mode", "compact") or "compact"),
         "long_range_operator_hints": bool(getattr(args, "long_range_operator_hints", False)),
         "smart_slide_streaming_control": bool(
@@ -1662,6 +1663,8 @@ def apply_saved_startup_settings(args: argparse.Namespace, settings: dict) -> No
         slide_mode = str(settings.get("long_range_slide_mode") or "").strip()
         if slide_mode in {"compact", "one_verse"}:
             args.long_range_slide_mode = slide_mode
+    if not setting_was_explicit("--holyrics-scripture-theme", env_name="HOLYRICS_SCRIPTURE_THEME"):
+        args.holyrics_scripture_theme = str(settings.get("holyrics_scripture_theme", "For_LiVerse"))
     if not setting_was_explicit("--long-range-operator-hints"):
         args.long_range_operator_hints = bool(settings.get("long_range_operator_hints", False))
     if not setting_was_explicit("--performance-diagnostics", "--no-performance-diagnostics"):
@@ -2197,6 +2200,8 @@ def citation_recognition_paused(
     reference_list_collecting: bool = False,
 ) -> bool:
     """Pause matches during a timed citation, except while extending its list."""
+    if str(getattr(args, "holyrics_scripture_theme", "") or "").strip():
+        return False
     return bool(
         temporary_verse_display_active(args)
         and not long_passage_reading
@@ -3248,7 +3253,7 @@ def ensure_sermon_plan_for_recognition(
 ) -> dict | None:
     """Reload a plan that became current after LiVerse started."""
     if (
-        sermon_plan is not None
+        (sermon_plan is not None and not str(getattr(args, "holyrics_scripture_theme", "") or "").strip())
         or not args.sermon_plan
         or pipeline_matched
         or long_passage_reading
@@ -3765,6 +3770,7 @@ def run_microphone(args: argparse.Namespace) -> int:
             ) else None,
             "holyrics_target": describe_holyrics_target(args),
             "holyrics_quick_minutes": args.holyrics_quick_minutes,
+            "holyrics_scripture_theme": args.holyrics_scripture_theme,
             "smart_slide_streaming_shadow": bool(args.smart_slide_streaming_shadow),
             "smart_slide_streaming_control": bool(args.smart_slide_streaming_control),
             "grammar": None if grammar is None else grammar_diagnostics(grammar),
@@ -5034,6 +5040,8 @@ def main() -> int:
         help="Holyrics API token. Can also be set via HOLYRICS_TOKEN or .env.",
     )
     parser.add_argument("--holyrics-timeout", type=float, default=float(env_setting("HOLYRICS_TIMEOUT", "1.5")))
+    parser.add_argument("--holyrics-scripture-theme", default=env_setting("HOLYRICS_SCRIPTURE_THEME", "For_LiVerse"),
+                        help="Fallback Holyrics scripture theme; current text styling or an empty background is preserved. Empty uses legacy styling.")
     parser.add_argument(
         "--holyrics-quick-minutes",
         type=float,
@@ -5193,6 +5201,7 @@ def main() -> int:
                 "approval_ui": args.approval_ui,
                 "holyrics_target": describe_holyrics_target(args),
                 "holyrics_quick_minutes": args.holyrics_quick_minutes,
+                "holyrics_scripture_theme": args.holyrics_scripture_theme,
                 "grammar": None if grammar is None else grammar_diagnostics(grammar),
             }
         )

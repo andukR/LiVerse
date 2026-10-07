@@ -14,6 +14,7 @@ from tools.liverse_gui import (
 )
 from tools.release_updater import (
     ReleaseUpdateError,
+    ReleaseDownloadCancelled,
     check_windows_release_update,
     download_windows_release_installer,
     launch_windows_release_installer,
@@ -206,6 +207,100 @@ class ReleaseUpdaterTest(unittest.TestCase):
                 download_windows_release_installer(update, destination_dir=target_dir)
             self.assertFalse((target_dir / name).exists())
             self.assertFalse((target_dir / f"{name}.download").exists())
+
+    def update_description(self, content):
+        name = "LiVerse-Setup-1.1.1.exe"
+        return {"status": "available", "kind": "binary", "installer_name": name,
+                "installer_url": "https://github.com/andukR/LiVerse/releases/download/v1.1.1/" + name,
+                "installer_size": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+
+    def test_timeout_resumes_from_received_bytes_and_logs_retry(self):
+        content = b"abcdefghijk"
+        class BrokenResponse(FakeResponse):
+            def read(self, size=-1):
+                if self.stream.tell():
+                    raise TimeoutError("timed out")
+                return self.stream.read(4)
+        resumed = FakeResponse(content[4:])
+        resumed.status = 206
+        resumed.headers = {"Content-Range": "bytes 4-10/11"}
+        with tempfile.TemporaryDirectory() as directory, patch("tools.release_updater.windows_update_dir", return_value=Path(directory) / "updates"), patch("tools.release_updater.urlopen", side_effect=[BrokenResponse(content), resumed]) as open_url:
+            path = download_windows_release_installer(self.update_description(content), retry_delay=0)
+            self.assertEqual(content, path.read_bytes())
+            self.assertEqual("bytes=4-10", open_url.call_args_list[1].args[0].get_header("Range"))
+            records = [json.loads(row) for row in (Path(directory) / "logs" / "updates.jsonl").read_text().splitlines()]
+            self.assertIn("download_retry", [r["event"] for r in records])
+            self.assertEqual("download_verified", records[-1]["event"])
+
+    def test_retry_after_restart_preserves_partial_and_changed_release_discards_it(self):
+        content = b"abcdefghijk"
+        class BrokenResponse(FakeResponse):
+            def read(self, size=-1):
+                if self.stream.tell():
+                    raise TimeoutError("timed out")
+                return self.stream.read(4)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            update = self.update_description(content)
+            with patch("tools.release_updater.urlopen", return_value=BrokenResponse(content)):
+                with self.assertRaises(ReleaseUpdateError):
+                    download_windows_release_installer(update, destination_dir=root, max_retries=0)
+            self.assertEqual(content[:4], (root / (update["installer_name"] + ".download")).read_bytes())
+            changed = b"different-new-release"
+            with patch("tools.release_updater.urlopen", return_value=FakeResponse(changed)) as open_url:
+                result = download_windows_release_installer(self.update_description(changed), destination_dir=root)
+            self.assertEqual(changed, result.read_bytes())
+            self.assertTrue(open_url.call_args.args[0].get_header("Range").startswith("bytes=0-"))
+
+    def test_bounded_range_parts_are_assembled_correctly(self):
+        content = b"abcdefghijk"
+        ranges = []
+        def serve(request, timeout):
+            value = request.get_header("Range")
+            ranges.append(value)
+            start, end = map(int, value.removeprefix("bytes=").split("-"))
+            response = FakeResponse(content[start:end + 1])
+            response.status = 206
+            response.headers = {"Content-Range": f"bytes {start}-{end}/{len(content)}"}
+            return response
+        with tempfile.TemporaryDirectory() as directory, patch("tools.release_updater.DOWNLOAD_PART_BYTES", 4), patch("tools.release_updater.urlopen", side_effect=serve):
+            result = download_windows_release_installer(self.update_description(content), destination_dir=Path(directory))
+            self.assertEqual(content, result.read_bytes())
+        self.assertEqual(["bytes=0-3", "bytes=4-7", "bytes=8-10"], ranges)
+
+    def test_cancel_keeps_partial_and_next_call_continues_even_if_range_ignored(self):
+        content = b"x" * 70000
+        stopped = [False]
+        with tempfile.TemporaryDirectory() as directory, patch("tools.release_updater.urlopen", side_effect=lambda *args, **kwargs: FakeResponse(content)):
+            root = Path(directory)
+            with self.assertRaises(ReleaseDownloadCancelled):
+                download_windows_release_installer(self.update_description(content), destination_dir=root,
+                    cancelled=lambda: stopped[0], progress=lambda n, total: stopped.__setitem__(0, n > 0))
+            self.assertEqual(65536, (root / "LiVerse-Setup-1.1.1.exe.download").stat().st_size)
+            result = download_windows_release_installer(self.update_description(content), destination_dir=root)
+            self.assertEqual(content, result.read_bytes())
+
+    def test_incorrect_content_range_is_rejected(self):
+        content = b"abc"
+        response = FakeResponse(content)
+        response.status = 206
+        response.headers = {"Content-Range": "bytes 1-2/3"}
+        with tempfile.TemporaryDirectory() as directory, patch("tools.release_updater.urlopen", return_value=response):
+            with self.assertRaises(ReleaseUpdateError):
+                download_windows_release_installer(self.update_description(content), destination_dir=Path(directory))
+            self.assertFalse((Path(directory) / "LiVerse-Setup-1.1.1.exe").exists())
+
+    def test_update_log_is_included_in_exported_archive(self):
+        import zipfile
+        from tools.liverse_gui import create_log_archive
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / "updates.jsonl"
+            log.write_text('{"event":"download_retry","downloaded":42}\n', encoding="utf-8")
+            archive = root / "logs.zip"
+            self.assertEqual(1, create_log_archive([], archive, update_log=log))
+            with zipfile.ZipFile(archive) as package:
+                self.assertEqual(42, json.loads(package.read("updates/updates.jsonl"))["downloaded"])
 
     def test_windows_download_directory_uses_local_app_data(self):
         self.assertEqual(
