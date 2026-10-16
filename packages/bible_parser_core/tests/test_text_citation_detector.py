@@ -1467,8 +1467,14 @@ class TextCitationIntegrationTest(unittest.TestCase):
         from tools.replay_audio_files import write_subtitle_window_plan
 
         video_id = "67IR5lBlUqs"
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory() as temporary, patch(
+            "tools.replay_audio_files.BibleTextSearcher"
+        ) as searcher:
+            # This test covers timed address markers, not Bible search quality.
+            searcher.return_value.search.return_value = ([], [])
             root = Path(temporary)
+            database = root / "bible_index.db"
+            database.touch()
             audio = root / "audio" / video_id / "sermon.wav"
             subtitle = root / "subtitles" / video_id / "sermon.srt"
             audio.parent.mkdir(parents=True)
@@ -1484,6 +1490,7 @@ class TextCitationIntegrationTest(unittest.TestCase):
                 [audio],
                 [root / "subtitles"],
                 root / "plans",
+                text_detection_db=database,
                 control_windows=0,
             )
             plan = json.loads(plans[0].read_text(encoding="utf-8"))
@@ -1491,6 +1498,7 @@ class TextCitationIntegrationTest(unittest.TestCase):
                 [audio],
                 [root / "subtitles"],
                 root / "audit-plans",
+                text_detection_db=database,
                 control_windows=1,
                 control_only=True,
             )
