@@ -7,7 +7,7 @@ import unittest
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import call, patch
+from unittest.mock import Mock, call, patch
 
 from bible_parser_core.live_pipeline import (
     LiveReferencePipeline,
@@ -38,6 +38,62 @@ from tools.holyrics import (
 
 
 class LiveReferencePipelineTest(unittest.TestCase):
+    def test_gui_update_check_leaves_settings_open_without_engine(self):
+        from tools.liverse_gui import LiVerseGui, GuiConfig
+        gui = Mock(config=GuiConfig(holyrics_token="test"))
+        LiVerseGui._start_after_update_check(gui)
+        gui.start_engine.assert_not_called()
+        gui.notebook.select.assert_called_once_with(gui.settings_tab)
+        gui.state_var.set.assert_called_with("Проверьте настройки")
+
+    def test_gui_start_waits_for_permission_check(self):
+        from tools.liverse_gui import LiVerseGui, GuiConfig
+        gui = Mock(_verified_start_config=None, _pending_start_config=None, process=None)
+        gui._collect_config.return_value = GuiConfig(holyrics_token="test")
+        with patch("tools.liverse_gui.threading.Thread") as thread:
+            LiVerseGui.save_and_start(gui)
+        thread.return_value.start.assert_called_once()
+        gui.start_engine.assert_not_called()
+        self.assertEqual(gui._collect_config.return_value, gui._pending_start_config)
+
+    def test_gui_permissions_must_be_known_and_complete_before_start(self):
+        from tools.liverse_gui import LiVerseGui, GuiConfig
+        config = GuiConfig(holyrics_token="test")
+        for extra in ({"ok": False}, {"ok": True, "token_info_ok": False},
+                      {"ok": True, "token_info_ok": True, "permissions": ["GetTokenInfo"],
+                       "missing_permissions": ["ShowText"]}):
+            with self.subTest(extra=extra):
+                gui = Mock(_pending_start_config=config)
+                with patch("tools.liverse_gui.messagebox.showwarning") as warning:
+                    LiVerseGui._handle_holyrics_result(gui, {"checked_config": config, **extra})
+                warning.assert_called_once()
+                gui.save_and_start.assert_not_called()
+                self.assertIsNone(gui._pending_start_config)
+
+    def test_gui_verified_settings_start_only_if_unchanged(self):
+        from tools.liverse_gui import LiVerseGui, GuiConfig
+        config = GuiConfig(holyrics_token="test")
+        for current in (config, GuiConfig(holyrics_token="changed")):
+            gui = Mock(_pending_start_config=config)
+            gui._collect_config.return_value = current
+            LiVerseGui._handle_holyrics_result(gui, {"checked_config": config,
+                "ok": True, "token_info_ok": True, "permissions": ["GetTokenInfo"]})
+            self.assertEqual(current == config, gui.save_and_start.called)
+
+    def test_popup_quote_preview_depends_on_detection_source(self):
+        from tools.vosk_grammar_probe import add_slide_payload, popup_approval_quote_text
+
+        for source, expected in (("text_citation", "Ибо так возлюбил Бог мир"),
+                                 ("parser", ""), ("context_range", "")):
+            with self.subTest(source=source):
+                payload = add_slide_payload({
+                    "source": source, "text": "произнесённая фраза",
+                    "parsed": {"ref": "Иоанн 3:16", "verse_text": "Ибо так возлюбил Бог мир"},
+                })
+                self.assertEqual(expected, popup_approval_quote_text(payload["slide"]))
+        self.assertEqual("", popup_approval_quote_text({"source": "vosk:text_citation"}))
+        self.assertEqual("", popup_approval_quote_text({"source": "sermon_plan", "verse": "план"}))
+
     def test_low_confidence_chapter_word_is_resolved_by_full_quoted_verse(self):
         address = "и павел говорит послание римляну четырнадцати два двенадцатый стих"
         quote = "итак каждый из нас за себя даст отчёт богу"
@@ -7324,6 +7380,16 @@ class LiveSessionCheckTest(unittest.TestCase):
         self.assertEqual("failed", report["status"])
         self.assertTrue(any("максимальная задержка" in r for r in report["failures"]))
 
+    def test_async_restore_must_finish_and_report_its_final_result(self):
+        self.events.append({"event": "scripture_restore_pending", "restore_id": "return1"})
+        self.assertEqual("insufficient", self.check()["status"])
+        self.events.append({"event": "scripture_restore_verification", "restore_id": "return1", "ok": False})
+        report = self.check()
+        self.assertEqual("failed", report["status"])
+        self.assertTrue(any("возврат к презентации" in r for r in report["failures"]))
+        self.events[-1]["ok"] = True
+        self.assertEqual("conditional", self.check()["status"])
+
     def plan_restore_after_absent_quick(self):
         # Recorded sequence from the live 03.10 test, including matched API IDs.
         start = datetime(2026, 10, 3, 10, 5, 5)
@@ -7484,7 +7550,7 @@ class LiveSessionCheckTest(unittest.TestCase):
 
     def test_diagnostic_gui_does_not_persist_test_settings(self):
         from tools.liverse_gui import LiVerseGui, GuiConfig
-        gui = SimpleNamespace(diagnostic_test=True, _collect_config=lambda: GuiConfig(),
+        gui = SimpleNamespace(diagnostic_test=True, _verified_start_config=GuiConfig(), _collect_config=lambda: GuiConfig(),
             _refresh_database_status=lambda: None, process=None, start_engine=lambda: None)
         with patch("tools.liverse_gui.save_gui_config") as save:
             LiVerseGui.save_and_start(gui)
@@ -7550,6 +7616,15 @@ class LiveSessionCheckTest(unittest.TestCase):
 
 class ScriptureThemeTest(unittest.TestCase):
     def setUp(self):
+        timer_patch = patch("tools.holyrics.threading.Timer")
+        self.restore_timer = timer_patch.start()
+        def controlled_timer(delay, callback):
+            timer = Mock()
+            if delay == 0:
+                timer.start.side_effect = callback
+            return timer
+        self.restore_timer.side_effect = controlled_timer
+        self.addCleanup(timer_patch.stop)
         self.args = SimpleNamespace(holyrics_scripture_theme="For_LiVerse", holyrics_quick_minutes=0,
                                     holyrics_url="http://localhost", sermon_plan=False)
         self.current = {"type": "song", "id": "song1", "slide_number": 1, "slide_type": "final_slide", "slides": [{"text": ""}] }
@@ -7800,10 +7875,207 @@ class ScriptureThemeTest(unittest.TestCase):
         original = self.api
         def no_effect(args, base, method, body):
             return (True, "ok", '{"status":"ok"}') if method == "ShowLyrics" else original(args, base, method, body)
-        with patch("tools.holyrics.post_holyrics_api", side_effect=no_effect):
+        with patch("tools.holyrics.post_holyrics_api", side_effect=no_effect), patch("tools.holyrics.holyrics_diagnostic_event") as log:
             ok, reason, _ = restore_owned_scripture_presentation(self.args, self.args.holyrics_url, owner)
-        self.assertFalse(ok)
-        self.assertEqual("scripture_restore_not_verified", reason)
+            self.assertTrue(ok)
+            self.assertEqual("scripture_restore_pending", reason)
+            owner["restore_pending"]["deadline"] = 0
+            self.restore_timer.call_args.args[1]()
+        self.assertIsNone(self.args._holyrics_owned_scripture_presentation)
+        self.assertEqual("scripture_restore_not_verified", log.call_args.args[2]["reason"])
+        self.assertFalse(log.call_args.args[2]["ok"])
+
+    def test_restore_waits_for_real_holyrics_transition_without_repeating_show(self):
+        from tools.holyrics import restore_owned_scripture_presentation, temporary_verse_display_active
+        self.current.update(type="text", id="plan-id", slide_type="default", slides=[{"text": "План"}] * 6)
+        previous = dict(self.current)
+        self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+        owner = self.args._holyrics_owned_scripture_presentation
+        self.args._holyrics_scripture_range_reading = {"scripture_owner": owner, "targets": [{}]}
+        with patch("tools.holyrics.holyrics_diagnostic_event") as log:
+            ok, reason, _ = restore_owned_scripture_presentation(self.args, self.args.holyrics_url, owner)
+            self.assertTrue(ok)
+            self.assertEqual("scripture_restore_pending", reason)
+            self.assertIsNone(self.args._holyrics_scripture_range_reading)
+            self.assertTrue(temporary_verse_display_active(self.args))
+            callback = self.restore_timer.call_args.args[1]
+            self.quick = {**previous, "type": "quick_presentation", "id": ""}
+            callback()
+            self.assertIs(self.args._holyrics_owned_scripture_presentation, owner)
+            self.assertFalse(any(c.args[1] == "scripture_restore_verification" for c in log.call_args_list))
+            self.quick = None
+            self.current = previous
+            self.restore_timer.call_args.args[1]()
+        self.assertIsNone(self.args._holyrics_owned_scripture_presentation)
+        self.assertFalse(temporary_verse_display_active(self.args))
+        self.assertEqual("scripture_restore_verified", log.call_args.args[2]["reason"])
+        self.assertEqual(1, sum(m == "ShowText" for m, _ in self.requests))
+
+    def test_restore_poll_preserves_operator_switch_and_black_screen(self):
+        from tools.holyrics import restore_owned_scripture_presentation
+        for black in (False, True):
+            with self.subTest(black=black):
+                self.black = False
+                self.current = {"type": "song", "id": "song1", "slide_number": 1, "slides": [{"text": ""}]}
+                self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+                owner = self.args._holyrics_owned_scripture_presentation
+                restore_owned_scripture_presentation(self.args, self.args.holyrics_url, owner)
+                self.quick = None
+                self.current = {"type": "text", "id": "operator-choice", "slide_number": 2, "slide_type": "default"}
+                self.black = black
+                self.requests.clear()
+                with patch("tools.holyrics.holyrics_diagnostic_event") as log:
+                    self.restore_timer.call_args.args[1]()
+                self.assertIsNone(self.args._holyrics_owned_scripture_presentation)
+                self.assertEqual("operator_changed_display", log.call_args.args[2]["reason"])
+                self.assertTrue(all(m.startswith("Get") for m, _ in self.requests))
+                self.assertEqual(black, self.black)
+
+    def test_old_restore_poll_cannot_clear_new_citation(self):
+        from tools.holyrics import restore_owned_scripture_presentation
+        self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+        owner = self.args._holyrics_owned_scripture_presentation
+        with patch("tools.holyrics.threading.Timer") as timer:
+            restore_owned_scripture_presentation(self.args, self.args.holyrics_url, owner)
+            callback = timer.call_args.args[1]
+            self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+        new_owner = self.args._holyrics_owned_scripture_presentation
+        self.requests.clear()
+        callback()
+        self.assertIs(self.args._holyrics_owned_scripture_presentation, new_owner)
+        self.assertEqual([], self.requests)
+
+    def test_restore_poll_retries_unavailable_state_then_verifies(self):
+        from tools.holyrics import restore_owned_scripture_presentation
+        self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+        owner = self.args._holyrics_owned_scripture_presentation
+        restore_owned_scripture_presentation(self.args, self.args.holyrics_url, owner)
+        with patch("tools.holyrics.get_holyrics_presentation_state", return_value=(False, None, "timeout")):
+            self.restore_timer.call_args.args[1]()
+        self.assertIs(self.args._holyrics_owned_scripture_presentation, owner)
+        self.restore_timer.call_args.args[1]()
+        self.assertIsNone(self.args._holyrics_owned_scripture_presentation)
+
+    def test_restore_poll_finishes_safely_after_unexpected_error(self):
+        from tools.holyrics import restore_owned_scripture_presentation
+        self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+        owner = self.args._holyrics_owned_scripture_presentation
+        restore_owned_scripture_presentation(self.args, self.args.holyrics_url, owner)
+        with patch("tools.holyrics.get_holyrics_presentation_state", side_effect=ValueError("broken state")), patch("tools.holyrics.holyrics_diagnostic_event") as log:
+            self.restore_timer.call_args.args[1]()
+        self.assertIsNone(self.args._holyrics_owned_scripture_presentation)
+        self.assertFalse(log.call_args.args[2]["ok"])
+        self.assertEqual("scripture_restore_verification_error", log.call_args.args[2]["reason"])
+
+    def test_new_owner_during_restore_poll_is_not_cleared(self):
+        from tools.holyrics import restore_owned_scripture_presentation
+        self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+        owner = self.args._holyrics_owned_scripture_presentation
+        restore_owned_scripture_presentation(self.args, self.args.holyrics_url, owner)
+        new_owner = {"texts": ["новая цитата"]}
+        def changed(*_args, **_kwargs):
+            self.args._holyrics_owned_scripture_presentation = new_owner
+            return True, self.current, "ok"
+        with patch("tools.holyrics.get_holyrics_presentation_state", side_effect=changed):
+            self.restore_timer.call_args.args[1]()
+        self.assertIs(self.args._holyrics_owned_scripture_presentation, new_owner)
+
+    def test_incomplete_item_state_waits_instead_of_claiming_operator_switch(self):
+        from tools.holyrics import restore_owned_scripture_presentation
+        self.current.update(type="text", id="runtime-plan-id", text_id="plan-id",
+                            slide_type="default", slides=[{"text": "План"}])
+        previous = dict(self.current)
+        self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+        owner = self.args._holyrics_owned_scripture_presentation
+        restore_owned_scripture_presentation(self.args, self.args.holyrics_url, owner)
+        self.quick = None
+        for partial in ({"type": "text", "id": "", "slide_number": 1, "slide_type": "default"},
+                        {"type": "text", "id": "runtime-plan-id", "slide_number": 1, "slide_type": "default"},
+                        {"type": "text", "id": "plan-id", "slide_type": "default"},
+                        {"type": "text", "id": "plan-id", "slide_number": 1}):
+            with self.subTest(partial=partial), patch("tools.holyrics.holyrics_diagnostic_event") as log:
+                self.current = partial
+                self.restore_timer.call_args.args[1]()
+                self.assertIs(self.args._holyrics_owned_scripture_presentation, owner)
+                self.assertFalse(any(c.args[1] == "scripture_restore_verification" for c in log.call_args_list))
+        self.current = previous
+        self.restore_timer.call_args.args[1]()
+        self.assertIsNone(self.args._holyrics_owned_scripture_presentation)
+
+    def test_return_queues_all_api_work_and_disables_range_immediately(self):
+        from tools.holyrics import restore_owned_scripture_presentation
+        self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+        owner = self.args._holyrics_owned_scripture_presentation
+        self.args._holyrics_scripture_range_reading = {"scripture_owner": owner, "targets": [{}]}
+        self.requests.clear()
+        with patch("tools.holyrics.threading.Timer") as timer:
+            self.assertTrue(restore_owned_scripture_presentation(self.args, self.args.holyrics_url, owner)[0])
+            self.assertEqual([], self.requests)
+            self.assertIsNone(self.args._holyrics_scripture_range_reading)
+            self.assertEqual(0, timer.call_args.args[0])
+
+    def test_inflight_return_rejects_new_write_until_verified_without_waiting(self):
+        import threading
+        from tools.holyrics import restore_owned_scripture_presentation
+        self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+        owner = self.args._holyrics_owned_scripture_presentation
+        reached, release = threading.Event(), threading.Event()
+        original = self.api
+        def delayed(args, base, method, body):
+            if method == "ShowLyrics":
+                reached.set()
+                if not release.wait(3):
+                    raise RuntimeError("test return was not released")
+            return original(args, base, method, body)
+        new_payload = {"ref": "Иоанн 3:17", "verse": "Новая цитата"}
+        with patch("tools.holyrics.threading.Timer") as timer, patch("tools.holyrics.post_holyrics_api", side_effect=delayed):
+            restore_owned_scripture_presentation(self.args, self.args.holyrics_url, owner)
+            stale_callback = timer.call_args.args[1]
+            worker = threading.Thread(target=stale_callback)
+            worker.start()
+            try:
+                self.assertTrue(reached.wait(2))
+                self.requests.clear()
+                ok, reason = post_holyrics_url(self.args, self.args.holyrics_url, new_payload)
+                self.assertFalse(ok)
+                self.assertIn("display_busy", reason)
+                self.assertEqual([], self.requests)
+            finally:
+                release.set()
+                worker.join(3)
+            self.assertFalse(worker.is_alive())
+            self.assertFalse(post_holyrics_url(self.args, self.args.holyrics_url, new_payload)[0])
+            timer.call_args.args[1]()
+            self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, new_payload)[0])
+            new_owner = self.args._holyrics_owned_scripture_presentation
+            stale_callback()
+            self.assertIs(self.args._holyrics_owned_scripture_presentation, new_owner)
+            self.assertIn("Новая цитата", self.quick["slides"][0]["text"])
+
+    def test_failed_initial_return_releases_state_and_logs_failure(self):
+        from tools.holyrics import restore_owned_scripture_presentation
+        self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+        owner = self.args._holyrics_owned_scripture_presentation
+        with patch("tools.holyrics.get_holyrics_presentation_state", return_value=(False, None, "timeout")), patch("tools.holyrics.holyrics_diagnostic_event") as log:
+            self.assertTrue(restore_owned_scripture_presentation(self.args, self.args.holyrics_url, owner)[0])
+        self.assertIsNone(self.args._holyrics_owned_scripture_presentation)
+        self.assertFalse(log.call_args.args[2]["ok"])
+        self.assertEqual("scripture_restore_state_unavailable", log.call_args.args[2]["reason"])
+
+    def test_incomplete_initial_screen_delays_command_without_claiming_manual_switch(self):
+        from tools.holyrics import restore_owned_scripture_presentation
+        self.assertTrue(post_holyrics_url(self.args, self.args.holyrics_url, self.payload)[0])
+        owner = self.args._holyrics_owned_scripture_presentation
+        self.requests.clear()
+        with patch("tools.holyrics.get_holyrics_presentation_state", return_value=(True, {"type": "text"}, "ok")), patch("tools.holyrics.holyrics_diagnostic_event") as log:
+            restore_owned_scripture_presentation(self.args, self.args.holyrics_url, owner)
+            self.assertIs(self.args._holyrics_owned_scripture_presentation, owner)
+            self.assertFalse(any(c.args[1] == "scripture_restore_verification" for c in log.call_args_list))
+        self.assertFalse(any(m == "ShowLyrics" for m, _ in self.requests))
+        self.restore_timer.call_args.args[1]()
+        self.assertEqual(1, sum(m == "ShowLyrics" for m, _ in self.requests))
+        self.restore_timer.call_args.args[1]()
+        self.assertIsNone(self.args._holyrics_owned_scripture_presentation)
 
     def test_return_to_no_presentation_closes_current_text_presentation(self):
         from tools.holyrics import restore_owned_scripture_presentation
@@ -7820,6 +8092,9 @@ class ScriptureThemeTest(unittest.TestCase):
             delay, callback = timer.call_args.args
             self.assertAlmostEqual(5, delay)
             callback()
+            # Timed expiry queues the API work instead of running it inline.
+            self.assertEqual(0, timer.call_args.args[0])
+            timer.call_args.args[1]()
         self.assertIsNone(self.quick)
         self.assertEqual("song", self.current["type"])
         self.assertIn(("ShowLyrics", {"id": "song1", "initial_index": 0}), self.requests)

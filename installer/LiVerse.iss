@@ -51,7 +51,7 @@ Name: "{userprograms}\LiVerse"; Filename: "{app}\LiVerse.exe"; WorkingDir: "{app
 Name: "{userdesktop}\LiVerse"; Filename: "{app}\LiVerse.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\LiVerse.exe"; Description: "Запустить LiVerse"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\LiVerse.exe"; Description: "Открыть LiVerse и проверить настройки"; Flags: nowait postinstall skipifsilent
 
 [Code]
 function PrepareToInstall(var NeedsRestart: Boolean): String;

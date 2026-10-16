@@ -2306,6 +2306,13 @@ def publish_web_if_needed(args: argparse.Namespace, payload: dict) -> dict:
     return {"enabled": True, "ok": True, "slide": slide}
 
 
+def popup_approval_quote_text(slide: dict) -> str:
+    """Preview Bible text only when the citation was found by spoken text."""
+    if slide.get("source") in {"text_citation", "vosk:text_citation"}:
+        return str(slide.get("verse") or "").strip()
+    return ""
+
+
 def popup_approval_decision(slide: dict, *, event_callback=None, on_decision=None) -> str:
     try:
         import tkinter as tk
@@ -2335,12 +2342,28 @@ def popup_approval_decision(slide: dict, *, event_callback=None, on_decision=Non
     button_height = 1
     button_pady = 8
 
+    quote_text = popup_approval_quote_text(slide)
+    if quote_text:
+        quote_frame = tk.Frame(root, bg="#101820")
+        quote_frame.pack(fill="both", expand=True, padx=30, pady=(20, 0))
+        scrollbar = tk.Scrollbar(quote_frame)
+        scrollbar.pack(side="right", fill="y")
+        quote = tk.Text(
+            quote_frame, height=6, width=42, wrap="word",
+            bg="#101820", fg="white", font=("Segoe UI", 20),
+            relief="flat", takefocus=False, yscrollcommand=scrollbar.set,
+        )
+        quote.insert("1.0", quote_text)
+        quote.configure(state="disabled")
+        quote.pack(side="left", fill="both", expand=True)
+        scrollbar.configure(command=quote.yview)
+
     tk.Label(
         root,
         text=str(slide.get("ref") or "Найдена цитата"),
         bg="#101820",
         fg="#ffd166",
-        font=ref_font,
+        font=hint_font if quote_text else ref_font,
         wraplength=max(440, width - 72),
         justify="center",
     ).pack(fill="x", padx=30, pady=(24, 8))
@@ -3642,6 +3665,7 @@ def log_live_streaming_alignment(
                 "reason": str(completion.get("reason") or ""),
                 "action": "complete_range",
                 "completed": completed,
+                "restore_pending": bool(completion.get("restore_pending")),
                 "restored_sermon_plan": bool(
                     completion.get("restored_sermon_plan")
                 ),

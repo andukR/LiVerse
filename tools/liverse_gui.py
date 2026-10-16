@@ -583,6 +583,8 @@ class LiVerseGui:
         self.qr_window = None
         self.qr_image = None
         self.help_images = []
+        self._pending_start_config = None
+        self._verified_start_config = None
 
         self.state_var = tk.StringVar(value="Подготовка к запуску")
         self.microphone_status_var = tk.StringVar(value="ещё не проверен")
@@ -620,6 +622,9 @@ class LiVerseGui:
 
         self._configure_window()
         self._build_interface()
+        self.notebook.select(self.settings_tab)
+        self.state_var.set("Проверьте настройки")
+        self.activity_var.set("Проверьте настройки перед запуском!")
         self.state_var.trace_add("write", self._refresh_state_badge)
         self._refresh_state_badge()
         self._refresh_microphones()
@@ -813,8 +818,14 @@ class LiVerseGui:
         self.settings_tab.columnconfigure(1, weight=2, uniform="settings_column")
         modes = ttk.LabelFrame(self.settings_tab, text="Распознавание и показ", padding=8)
         holyrics = ttk.LabelFrame(self.settings_tab, text="HoLyrics и дополнительные настройки", padding=8)
-        modes.grid(row=0, column=0, sticky="nsew", padx=(0, 4), pady=(0, 6))
-        holyrics.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=(0, 6))
+        ttk.Label(self.settings_tab, text="Проверьте настройки перед запуском!",
+                  font=("Segoe UI", 13, "bold")).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(self.settings_tab, text=(
+            "Проверьте время показа цитаты. После обновления могут потребоваться новые разрешения HoLyrics.\n"
+            "При нажатии «Сохранить и запустить» LV проверит связь и необходимые разрешения."
+        ), wraplength=740).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        modes.grid(row=2, column=0, sticky="nsew", padx=(0, 4), pady=(0, 6))
+        holyrics.grid(row=2, column=1, sticky="nsew", padx=(4, 0), pady=(0, 6))
         modes.columnconfigure(0, weight=1)
         holyrics.columnconfigure(1, weight=1)
         mode_row = 0
@@ -925,7 +936,7 @@ class LiVerseGui:
         ).grid(row=right_row, column=0, columnspan=2, sticky="w", pady=3)
 
         actions = ttk.Frame(self.settings_tab)
-        actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        actions.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self._create_primary_button(actions, text="Сохранить и запустить", command=self.save_and_start).pack(
             side="left"
         )
@@ -1266,6 +1277,14 @@ class LiVerseGui:
         config = self._collect_config()
         if config is None:
             return
+        if getattr(self, "_verified_start_config", None) != config:
+            if getattr(self, "_pending_start_config", None) is not None:
+                return
+            self._pending_start_config = config
+            self.state_var.set("Проверка HoLyrics")
+            self.activity_var.set("Проверяю связь и разрешения перед запуском…")
+            threading.Thread(target=self._check_holyrics_worker, args=(config,), daemon=True).start()
+            return
         try:
             if not getattr(self, "diagnostic_test", False):
                 save_gui_config(config)
@@ -1528,6 +1547,8 @@ class LiVerseGui:
         self.diagnostics_text.configure(state="disabled")
 
     def check_holyrics(self) -> None:
+        if self._pending_start_config is not None:
+            return
         config = self._collect_config()
         if config is None:
             return
@@ -1535,23 +1556,51 @@ class LiVerseGui:
         threading.Thread(target=self._check_holyrics_worker, args=(config,), daemon=True).start()
 
     def _check_holyrics_worker(self, config: GuiConfig) -> None:
-        result = check_holyrics_api_server(holyrics_check_args(config))
+        try:
+            result = check_holyrics_api_server(holyrics_check_args(config))
+        except Exception as exc:
+            result = {"ok": False, "reason": str(exc)}
+        result["checked_config"] = config
         self.output_queue.put(("holyrics_result", result))
 
     def _handle_holyrics_result(self, payload: object) -> None:
         result = payload if isinstance(payload, dict) else {}
+        pending = getattr(self, "_pending_start_config", None)
+        if pending is not None and result.get("checked_config") != pending:
+            return
+        self._pending_start_config = None
         if not result.get("ok"):
             self.holyrics_status_var.set("не подключён")
             self.activity_var.set("Запустите HoLyrics и проверьте порт API Server Local.")
+            if pending is not None:
+                self.state_var.set("Проверьте HoLyrics")
+                self.notebook.select(self.settings_tab)
+                messagebox.showwarning("LiVerse — проверка перед запуском", self.activity_var.get())
+            return
+        if pending is not None and (not result.get("token_info_ok") or not result.get("permissions")):
+            self.state_var.set("Проверьте разрешения")
+            self.activity_var.set("Не удалось проверить разрешения HoLyrics. Проверьте token и разрешите GetTokenInfo.")
+            self.notebook.select(self.settings_tab)
+            messagebox.showwarning("LiVerse — проверка разрешений", self.activity_var.get())
             return
         missing = list(result.get("missing_permissions") or [])
         if missing:
             self.holyrics_status_var.set("не хватает разрешений")
             self.activity_var.set(format_missing_holyrics_permissions(missing))
+            if pending is not None:
+                self.state_var.set("Нужны разрешения")
+                self.notebook.select(self.settings_tab)
+                messagebox.showwarning("LiVerse — нужны разрешения HoLyrics", self.activity_var.get())
             return
         version = str(result.get("version") or "").strip()
         self.holyrics_status_var.set(f"подключён{', версия ' + version if version else ''}")
         self.activity_var.set("Связь с HoLyrics работает")
+        if pending is not None:
+            self._verified_start_config = pending
+            if self._collect_config() == pending:
+                self.save_and_start()
+            else:
+                self.activity_var.set("Настройки изменились. Проверьте их и нажмите «Сохранить и запустить».")
 
     def show_permissions(self) -> None:
         permissions = sorted(
@@ -1792,7 +1841,9 @@ class LiVerseGui:
             self.activity_var.set("Введите token и порт HoLyrics, затем выберите микрофон.")
             self.notebook.select(self.settings_tab)
             return
-        self.start_engine()
+        self.state_var.set("Проверьте настройки")
+        self.activity_var.set("Проверьте настройки перед запуском!")
+        self.notebook.select(self.settings_tab)
 
     def _start_tray(self) -> None:
         try:
@@ -1846,6 +1897,11 @@ class LiVerseGui:
         self.root.after(50, self.root.focus_force)
 
     def hide_window(self) -> None:
+        if self.process is None or self.process.poll() is not None:
+            self.notebook.select(self.settings_tab)
+            self.activity_var.set("Проверьте настройки перед запуском! Для выхода используйте «Выход».")
+            self.show_window()
+            return
         if self.tray_available and tray_can_hide_window(backend=self.tray_backend):
             self.root.withdraw()
         else:

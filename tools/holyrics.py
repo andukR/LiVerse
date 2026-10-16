@@ -33,6 +33,9 @@ _LIVE_LATENCY_CONTEXT = threading.local()
 # starts returning the new quick presentation.  During this short interval the
 # previous sermon-plan presentation is stale state, not a manual operator move.
 SCRIPTURE_RANGE_STARTUP_SYNC_GRACE_SECONDS = 1.5
+SCRIPTURE_RESTORE_VERIFY_INTERVAL_SECONDS = 0.25
+SCRIPTURE_RESTORE_VERIFY_TIMEOUT_SECONDS = 10.0
+_SCRIPTURE_OWNER_LOCK = threading.RLock()
 # Keep the live Holyrics threshold unchanged.  The browser review timeline has
 # its own slightly wider rule for four-verse announcements.
 DEFAULT_LONG_RANGE_MIN_VERSES = 3
@@ -1167,7 +1170,9 @@ def cancel_holyrics_restore_timer(args: Any | None = None, *, reason: str = "uns
 
 def temporary_verse_display_active(args: Any) -> bool:
     """Return whether a normal Bible slide is waiting for its timed restore."""
-    return getattr(args, "_holyrics_temporary_verse_display", None) is not None
+    owner = getattr(args, "_holyrics_owned_scripture_presentation", None)
+    return (getattr(args, "_holyrics_temporary_verse_display", None) is not None
+            or isinstance(owner, dict) and bool(owner.get("restore_pending")))
 
 
 def show_holyrics_text_slide(
@@ -2037,6 +2042,7 @@ def handle_scripture_range_reading_match(args: Any, candidate: Any) -> dict:
             "active": False,
             "matched_boundary": True,
             "completed": True,
+            "restore_pending": restore_reason == "scripture_restore_pending",
             "restored_sermon_plan": isinstance(presentation, dict) and not isinstance(state.get("scripture_owner"), dict),
             "reason": restore_reason if isinstance(presentation, dict) else "long_passage_completed",
             "restore_diagnostics": restore_diagnostics,
@@ -2128,7 +2134,184 @@ def owned_scripture_presentation(current: dict | None, owner: dict) -> bool:
     return isinstance(slides, list) and [str(s.get("text") or "").strip() for s in slides] == owner["texts"]
 
 
+def finish_scripture_restore(args: Any, owner: dict, pending: dict,
+                             ok: bool, reason: str, current: dict | None = None) -> None:
+    """Retire only this return, never a newer citation's state."""
+    with _SCRIPTURE_OWNER_LOCK:
+        if (getattr(args, "_holyrics_owned_scripture_presentation", None) is not owner
+                or owner.get("restore_pending") is not pending):
+            return
+        owner.pop("restore_pending", None)
+        setattr(args, "_holyrics_owned_scripture_presentation", None)
+        state = getattr(args, "_holyrics_scripture_range_reading", None)
+        if isinstance(state, dict) and state.get("scripture_owner") is owner:
+            clear_scripture_range_reading(args)
+    holyrics_diagnostic_event(args, "scripture_restore_verification", {
+        "ok": ok, "reason": reason, "restored": current,
+        "restore_id": pending["id"],
+        "elapsed_seconds": round(time.monotonic() - pending["started"], 3),
+        "checks": pending["checks"],
+    })
+
+
+def verify_scripture_restore_later(args: Any, base_url: str, owner: dict) -> None:
+    """Observe an acknowledged return without blocking ASR or repeating writes."""
+    pending = owner["restore_pending"]
+    previous = owner.get("previous") or {}
+
+    def active() -> bool:
+        return (getattr(args, "_holyrics_owned_scripture_presentation", None) is owner
+                and owner.get("restore_pending") is pending)
+
+    def finish(ok: bool, reason: str, current: dict | None = None) -> None:
+        finish_scripture_restore(args, owner, pending, ok, reason, current)
+
+    def poll() -> None:
+        if not active():
+            return
+        if time.monotonic() >= pending["deadline"]:
+            finish(False, "scripture_restore_not_verified")
+            return
+        black_ok, black = scripture_black_screen_state(args, base_url)
+        state_ok, current, response = get_holyrics_presentation_state(
+            args, base_url, "GetCurrentPresentation", {"include_slides": True}
+        )
+        if not active():
+            return
+        pending["checks"] += 1
+        holyrics_diagnostic_event(args, "scripture_restore_observed", {
+            "restore_id": pending["id"],
+            "check": pending["checks"], "state_ok": state_ok,
+            "black_state_ok": black_ok, "black": black, "response": response,
+            "type": (current or {}).get("type"),
+            "id": (current or {}).get("text_id") or (current or {}).get("song_id") or (current or {}).get("id"),
+            "slide_number": (current or {}).get("slide_number"),
+            "slide_type": (current or {}).get("slide_type"),
+        })
+        if (black_ok and black) or (state_ok and (current or {}).get("slide_type") == "black"):
+            finish(True, "operator_changed_display", current)
+            return
+        if state_ok and black_ok:
+            kind = previous.get("type")
+            key = "song_id" if kind == "song" else "text_id"
+            expected_id = str(previous.get(key) or previous.get("id") or "")
+            # A runtime presentation ID is not a substitute for a missing
+            # saved-library ID when the snapshot supplied text_id/song_id.
+            actual_id = str((current or {}).get(key) or (
+                (current or {}).get("id") if not previous.get(key) else "") or "")
+            number = (current or {}).get("slide_number")
+            actual_kind = (current or {}).get("type")
+            actual_key = "song_id" if actual_kind == "song" else "text_id"
+            complete_item = (actual_kind in {"song", "text"}
+                             and bool((current or {}).get(actual_key) or (current or {}).get("id"))
+                             and type(number) is int and number > 0
+                             and isinstance((current or {}).get("slide_type"), str)
+                             and bool(current["slide_type"]))
+            if actual_kind == kind and previous.get(key) and not (current or {}).get(key):
+                complete_item = False
+            matches = (not previous and current is None) or (
+                complete_item and bool(previous) and actual_kind == kind and actual_id == expected_id
+                and (current or {}).get("slide_number", 1) == previous.get("slide_number", 1)
+                and (current or {}).get("slide_type", "default") == previous.get("slide_type", "default")
+            )
+            if matches:
+                finish(True, "scripture_restore_verified", current)
+                return
+            # Holyrics briefly keeps type=quick_presentation while it loads
+            # the previous item's slides. A different known item is manual.
+            if complete_item:
+                finish(True, "operator_changed_display", current)
+                return
+            slides = (current or {}).get("slides")
+            previous_slides = previous.get("slides")
+            if isinstance(slides, list) and slides and not owned_scripture_presentation(current, owner):
+                texts = [str(s.get("text") or "").strip() for s in slides]
+                expected_texts = [str(s.get("text") or "").strip() for s in previous_slides] if isinstance(previous_slides, list) else None
+                if expected_texts is not None and texts != expected_texts:
+                    finish(True, "operator_changed_display", current)
+                    return
+        if time.monotonic() >= pending["deadline"]:
+            finish(False, "scripture_restore_not_verified", current)
+        else:
+            schedule()
+
+    def schedule() -> None:
+        def guarded_poll() -> None:
+            try:
+                poll()
+            except Exception as exc:
+                holyrics_log(f"scripture restore verification failed: {exc}")
+                finish(False, "scripture_restore_verification_error")
+        timer = threading.Timer(SCRIPTURE_RESTORE_VERIFY_INTERVAL_SECONDS, guarded_poll)
+        timer.daemon = True
+        pending["timer"] = timer
+        timer.start()
+
+    schedule()
+
+
 def restore_owned_scripture_presentation(args: Any, base_url: str, owner: dict) -> tuple[bool, str, dict]:
+    """Queue a guarded return. All API calls and confirmation run off the ASR thread."""
+    with _SCRIPTURE_OWNER_LOCK:
+        if getattr(args, "_holyrics_owned_scripture_presentation", None) is not owner:
+            return True, "scripture_presentation_replaced", {}
+        if owner.get("restore_pending"):
+            return True, "scripture_restore_pending", {"verification_pending": True}
+        started = time.monotonic()
+        pending = {"id": str(time.monotonic_ns()), "started": started,
+                   "deadline": started + SCRIPTURE_RESTORE_VERIFY_TIMEOUT_SECONDS,
+                   "checks": 0, "phase": "command_queued"}
+        owner["restore_pending"] = pending
+        state = getattr(args, "_holyrics_scripture_range_reading", None)
+        if isinstance(state, dict) and state.get("scripture_owner") is owner:
+            clear_scripture_range_reading(args)
+        holyrics_diagnostic_event(args, "scripture_restore_pending", {
+            "restore_id": pending["id"], "phase": "command_queued",
+            "previous_type": (owner.get("previous") or {}).get("type"),
+            "timeout_seconds": SCRIPTURE_RESTORE_VERIFY_TIMEOUT_SECONDS,
+        })
+
+        def submit() -> None:
+            # The lock covers fresh screen checks, the write and its ACK.
+            # A newer citation either cancels this queued return, or follows
+            # the already-started write using a fresh screen snapshot.
+            with _SCRIPTURE_OWNER_LOCK:
+                if (getattr(args, "_holyrics_owned_scripture_presentation", None) is not owner
+                        or owner.get("restore_pending") is not pending):
+                    return
+                if time.monotonic() >= pending["deadline"]:
+                    finish_scripture_restore(args, owner, pending, False, "scripture_restore_request_expired")
+                    return
+                try:
+                    pending["phase"] = "command_running"
+                    ok, reason, diagnostics = submit_owned_scripture_restore(args, base_url, owner)
+                except Exception as exc:
+                    holyrics_log(f"scripture restore request failed: {exc}")
+                    ok, reason, diagnostics = False, "scripture_restore_request_error", {}
+                if reason == "scripture_restore_state_incomplete":
+                    # No write was sent. Wait for a usable screen snapshot;
+                    # a new citation can still cancel this queued return.
+                    pending["phase"] = "command_queued"
+                    holyrics_diagnostic_event(args, "scripture_restore_observed", {
+                        "restore_id": pending["id"], "phase": "before_command", "reason": reason,
+                    })
+                    retry = threading.Timer(SCRIPTURE_RESTORE_VERIFY_INTERVAL_SECONDS, submit)
+                    retry.daemon = True
+                    pending["timer"] = retry
+                    retry.start()
+                    return
+                if reason != "scripture_restore_pending":
+                    finish_scripture_restore(args, owner, pending, ok, reason, diagnostics.get("restored"))
+
+        timer = threading.Timer(0, submit)
+        timer.daemon = True
+        pending["timer"] = timer
+        timer.start()
+    return True, "scripture_restore_pending", {"verification_pending": True}
+
+
+def submit_owned_scripture_restore(args: Any, base_url: str, owner: dict) -> tuple[bool, str, dict]:
+    """Run under the same write lock as new citations, in a background timer."""
     if getattr(args, "_holyrics_owned_scripture_presentation", None) is not owner:
         return True, "scripture_presentation_replaced", {}
     state_ok, current, reason = get_holyrics_presentation_state(
@@ -2139,8 +2322,26 @@ def restore_owned_scripture_presentation(args: Any, base_url: str, owner: dict) 
     black_ok, black = scripture_black_screen_state(args, base_url)
     if not black_ok:
         return False, "holyrics_black_screen_state_unavailable", {}
-    if not owned_scripture_presentation(current, owner) or black or (current or {}).get("slide_type") == "black":
-        setattr(args, "_holyrics_owned_scripture_presentation", None)
+    if getattr(args, "_holyrics_owned_scripture_presentation", None) is not owner:
+        return True, "scripture_presentation_replaced", {}
+    own = owned_scripture_presentation(current, owner)
+    if not own and not black and (current or {}).get("slide_type") != "black":
+        kind = (current or {}).get("type")
+        number = (current or {}).get("slide_number")
+        known = (type(number) is int and number > 0
+                 and bool((current or {}).get("slide_type")))
+        if kind in {"song", "text"}:
+            key = "song_id" if kind == "song" else "text_id"
+            known = known and bool((current or {}).get(key) or (current or {}).get("id"))
+        elif kind == "quick_presentation":
+            slides = current.get("slides")
+            known = known and isinstance(slides, list) and bool(slides) and all(
+                isinstance(s, dict) and isinstance(s.get("text"), str) for s in slides)
+        else:
+            known = False
+        if not known:
+            return False, "scripture_restore_state_incomplete", {}
+    if not own or black or (current or {}).get("slide_type") == "black":
         holyrics_diagnostic_event(args, "scripture_restore_skipped", {"reason": "operator_changed_display"})
         return True, "operator_changed_display", {}
     previous = owner.get("previous") or {}
@@ -2167,23 +2368,14 @@ def restore_owned_scripture_presentation(args: Any, base_url: str, owner: dict) 
         ok, reason, _response = post_holyrics_api(args, base_url, mode, {"enable": True})
         if not ok:
             return False, reason, {}
-    verified, restored, reason = get_holyrics_presentation_state(args, base_url, "GetCurrentPresentation")
-    diagnostics = {"restored": restored, "response": reason}
-    if not verified:
-        return False, "scripture_restore_state_unavailable", diagnostics
-    if previous:
-        restored = restored or {}
-        restored_id = str(restored.get("song_id" if kind == "song" else "text_id") or restored.get("id") or "")
-        matches = (restored.get("type") == kind and restored_id == item_id
-                   and int(restored.get("slide_number") or 1) == index + 1
-                   and restored.get("slide_type", "default") == previous.get("slide_type", "default"))
-    else:
-        matches = restored is None
-    if not matches:
-        return False, "scripture_restore_not_verified", diagnostics
-    if getattr(args, "_holyrics_owned_scripture_presentation", None) is owner:
-        setattr(args, "_holyrics_owned_scripture_presentation", None)
-    return True, "scripture_restore_verified", diagnostics
+    pending = owner["restore_pending"]
+    pending["phase"] = "verification"
+    pending["deadline"] = time.monotonic() + SCRIPTURE_RESTORE_VERIFY_TIMEOUT_SECONDS
+    holyrics_diagnostic_event(args, "scripture_restore_command_acknowledged", {
+        "restore_id": pending["id"], "endpoint": endpoint, "previous_type": kind,
+    })
+    verify_scripture_restore_later(args, base_url, owner)
+    return True, "scripture_restore_pending", {"verification_pending": True}
 
 
 def scripture_presentation_appearance(
@@ -2268,6 +2460,20 @@ def scripture_presentation_appearance(
 
 
 def post_holyrics_scripture_theme(args: Any, base_url: str, payload: dict) -> tuple[bool, str]:
+    """Serialize LV writes so an old return cannot follow a newer citation."""
+    if not _SCRIPTURE_OWNER_LOCK.acquire(blocking=False):
+        return False, "holyrics_scripture_display_busy: экран ещё переключается; повторите показ после возврата"
+    try:
+        owner = getattr(args, "_holyrics_owned_scripture_presentation", None)
+        pending = owner.get("restore_pending") if isinstance(owner, dict) else None
+        if pending and pending.get("phase") != "command_queued":
+            return False, "holyrics_scripture_restore_pending: экран ещё переключается; повторите показ после возврата"
+        return post_holyrics_scripture_theme_locked(args, base_url, payload)
+    finally:
+        _SCRIPTURE_OWNER_LOCK.release()
+
+
+def post_holyrics_scripture_theme_locked(args: Any, base_url: str, payload: dict) -> tuple[bool, str]:
     """Show scripture with styling selected from the operator's current screen."""
     state_ok, current, reason = get_holyrics_presentation_state(
         args, base_url, "GetCurrentPresentation", {"include_slides": True}
@@ -2314,7 +2520,15 @@ def post_holyrics_scripture_theme(args: Any, base_url: str, payload: dict) -> tu
     clear_scripture_range_reading(args)
     owner = {"texts": [str(s["text"]).strip() for s in slides], "previous": previous,
              "styling": styling, "appearance_source": appearance_source}
-    setattr(args, "_holyrics_owned_scripture_presentation", owner)
+    with _SCRIPTURE_OWNER_LOCK:
+        if isinstance(prior_owner, dict) and prior_owner.get("restore_pending"):
+            pending = prior_owner.pop("restore_pending")
+            pending["timer"].cancel()
+            holyrics_diagnostic_event(args, "scripture_restore_verification", {
+                "restore_id": pending["id"], "ok": True,
+                "reason": "scripture_presentation_replaced", "checks": pending["checks"],
+            })
+        setattr(args, "_holyrics_owned_scripture_presentation", owner)
     holyrics_diagnostic_event(args, "scripture_theme_presentation_shown", {
         "fallback_theme_name": str(args.holyrics_scripture_theme).strip(), "appearance_source": appearance_source, "reference": payload.get("ref"),
         "previous": previous, "slides": len(slides),

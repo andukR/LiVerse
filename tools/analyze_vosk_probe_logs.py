@@ -1242,6 +1242,15 @@ def check_live_session(session: Path) -> dict:
                                    "Последующий возврат к нужному слайду плана подтверждён; эти ответы не считаются сбоем показа.")
         if bad_api:
             failures.append(f"Неуспешных ответов Holyrics: {len(bad_api)}. Возможен сбой или неизвестный результат показа.")
+        restore_results = [r for r in events if r.get("event") == "scripture_restore_verification"]
+        failed_restores = [r for r in restore_results if r.get("ok") is False]
+        if failed_restores:
+            failures.append(f"Не удалось подтвердить возврат к презентации: {len(failed_restores)}.")
+        completed_restores = {r.get("restore_id") for r in restore_results}
+        pending_restores = [r for r in events if r.get("event") == "scripture_restore_pending"
+                            and r.get("restore_id") not in completed_restores]
+        if pending_restores:
+            missing.append(f"Проверка возврата к презентации не завершена: {len(pending_restores)}.")
         if not api:
             missing.append("Нет ответов Holyrics; вывод на презентацию не проверялся.")
         if not any(r.get("endpoint") in ("ShowVerse", "ShowText", "ShowQuickPresentation") and r.get("ok") is True for r in api):
