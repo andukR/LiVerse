@@ -844,6 +844,50 @@ FEMININE_CHAPTER_ORDINAL_PATTERN = "|".join(
 )
 NUMBER_WORD_PATTERN = "|".join(sorted(NUMBER_WORDS, key=len, reverse=True))
 ADDRESS_NUMBER_PATTERN = rf"(?:\d+|(?:{NUMBER_WORD_PATTERN})(?:\s+(?:{NUMBER_WORD_PATTERN}))?)"
+
+# In the spoken construction «с первого по двенадцатой» Sherpa can put the
+# end ordinal into the feminine form. Normalize that ending deterministically
+# only after an explicit «с … по …» range marker; outside this construction a
+# feminine ordinal can be ordinary speech or a chapter number.
+FEMININE_RANGE_END_ORDINALS = {
+    word: value for word, value in ORDINALS.items() if word.endswith("ой")
+}
+FEMININE_RANGE_END_ORDINALS.update(
+    {
+        f"{word[:-2]}ой": value
+        for word, value in ORDINALS.items()
+        if word.endswith("ый")
+    }
+)
+# Also accept the possible ASR spelling «третой» in this explicit range.
+FEMININE_RANGE_END_ORDINALS["третой"] = 3
+FEMININE_RANGE_END_TENS = {
+    "двадцать": 20,
+    "тридцать": 30,
+    "сорок": 40,
+    "пятьдесят": 50,
+    "шестьдесят": 60,
+    "семьдесят": 70,
+    "восемьдесят": 80,
+    "девяносто": 90,
+}
+FEMININE_RANGE_END_ORDINAL_RE = re.compile(
+    rf"(?P<prefix>\bс\s+{ADDRESS_NUMBER_PATTERN}\s+по\s+)"
+    rf"(?:(?P<tens>{'|'.join(sorted(FEMININE_RANGE_END_TENS, key=len, reverse=True))})\s+)?"
+    rf"(?P<ordinal>{'|'.join(sorted(FEMININE_RANGE_END_ORDINALS, key=len, reverse=True))})\b"
+)
+
+
+def replace_feminine_range_end_ordinal(match: re.Match[str]) -> str:
+    value = FEMININE_RANGE_END_ORDINALS[match.group("ordinal")]
+    tens = match.group("tens")
+    if tens:
+        if not 1 <= value <= 9:
+            return match.group(0)
+        value += FEMININE_RANGE_END_TENS[tens]
+    return f"{match.group('prefix')}{value}"
+
+
 CARDINAL_BEFORE_FEMININE_CHAPTER_RE = re.compile(
     rf"\b(?P<cardinal>{CARDINAL_WORD_PATTERN})\s+"
     rf"(?P<ordinal>{FEMININE_CHAPTER_ORDINAL_PATTERN})"
@@ -1134,6 +1178,10 @@ def normalize_text(text: str) -> str:
     )
     normalized = TRUNCATED_GENITIVE_RANGE_START_RE.sub(
         replace_truncated_genitive_range_start,
+        normalized,
+    )
+    normalized = FEMININE_RANGE_END_ORDINAL_RE.sub(
+        replace_feminine_range_end_ordinal,
         normalized,
     )
     normalized = CARDINAL_BEFORE_FEMININE_CHAPTER_RE.sub(

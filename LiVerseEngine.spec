@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_data_files
 
 
 project_root = Path(SPECPATH)
@@ -59,7 +60,7 @@ engine_analysis = Analysis(
         (str(project_root / "bible_index" / "bible_index.db"), "bible_index"),
         (str(model_dir), f".cache/liverse/models/{model_name}"),
         (str(project_root / "slide_display"), "slide_display"),
-    ],
+    ] + collect_data_files("pymorphy2_dicts") + collect_data_files("natasha"),
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

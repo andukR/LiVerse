@@ -817,7 +817,10 @@ try {
     }
     $oldVersion = (& $engine --version | Out-String).Trim()
     if ($LASTEXITCODE -ne 0) { throw "Previous installed version check failed: $LASTEXITCODE" }
-    if ($oldVersion -match [regex]::Escape($newVersionExpected)) { throw "Previous installer already contains LiVerse $newVersionExpected" }
+    # A corrected installer may keep its public version. Reject testing the
+    # identical installer, while allowing an upgrade over an earlier build.
+    $newSetupHash = (Get-FileHash -LiteralPath $newSetup -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($oldHashActual -eq $newSetupHash) { throw "Previous and new installers are identical" }
 
     # The previous public engine does not know the private hold option. After
     # confirming its real version, replace only the test executable with the
@@ -844,6 +847,10 @@ try {
     $newVersion = (& $engine --version | Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or $newVersion -notmatch [regex]::Escape($newVersionExpected)) {
         throw "Expected installed version $newVersionExpected, got: $newVersion"
+    }
+    $expectedEngineHash = (Get-FileHash -LiteralPath $testEngine -Algorithm SHA256).Hash
+    if ((Get-FileHash -LiteralPath $engine -Algorithm SHA256).Hash -ne $expectedEngineHash) {
+        throw "Installed engine differs from the newly built engine"
     }
     & $engine --check-runtime-assets
     if ($LASTEXITCODE -ne 0) { throw "Runtime assets check failed: $LASTEXITCODE" }

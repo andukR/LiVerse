@@ -5365,6 +5365,14 @@ def main() -> int:
         return list_audio_devices()
     if args.check_runtime_assets:
         try:
+            # Check the real dependency directly: parser fallback can conceal
+            # missing dictionary data in a frozen Windows build.
+            from words2numsrus import NumberExtractor
+
+            extractor = NumberExtractor()
+            for word, expected in (("двенадцатой", "12"), ("тринадцатой", "13"), ("третьему", "3")):
+                if extractor.replace(word) != expected:
+                    raise RuntimeError(f"words2numsrus: {word!r} не преобразовано в {expected}")
             with BibleTextSearcher(args.text_detection_db) as searcher:
                 _lemmas, results = searcher.search("ибо так возлюбил бог мир", limit=1)
                 if not results or results[0].reference != "Ин. 3:16":
@@ -5377,7 +5385,7 @@ def main() -> int:
         except Exception as exc:
             print(f"LiVerse runtime assets check failed: {exc}", file=sys.stderr, flush=True)
             return 2
-        print("LiVerse runtime assets check passed: Ин. 3:16, bible_index.db, Sherpa 0.54.", flush=True)
+        print("LiVerse runtime assets check passed: words2numsrus (12, 13, 3), Ин. 3:16, bible_index.db, Sherpa 0.54.", flush=True)
         return 0
     if args.print_grammar_json:
         grammar_json = json.dumps(build_grammar(), ensure_ascii=False)

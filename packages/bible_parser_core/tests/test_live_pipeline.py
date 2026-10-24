@@ -3536,6 +3536,35 @@ class LiveReferencePipelineTest(unittest.TestCase):
         )
         self.assertEqual("Евреям 13:15-16", result["parsed"]["ref"])
 
+    def test_church_first_john_range_without_optional_number_extractor(self):
+        with patch("bible_parser_core.parser._NUMBER_EXTRACTOR_UNAVAILABLE", True):
+            result = LiveReferencePipeline().process_text(
+                "все готовится к зиме и знаете да вот сегодняшнее тихое время это "
+                "первое послание иана пятое глава начало да с первого по двенадцатой"
+            )
+        self.assertEqual("1 Иоанна 5:1-12", result["parsed"]["ref"])
+
+    def test_feminine_range_endings_without_optional_number_extractor(self):
+        cases = (
+            ("второй", 2), ("третой", 3), ("четвертой", 4), ("пятой", 5),
+            ("шестой", 6), ("седьмой", 7), ("восьмой", 8), ("девятой", 9),
+            ("десятой", 10), ("одиннадцатой", 11), ("двенадцатой", 12),
+            ("тринадцатой", 13), ("четырнадцатой", 14), ("пятнадцатой", 15),
+            ("шестнадцатой", 16), ("семнадцатой", 17), ("восемнадцатой", 18),
+            ("девятнадцатой", 19), ("двадцатой", 20), ("тридцатой", 30),
+            ("сороковой", 40), ("пятидесятой", 50), ("шестидесятой", 60),
+            ("семидесятой", 70), ("восьмидесятой", 80), ("девяностой", 90),
+            ("сотой", 100), ("двадцать первой", 21), ("тридцать четвертой", 34),
+        )
+        with patch("bible_parser_core.parser._NUMBER_EXTRACTOR_UNAVAILABLE", True):
+            for ending, expected in cases:
+                with self.subTest(ending=ending):
+                    reference = parse_live_reference(
+                        f"псалом 118 глава с первого по {ending} стих"
+                    )
+                    self.assertIsNotNone(reference)
+                    self.assertEqual(f"Псалтирь 118:1-{expected}", reference.ref)
+
     def test_tenth_verse_as_tensok_range_distortion(self):
         pipeline = LiveReferencePipeline()
         result = pipeline.process_text(
