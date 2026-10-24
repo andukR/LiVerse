@@ -191,20 +191,21 @@ print(json.dumps({
     while true; do
         status=$(virsh -c "$VM_URI" qemu-agent-command "$VM_NAME" \
             "{\"execute\":\"guest-exec-status\",\"arguments\":{\"pid\":$pid}}")
-        exited=$(python3 -c 'import json, sys; print(str(json.loads(sys.argv[1])["return"].get("exited", False)).lower())' "$status")
+        # Build logs can exceed the OS limit for one command-line argument.
+        exited=$(python3 -c 'import json, sys; print(str(json.load(sys.stdin)["return"].get("exited", False)).lower())' <<< "$status")
         if [[ "$exited" == true ]]; then
             python3 -c '
 import base64
 import json
 import sys
 
-result = json.loads(sys.argv[1])["return"]
+result = json.load(sys.stdin)["return"]
 if result.get("out-data"):
     sys.stdout.buffer.write(base64.b64decode(result["out-data"]))
 if result.get("err-data"):
     sys.stderr.buffer.write(base64.b64decode(result["err-data"]))
-' "$status"
-            exit_code=$(python3 -c 'import json, sys; print(json.loads(sys.argv[1])["return"].get("exitcode", 1))' "$status")
+' <<< "$status"
+            exit_code=$(python3 -c 'import json, sys; print(json.load(sys.stdin)["return"].get("exitcode", 1))' <<< "$status")
             printf 'Windows VM: %s exit code: %s\n' "$description" "$exit_code"
             return "$exit_code"
         fi
