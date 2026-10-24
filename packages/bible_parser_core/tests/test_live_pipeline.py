@@ -38,6 +38,131 @@ from tools.holyrics import (
 
 
 class LiveReferencePipelineTest(unittest.TestCase):
+    def test_selected_scripture_is_remembered_only_after_successful_output(self):
+        from tools.vosk_grammar_probe import (
+            forget_rejected_address_marker,
+            remember_selected_scripture,
+        )
+        detector = Mock()
+        args = SimpleNamespace(_text_citation_detector=detector)
+        payload = {"slide": {"ref": "Иаков 5:9", "source": "vosk:parser"}}
+
+        remember_selected_scripture(
+            args, payload,
+            {"approval": {"enabled": False}, "holyrics": {"enabled": True, "ok": True}},
+        )
+        self.assertEqual("Иаков 5:9", detector.select_reference.call_args.args[0])
+
+        detector.reset_mock()
+        failed = {"approval": {"action": "approve"}, "holyrics": {"enabled": True, "ok": False}}
+        remember_selected_scripture(args, payload, failed)
+        self.assertFalse(detector.select_reference.called)
+
+        rejected = {"approval": {"action": "wrong_reference"}, "holyrics": {"ok": False}}
+        forget_rejected_address_marker(args, payload, rejected)
+        self.assertEqual("Иаков 5:9", detector.clear_rejected_address.call_args.args[0])
+
+    def test_written_plan_reference_variants_and_all_canonical_books(self):
+        from bible_parser_core.parser import DEFAULT_BIBLE
+        from bible_parser_core.book_aliases import books_data
+        from bible_parser_core.live_pipeline import sermon_plan_reading_references
+        data = json.loads(DEFAULT_BIBLE.read_text(encoding="utf-8"))
+        for item, (book, _) in zip(data["Books"], books_data):
+            abbreviation = item["BookName"].lower().replace(".", "").replace(" ", "")
+            with self.subTest(abbreviation=abbreviation):
+                refs = sermon_plan_reading_references(f"{abbreviation}1:1–2")
+                self.assertEqual([book], [ref.book for ref in refs])
+        for book, _ in books_data:
+            for separator in (" ", ""):
+                text = f"{book.lower()}{separator}1:1–2"
+                with self.subTest(text=text):
+                    refs = sermon_plan_reading_references(text)
+                    self.assertEqual([(book, 1, 1, 2)],
+                                     [(r.book, r.chapter, r.start_verse, r.end_verse) for r in refs])
+        for book in ("Иак.", "Иак", "Иаков", "Иакова", "иак.", "иакова", "иаков"):
+            refs = sermon_plan_reading_references(f"1. Терпение\n{book}5:7—8")
+            self.assertEqual(["Иаков 5:7-8"], [r.ref for r in refs])
+        self.assertEqual(["1 Коринфянам 11:23-26"],
+                         [r.ref for r in sermon_plan_reading_references("1Кор.11:23-26")])
+        self.assertEqual([], sermon_plan_reading_references("Первый пункт. Терпение. 5 вопросов"))
+        self.assertEqual([], sermon_plan_reading_references("Иаков 5:7-999"))
+
+    def test_actual_spoken_subrange_preserves_global_range_and_uses_plan_hint(self):
+        from tools.vosk_grammar_probe import update_reading_fragment
+        state = {"ref": "Иаков 5:7-12", "book": "Иаков", "current_index": 0,
+                 "targets": [{"chapter": 5, "verse": n} for n in range(7, 13)],
+                 "scripture_owner": {"previous": {"slides": [{"number": 2, "text": "Иак.5:7–8"}]}}}
+        text = ("и первый пример который мы будем сегодня читать это пятая глава седьмой восьмой стих "
+                "послание иакова пятая глава седьмой восьмой стих")
+        logger = Mock()
+        self.assertTrue(update_reading_fragment(SimpleNamespace(), state, text, logger))
+        self.assertEqual("Иаков 5:7-12", state["ref"])
+        self.assertEqual("Иаков 5:7-8", state["fragment_ref"])
+        self.assertEqual(1, state["fragment_end_index"])
+        self.assertEqual([2], logger.write.call_args.args[1]["plan_slides"])
+        self.assertFalse(update_reading_fragment(SimpleNamespace(), state, "два первых стиха говорят о терпении", logger))
+        self.assertFalse(update_reading_fragment(SimpleNamespace(), state, "Иаков 5:7-15", logger))
+        self.assertTrue(update_reading_fragment(SimpleNamespace(), state, "Иаков 5:7-12", logger))
+        self.assertNotIn("fragment_end_index", state)
+        self.assertTrue(update_reading_fragment(SimpleNamespace(), state, "с седьмого по восьмой стих", logger))
+        self.assertEqual(1, state["fragment_end_index"])
+
+    def test_commentary_requires_heard_ending_and_fresh_nonreading_phrases(self):
+        from tools.vosk_grammar_probe import observe_reading_commentary
+        searcher = SimpleNamespace(normalize_lemmas=lambda text: text.lower().split())
+        state = {"current_index": 0, "targets": [{"text": "долготерпите и вы укрепите сердца ваши потому что пришествие господня приближается"}]}
+        ending = SimpleNamespace(status="current_ending", would_activate=True, current_tail_hits=3)
+        commentary = "каждый человек знаком с земледелием по собственному жизненному опыту"
+        with patch("tools.vosk_grammar_probe.pause_scripture_range_reading", return_value={"ok": True}) as pause:
+            for _ in range(3):
+                self.assertFalse(observe_reading_commentary(SimpleNamespace(), state, ending, commentary, searcher, Mock()))
+            pause.assert_not_called()  # Historic rolling alignment is insufficient.
+            self.assertFalse(observe_reading_commentary(SimpleNamespace(), state, ending, "пришествие господня приближается", searcher, Mock()))
+            for _ in range(2):
+                self.assertFalse(observe_reading_commentary(SimpleNamespace(), state, ending, commentary, searcher, Mock()))
+            self.assertTrue(observe_reading_commentary(SimpleNamespace(), state, ending, commentary, searcher, Mock()))
+            pause.assert_called_once()
+
+    def test_slow_reading_and_silence_do_not_count_as_commentary(self):
+        from tools.vosk_grammar_probe import observe_reading_commentary
+        searcher = SimpleNamespace(normalize_lemmas=lambda text: text.lower().split())
+        verse = "долготерпите и вы укрепите сердца ваши потому что пришествие господня приближается"
+        state = {"current_index": 0, "targets": [{"text": verse}], "heard_ending_index": 0,
+                 "commentary_phrases": 2, "commentary_words": 20}
+        alignment = SimpleNamespace(status="tracking_current", would_activate=True)
+        with patch("tools.vosk_grammar_probe.pause_scripture_range_reading") as pause:
+            for phrase in ("", "аминь", "долготерпите и вы укрепите сердца ваши", "потому что пришествие господня приближается"):
+                self.assertFalse(observe_reading_commentary(SimpleNamespace(), state, alignment, phrase, searcher, Mock()))
+        pause.assert_not_called()
+        self.assertEqual(0, state["commentary_phrases"])
+
+    def test_manual_reading_return_uses_existing_owner_restore(self):
+        from tools.holyrics import pause_scripture_range_reading
+        owner = {"previous": {"type": "text", "text_id": "plan"}}
+        state = {"ref": "Иаков 5:7-12", "current_index": 1, "scripture_owner": owner}
+        args = SimpleNamespace(_holyrics_scripture_range_reading=state, holyrics_url="http://localhost:8091")
+        with patch("tools.holyrics.restore_owned_scripture_presentation", return_value=(True, "scripture_restore_pending", {})) as restore:
+            result = pause_scripture_range_reading(args)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["restore_pending"])
+        restore.assert_called_once_with(args, "http://localhost:8091", owner)
+        self.assertEqual("Иаков 5:7-12", state["ref"])
+
+    def test_return_plan_button_sends_command_without_stopping_engine(self):
+        from tools.liverse_gui import LiVerseGui
+        from tools.vosk_grammar_probe import consume_stop_request
+        gui = Mock()
+        gui.process.poll.return_value = None
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "engine.stop"
+            with patch("tools.liverse_gui.engine_stop_path", return_value=path):
+                LiVerseGui.pause_reading(gui)
+                self.assertEqual("pause_reading", consume_stop_request(path))
+                path.write_text("stop")
+                LiVerseGui.pause_reading(gui)
+                self.assertEqual("stop", consume_stop_request(path))
+        gui.process.terminate.assert_not_called()
+
     def test_gui_update_check_leaves_settings_open_without_engine(self):
         from tools.liverse_gui import LiVerseGui, GuiConfig
         gui = Mock(config=GuiConfig(holyrics_token="test"))
@@ -134,18 +259,49 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertEqual("Откровение 3:7-13", result.ref)
         self.assertEqual("Откровение", result.book)
 
+    def test_missing_chapter_preview_preserves_parser_input_without_editing(self):
+        import tkinter as tk
+        from tkinter import font as tkfont
+        from contextlib import ExitStack
+        from tools import vosk_grammar_probe as probe
+        for source_text in ("апостол павел говорит в послании вся на четвёртогла пятнадцатый стих " * 20, ""):
+            root = Mock()
+            root.winfo_screenwidth.return_value = 1366
+            root.winfo_screenheight.return_value = 768
+            root.winfo_reqheight.return_value = 590
+            hint = {"book": "Ефесянам", "start_verse": 15, "source_text": source_text}
+            with self.subTest(source_text=bool(source_text)), ExitStack() as stack:
+                stack.enter_context(patch.object(probe, "popup_tk_window", return_value=root))
+                stack.enter_context(patch.object(probe, "center_tk_window"))
+                stack.enter_context(patch.object(tkfont, "Font"))
+                widgets = {name: stack.enter_context(patch.object(tk, name)) for name in
+                           ("Label", "Frame", "Scrollbar", "Text", "Entry", "Button", "BooleanVar", "StringVar")}
+                probe.popup_missing_chapter(hint, on_decision=Mock())
+                preview = widgets["Text"].return_value
+                expected = source_text or "Исходная распознанная фраза не сохранена."
+                preview.insert.assert_called_once_with("1.0", expected)
+                preview.configure.assert_called_with(state="disabled")
+                root.wait_variable.assert_not_called()
+                self.assertEqual(source_text, hint["source_text"])
+
     @unittest.skipUnless(sys.platform == "win32", "Real Tk popup regression on Windows")
     def test_missing_chapter_window_returns_without_wait_and_validates_chapter(self):
         import tkinter as tk
         from tools import vosk_grammar_probe as probe
 
         decisions = []
-        hint = {"book": "Иаков", "start_verse": 6, "end_verse": 6}
+        hint = {"book": "Ефесянам", "start_verse": 15, "end_verse": 15,
+                "source_text": "апостол павел говорит в послании вся на четвёртогла пятнадцатый стих "
+                               "о необходимости говорить истину в любви истинно без любви может превратиться в жестокость"}
         try:
             with patch.object(tk.Misc, "wait_variable", side_effect=AssertionError("blocks audio")):
                 probe.popup_missing_chapter(hint, on_decision=decisions.append)
             root = probe._POPUP_TK_ROOT
             root.update()
+            source = next(w for frame in root.winfo_children() if isinstance(frame, tk.Frame)
+                          for w in frame.winfo_children() if isinstance(w, tk.Text))
+            self.assertEqual(hint["source_text"], source.get("1.0", "end-1c"))
+            self.assertEqual("disabled", source.cget("state"))
             entry = next(w for w in root.winfo_children() if isinstance(w, tk.Entry))
             submit = next(w for w in root.winfo_children()
                           if isinstance(w, tk.Button) and "показать" in str(w.cget("text")))
@@ -153,11 +309,11 @@ class LiveReferencePipelineTest(unittest.TestCase):
             submit.invoke()
             self.assertEqual([], decisions)
             entry.delete(0, "end")
-            entry.insert(0, "5")
+            entry.insert(0, "4")
             submit.invoke()
             submit.invoke()
             self.assertEqual(1, len(decisions))
-            self.assertEqual("Иаков 5:6", decisions[0]["parsed"]["ref"])
+            self.assertEqual("Ефесянам 4:15", decisions[0]["parsed"]["ref"])
             closed_messages = []
             with patch.object(tk.Misc, "wait_variable", side_effect=AssertionError("blocks audio")):
                 probe.show_popup_message("LiVerse", "Неверный адрес", on_decision=closed_messages.append)
@@ -339,11 +495,15 @@ class LiveReferencePipelineTest(unittest.TestCase):
         from tools.vosk_grammar_probe import JsonlLogger, PopupApprovalQueue
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            args = SimpleNamespace(_popup_event_logger=None)
+            detector = Mock()
+            args = SimpleNamespace(
+                _popup_event_logger=None,
+                _text_citation_detector=detector,
+            )
             logger = JsonlLogger(Path(temp_dir), enabled=False)
             approval_queue = PopupApprovalQueue(args, logger, [])
-            first = {"slide": {"ref": "Иоанн 3:16"}}
-            second = {"slide": {"ref": "Римлянам 6:23"}}
+            first = {"slide": {"ref": "Иоанн 3:16", "source": "vosk:parser"}}
+            second = {"slide": {"ref": "Римлянам 6:23", "source": "vosk:parser"}}
             first_result = approval_queue.submit(args, first)
             second_result = approval_queue.submit(args, second)
             self.assertEqual("waiting", first_result["action"])
@@ -363,6 +523,7 @@ class LiveReferencePipelineTest(unittest.TestCase):
                     "action": action,
                     "proposed_ref": "",
                     "selected_ref": "",
+                    "holyrics": {"enabled": True, "ok": True},
                 },
             ):
                 approval_queue.pump()
@@ -370,9 +531,12 @@ class LiveReferencePipelineTest(unittest.TestCase):
                 self.assertIs(first, approval_queue.active)
                 displayed[0]("reject")
                 self.assertIsNone(approval_queue.active)
+                detector.select_reference.assert_not_called()
                 approval_queue.pump()
                 self.assertEqual(2, len(displayed))
                 self.assertIs(second, approval_queue.active)
+                displayed[1]("approve")
+                self.assertEqual("Римлянам 6:23", detector.select_reference.call_args.args[0])
 
     def test_queued_popup_retries_focus_only_briefly_when_not_focused(self):
         from tools.vosk_grammar_probe import schedule_popup_focus_retry
@@ -1310,6 +1474,32 @@ class LiveReferencePipelineTest(unittest.TestCase):
         self.assertFalse(
             tray_needs_own_event_loop(platform="win32", backend="pystray._win32")
         )
+
+    def test_gui_hide_works_when_recognition_is_not_running(self):
+        from tools.liverse_gui import LiVerseGui
+
+        app = object.__new__(LiVerseGui)
+        app.root = Mock()
+        app.tray_available = True
+        app.tray_backend = "test_backend"
+        with patch("tools.liverse_gui.tray_can_hide_window", return_value=True):
+            app.hide_window()
+        app.root.withdraw.assert_called_once_with()
+        app.root.iconify.assert_not_called()
+
+        app.root = Mock()
+        app.tray_available = False
+        with patch("tools.liverse_gui.tray_can_hide_window", return_value=False):
+            app.hide_window()
+        app.root.iconify.assert_called_once_with()
+
+    def test_gui_window_close_quits_when_recognition_is_not_running(self):
+        from tools.liverse_gui import LiVerseGui
+
+        finalize = Mock()
+        app = SimpleNamespace(process=None, _finalize_quit=finalize)
+        LiVerseGui.quit_application(app)
+        finalize.assert_called_once_with(restart=False)
 
     def test_full_setup_can_select_microphone_by_stable_name(self):
         from tools.vosk_grammar_probe import ask_audio_input_device
@@ -5869,6 +6059,44 @@ class LiveReferencePipelineTest(unittest.TestCase):
 
         self.assertNotIn("глава", normalize_text("обычная пятого раза"))
 
+    def test_fused_ordinal_chapter_marker_covers_known_numbers_and_compounds(self):
+        from bible_parser_core.parser import ORDINALS
+        # Every known genitive ordinal can retain -о/-е when glued to «гла».
+        for ordinal, number in ORDINALS.items():
+            if not ordinal.endswith(("ого", "его")) or number > 150:
+                continue
+            text = f"псалтирь {ordinal[:-2]}гла первый стих"
+            with self.subTest(text=text):
+                result = LiveReferencePipeline().process_text(text)
+                self.assertEqual(f"Псалтирь {number}:1", (result.get("parsed") or {}).get("ref"))
+        for number, fused in ((21, "двадцать первогла"), (21, "двадцатьпервогла"),
+                              (103, "сто третьегла"), (105, "стопятогла"),
+                              (121, "сто двадцать первогла"), (121, "стодвадцатьпервогла"),
+                              (4, "четвёртойглаве"), (4, "четвертоглава"), (4, "4гла")):
+            with self.subTest(fused=fused):
+                self.assertEqual(f"псалтирь {number} глава 1 стих",
+                                 normalize_text(f"псалтирь {fused} первый стих"))
+                result = LiveReferencePipeline().process_text(f"псалтирь {fused} первый стих")
+                canonical = LiveReferencePipeline().process_text(f"псалтирь {number} глава первый стих")
+                self.assertEqual((canonical.get("parsed") or {}).get("ref"),
+                                 (result.get("parsed") or {}).get("ref"))
+                self.assertEqual(number, (result.get("parsed") or {}).get("chapter"))
+
+    def test_actual_ephesians_glued_chapter_no_longer_requests_operator(self):
+        text = ("апостол павел говорит в послании вся на четвёртогла пятнадцатый стих "
+                "о необходимости говорить истину в любви истинно без любви может превратиться в жестокость")
+        result = LiveReferencePipeline().process_text(text)
+        self.assertEqual("Ефесянам 4:15", (result.get("parsed") or {}).get("ref"))
+        self.assertFalse(result.get("incomplete_reference"))
+
+    def test_glued_chapter_rule_preserves_words_and_verse_numbers(self):
+        for text in ("двуглавый орел", "трехглавая гора", "первоглавный", "четвертого раза"):
+            with self.subTest(text=text):
+                self.assertNotRegex(normalize_text(text), r"\bглава\b")
+        self.assertEqual("матфей 4 глава 15 стих", normalize_text("матфей четвертая глава пятнадцатый стих"))
+        result = LiveReferencePipeline().process_text("Иаков пятая глава с четвертого по восьмой стих")
+        self.assertEqual("Иаков 5:4-8", (result.get("parsed") or {}).get("ref"))
+
     def test_inflected_full_revelation_title_does_not_fall_back_to_john(self):
         result = LiveReferencePipeline().process_text(
             "об этом нам говорит откровением иоанна богослова "
@@ -7030,6 +7258,43 @@ class LiveReferencePipelineTest(unittest.TestCase):
         )
 
         self.assertEqual("Иаков 4:8-10", result.get("parsed", {}).get("ref"))
+
+    def test_verse_before_book_and_chapter_trigger_0003(self):
+        text = (
+            "девятый стих послания иакова пятая глава не сетуйте братья друг на друга "
+            "чтобы не быть осуждёнными вот судья стоит у дверей"
+        )
+        for prefix in ("", "не позволяйте страданиям разрушать отношения между братьями "):
+            with self.subTest(prefix=prefix):
+                phrase = prefix + text
+                self.assertEqual("Иаков 5:9", parse_live_reference(phrase).ref)
+                result = LiveReferencePipeline().process_text(phrase)
+                self.assertEqual("Иаков 5:9", result.get("parsed", {}).get("ref"))
+                self.assertNotIn("fuzzy_book_match", result.get("risk_reasons", []))
+
+    def test_verse_before_book_and_chapter_variants(self):
+        for text, expected in (
+            ("девятый стих послания иакова пятая глава", "Иаков 5:9"),
+            ("9 стих Иакова 5 глава", "Иаков 5:9"),
+            ("третий стих послания к римлянам восьмая глава", "Римлянам 8:3"),
+            ("девятый стих первого послания иоанна первая глава", "1 Иоанна 1:9"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(expected, parse_live_reference(text).ref)
+
+    def test_reversed_address_requires_exact_book_and_adjacent_markers(self):
+        from bible_parser_core.parser import bible_map, ref_candidates
+        bible = bible_map()
+        for text, book in (
+            ("9 стих послания иакова 5 глава", "Судьи"),
+            ("9 стих послания иакова мы прочитали затем 5 глава", "Иаков"),
+            ("9 стих вот судья стоит у дверей 5 глава", "Судьи"),
+        ):
+            with self.subTest(text=text, book=book):
+                self.assertFalse(any(
+                    candidate.score >= 1.0
+                    for candidate in ref_candidates(text, book, bible)
+                ))
 
     def test_verse_range_before_book_without_chapter_stays_incomplete(self):
         result = LiveReferencePipeline().process_text(

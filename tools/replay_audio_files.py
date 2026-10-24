@@ -3056,6 +3056,14 @@ def handle_result(
         }
     }
     payload["output"] = output
+    if text_detector is not None and output["replay"]["sent"]:
+        slide = payload.get("slide") or {}
+        slide_source = str(slide.get("source") or "").removeprefix("vosk:")
+        if slide_source in {"parser", "text_citation"} and slide.get("ref"):
+            # Replay assumes ordinary detected citations were sent. Keep the
+            # same semantic duplicate guard as live output, without simulating
+            # an operator approval popup.
+            text_detector.select_reference(str(slide["ref"]))
     logger.write(
         "parsed",
         {

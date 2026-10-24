@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 import time
+import json
+from functools import lru_cache
 from collections import deque
 from dataclasses import asdict
 from difflib import SequenceMatcher
@@ -281,6 +283,51 @@ def sermon_plan_grammar_phrases(
             phrases.update(words)
             phrases.add(" ".join(words))
     return sorted(phrases)
+
+
+@lru_cache(maxsize=4)
+def written_book_abbreviations(bible_path: Path) -> dict[str, str]:
+    """Reuse the abbreviations supplied by the Bible, not a second alias list."""
+    from bible_parser_core.book_aliases import books_data
+    data = json.loads(bible_path.read_text(encoding="utf-8"))
+    result = {}
+    for book, (canonical, _aliases) in zip(data.get("Books", []), books_data):
+        name = str(book.get("BookName") or "").lower().replace("ё", "е")
+        name = re.sub(r"^(\d)(?=[а-я])", r"\1 ", name)
+        result[re.sub(r"[.\s]+", " ", name).strip()] = canonical
+    return result
+
+
+def sermon_plan_reading_references(text: str, bible_path: Path = DEFAULT_BIBLE) -> list[ParsedReference]:
+    """Read written plan references; punctuation is not an ASR alias."""
+    from bible_parser_core.parser import BOOK_VARIANTS
+    from bible_parser_core.book_aliases import books_data
+
+    normalized = re.sub(r"[–—−]", "-", text.lower().replace("ё", "е"))
+    found = []
+    multiword = [re.escape(book.lower()) for book, _ in books_data
+                 if " " in book and not book[0].isdigit()]
+    book_pattern = "|".join(multiword + [r"(?:[1-4]\s*)?[а-я]+"])
+    for match in re.finditer(
+        rf"(?<![\w])({book_pattern})\.?\s*(\d+)\s*:\s*(\d+)(?:\s*-\s*(\d+))?",
+        normalized,
+    ):
+        book, chapter, first, last = match.groups()
+        book = re.sub(r"^(\d)(?=[а-я])", r"\1 ", book)
+        # Standard short names that the ordinary parser does not resolve can
+        # use an unambiguous prefix. Never guess between multiple books.
+        canonical = written_book_abbreviations(bible_path).get(book) or BOOK_VARIANTS.get(book)
+        if canonical is None and len(book.replace(" ", "")) >= 3:
+            candidates = {name for alias, name in BOOK_VARIANTS.items() if alias.startswith(book)}
+            if len(candidates) == 1:
+                canonical = candidates.pop()
+        reference = parse_live_reference(f"{canonical or book} {chapter}:{first}" + (f"-{last}" if last else ""), bible_path=bible_path)
+        if (reference is not None and reference.confidence >= 0.95
+                and reference.chapter == int(chapter)
+                and reference.start_verse == int(first)
+                and reference.end_verse == int(last or first)):
+            found.append(reference)
+    return found
 
 
 def sermon_plan_match_targets(text: str) -> list[str]:

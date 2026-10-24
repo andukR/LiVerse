@@ -58,6 +58,7 @@ from bible_parser_core.live_pipeline import (
     parsed_payload_from_candidates as core_parsed_payload_from_candidates,
     resolve_reference_payload as core_resolve_reference_payload,
     sermon_plan_grammar_phrases,
+    sermon_plan_reading_references,
 )
 from bible_parser_core.parser import DEFAULT_BIBLE, normalize_text, parse_live_reference
 from bible_parser_core.risk_model import load_risk_model, score_payload_with_model
@@ -91,6 +92,7 @@ from tools.holyrics import (
     env_setting,
     get_holyrics_current_presentation,
     handle_scripture_range_reading_match,
+    pause_scripture_range_reading,
     apply_scripture_range_operator_hint,
     liverse_config_dir,
     show_holyrics_text_slide,
@@ -448,6 +450,15 @@ class JsonlLogger:
             return
         (self.run_dir / "session.json").write_text(
             json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def write_session_summary(self, records: list[dict]) -> None:
+        if not self.enabled or self.run_dir is None:
+            return
+        path = self.run_dir / "session_summary.json"
+        path.write_text(
+            json.dumps({"references": records}, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
 
@@ -2225,7 +2236,7 @@ def consume_stop_request(path: Path | None) -> str:
         path.unlink()
     except OSError:
         return ""
-    return action if action in {"stop", "restart"} else "stop"
+    return action if action in {"stop", "restart", "pause_reading"} else "stop"
 
 
 def parsed_payload_from_candidates(
@@ -2785,6 +2796,23 @@ def popup_missing_chapter(hint: dict, bible_path: Path = DEFAULT_BIBLE, *, on_de
         wraplength=650,
     ).pack(fill="x", padx=30, pady=(28, 12))
     tk.Label(
+        root, text="Распознанная фраза (возможны ошибки):",
+        bg="#101820", fg="#c8d2dc", font=("Segoe UI", 13),
+    ).pack(fill="x", padx=30, anchor="w")
+    source_frame = tk.Frame(root, bg="#101820")
+    source_frame.pack(fill="x", padx=30, pady=(4, 12))
+    source_scroll = tk.Scrollbar(source_frame)
+    source_scroll.pack(side="right", fill="y")
+    source = tk.Text(
+        source_frame, height=4, width=54, wrap="word", font=("Segoe UI", 14),
+        bg="#101820", fg="#f5f7fa", relief="flat", takefocus=False,
+        yscrollcommand=source_scroll.set,
+    )
+    source.insert("1.0", str(hint.get("source_text") or "Исходная распознанная фраза не сохранена."))
+    source.configure(state="disabled")
+    source.pack(side="left", fill="x", expand=True)
+    source_scroll.configure(command=source.yview)
+    tk.Label(
         root,
         text="Номер главы не распознан. Введите номер главы:",
         bg="#101820",
@@ -2851,6 +2879,13 @@ def popup_missing_chapter(hint: dict, bible_path: Path = DEFAULT_BIBLE, *, on_de
     root.bind_all("<Return>", lambda _event: (submit(), "break")[1])
     root.bind_all("<Escape>", lambda _event: (close(), "break")[1])
     root.protocol("WM_DELETE_WINDOW", close)
+
+    root.update_idletasks()
+    width, height = approval_popup_dimensions(
+        int(root.winfo_screenwidth()), int(root.winfo_screenheight()),
+        int(root.winfo_reqheight()) + 4,
+    )
+    center_tk_window(root, width, height)
 
     def claim_focus() -> None:
         if not root.winfo_exists() or bool(closed.get()):
@@ -3147,6 +3182,8 @@ class PopupApprovalQueue:
                     "web": result.get("web", {"enabled": False, "reason": "rejected_or_no_slide"}),
                 }
                 final_action = approval_action(item["output"])
+                remember_selected_scripture(self.args, item, item["output"])
+                forget_rejected_address_marker(self.args, item, item["output"])
                 if action_selects_context(final_action, item.get("slide") or {}):
                     pipeline = getattr(self.args, "_live_reference_pipeline", None)
                     if pipeline is not None:
@@ -3467,6 +3504,35 @@ def approval_action(output: dict) -> str:
     return "recognized"
 
 
+def remember_selected_scripture(args: argparse.Namespace, payload: dict, output: dict) -> None:
+    """Track the latest scripture slide only after an operator chose it and output succeeded."""
+    if approval_action(output) not in {"sent", "approve", "approve_context"}:
+        return
+    slide = payload.get("slide") or {}
+    source = str(slide.get("source") or "").removeprefix("vosk:")
+    if source not in {"parser", "text_citation"}:
+        return
+    detector = getattr(args, "_text_citation_detector", None)
+    reference = str(slide.get("ref") or "").strip()
+    if detector is not None and reference:
+        detector.select_reference(reference)
+
+
+def forget_rejected_address_marker(args: argparse.Namespace, payload: dict, output: dict) -> None:
+    """Let Bible-text recognition correct a rejected spoken address."""
+    if approval_action(output) not in {
+        "reject", "not_citation", "wrong_reference", "skip", "output_failed",
+    }:
+        return
+    slide = payload.get("slide") or {}
+    if str(slide.get("source") or "").removeprefix("vosk:") != "parser":
+        return
+    detector = getattr(args, "_text_citation_detector", None)
+    reference = str(slide.get("ref") or "").strip()
+    if detector is not None and reference:
+        detector.clear_rejected_address(reference)
+
+
 def operator_feedback(output: dict) -> dict | None:
     """Return an unambiguous local training label for an operator decision."""
     approval = output.get("approval") or {}
@@ -3559,6 +3625,101 @@ def list_audio_devices() -> int:
     return 0
 
 
+def update_reading_fragment(args, state: dict, text: str, logger) -> bool:
+    """Honor a fresh spoken subrange without replacing the global context."""
+    if "plan_fragments" not in state:
+        owner = state.get("scripture_owner") or {}
+        previous = owner.get("previous") or {}
+        fragments = []
+        for slide in previous.get("slides") or []:
+            for ref in sermon_plan_reading_references(str(slide.get("text") or ""),
+                                                     getattr(args, "bible", DEFAULT_BIBLE)):
+                if ref.book == state.get("book"):
+                    fragments.append({"ref": ref.ref, "slide_number": slide.get("number")})
+        state["plan_fragments"] = fragments
+        if fragments:
+            logger.write("SCRIPTURE_READING_PLAN_HINTS", {"passage": state.get("ref"), "fragments": fragments})
+    marked = normalize_text(text)
+    if not (re.search(r"\d\s*:\s*\d", text) or
+            re.search(r"\d+\s+стих\w*\b|\bстих\w*\s+(?:с\s+)?\d+", marked)):
+        return False
+    parsed = parse_live_reference(text, bible_path=getattr(args, "bible", DEFAULT_BIBLE))
+    if parsed is None:
+        # Only explicitly marked verse numbers may borrow book/chapter.
+        current = (state.get("targets") or [{}])[int(state.get("current_index") or 0)]
+        parsed = parse_live_reference(
+            f"{state.get('book')} {current.get('chapter')} глава {text}",
+            bible_path=getattr(args, "bible", DEFAULT_BIBLE),
+        )
+    if parsed is None or parsed.book != state.get("book") or parsed.confidence < 0.95:
+        return False
+    targets = state.get("targets") or []
+    start = (parsed.chapter, parsed.start_verse)
+    end = (parsed.end_chapter or parsed.chapter, parsed.end_verse)
+    current_index = int(state.get("current_index") or 0)
+    positions = [(int(t["chapter"]), int(t["verse"])) for t in targets]
+    if start not in positions or end not in positions or start > end or positions.index(end) < current_index:
+        return False
+    end_index = positions.index(end)
+    if end_index == len(targets) - 1 and positions.index(start) == 0:
+        if "fragment_end_index" not in state:
+            return False
+        state.pop("fragment_end_index", None)
+        state.pop("fragment_ref", None)
+        logger.write("SCRIPTURE_READING_FRAGMENT", {"passage": state.get("ref"),
+                     "fragment": parsed.ref, "source": "spoken_full_range"})
+        return True
+    state["fragment_end_index"] = end_index
+    state["fragment_ref"] = parsed.ref
+    logger.write("SCRIPTURE_READING_FRAGMENT", {"passage": state.get("ref"), "fragment": parsed.ref,
+                  "end_index": end_index, "source": "spoken_address",
+                  "plan_slides": [hint["slide_number"] for hint in state["plan_fragments"]
+                                  if hint["ref"] == parsed.ref]})
+    return True
+
+
+def fresh_reading_ending(state, alignment, text, searcher) -> bool:
+    current = int(state.get("current_index") or 0)
+    targets = state.get("targets") or []
+    if current >= len(targets):
+        return False
+    ordered_tail = searcher.normalize_lemmas(targets[current].get("text", ""))[-4:]
+    tail = set(ordered_tail)
+    words = set(searcher.normalize_lemmas(text))
+    return bool(tail and alignment.status == "current_ending" and alignment.would_activate
+                and ordered_tail[-1] in words
+                and getattr(alignment, "current_tail_hits", 0) >= min(2, len(tail)))
+
+
+def observe_reading_commentary(args, state, alignment, text, searcher, logger) -> bool:
+    """Require fresh non-reading speech after a heard ending, never silence."""
+    current = int(state.get("current_index") or 0)
+    targets = state.get("targets") or []
+    if not targets or current >= len(targets):
+        return False
+    words = searcher.normalize_lemmas(text)
+    nearby = set(searcher.normalize_lemmas(" ".join(t.get("text", "") for t in targets[current:current + 2])))
+    overlap = sum(word in nearby for word in words)
+    # The aligner has rolling history. A historic ending is insufficient:
+    # this fresh final phrase must itself contain the verse's final words.
+    if fresh_reading_ending(state, alignment, text, searcher):
+        state["heard_ending_index"] = current
+    if len(words) < 4:
+        return False
+    if overlap >= 3 or overlap / len(words) >= 0.35:
+        state["commentary_phrases"] = state["commentary_words"] = 0
+        return False
+    if state.get("heard_ending_index") != current:
+        return False
+    state["commentary_phrases"] = state.get("commentary_phrases", 0) + 1
+    state["commentary_words"] = state.get("commentary_words", 0) + len(words)
+    if state["commentary_phrases"] < 3 or state["commentary_words"] < 18:
+        return False
+    result = pause_scripture_range_reading(args, reason="commentary_after_verse")
+    logger.write("SCRIPTURE_READING_COMMENTARY", result)
+    return bool(result.get("ok"))
+
+
 def log_live_streaming_alignment(
     args: argparse.Namespace,
     text: str,
@@ -3583,6 +3744,8 @@ def log_live_streaming_alignment(
     state = getattr(args, "_holyrics_scripture_range_reading", None)
     if not isinstance(state, dict):
         return None
+    if recognition_result == "final":
+        update_reading_fragment(args, state, text, logger)
     aligner = getattr(args, "_live_streaming_verse_aligner", None)
     if not isinstance(aligner, StreamingVerseAligner):
         aligner = StreamingVerseAligner(text_searcher)
@@ -3623,6 +3786,27 @@ def log_live_streaming_alignment(
     )
     targets = list(state.get("targets") or [])
     current_index = int(state.get("current_index") or 0)
+    fragment_end = state.get("fragment_end_index")
+    if controls_slide and isinstance(fragment_end, int) and (
+        (recognition_result == "final" and current_index == fragment_end
+         and fresh_reading_ending(state, alignment, text, text_searcher))
+        or (alignment.would_advance and isinstance(alignment.proposed_index, int)
+            and alignment.proposed_index > fragment_end)
+    ):
+        result = pause_scripture_range_reading(args, reason="spoken_fragment_completed")
+        logger.write("SCRIPTURE_READING_FRAGMENT_COMPLETED", result)
+        if result.get("ok"):
+            aligner.clear()
+            if text_detector is not None:
+                text_detector.clear()
+            return alignment
+    if controls_slide and recognition_result == "final" and observe_reading_commentary(
+        args, state, alignment, text, text_searcher, logger
+    ):
+        aligner.clear()
+        if text_detector is not None:
+            text_detector.clear()
+        return alignment
     if (
         controls_slide
         and recognition_result == "final"
@@ -3903,6 +4087,7 @@ def run_microphone(args: argparse.Namespace) -> int:
                 ),
                 event_callback=logger.write,
             )
+            setattr(args, "_text_citation_detector", text_detector)
             print(f"Поиск цитат по тексту: {args.text_detection_db}", flush=True)
         except (OSError, RuntimeError, ValueError) as exc:
             logger.write("text_detection_startup_error", {"error": str(exc)})
@@ -4098,7 +4283,15 @@ def run_microphone(args: argparse.Namespace) -> int:
                 last_streaming_partial = ""
                 while True:
                     stop_action = consume_stop_request(args.stop_file)
-                    if stop_action:
+                    if stop_action == "pause_reading":
+                        result = pause_scripture_range_reading(args)
+                        logger.write("SCRIPTURE_READING_OPERATOR_PAUSE", result)
+                        if text_detector is not None:
+                            text_detector.clear()
+                        cancel_pending_popup_approval()
+                        console.status("чтение приостановлено; возвращаю предыдущий экран" if result.get("ok")
+                                       else f"возврат не выполнен: {result.get('reason')}")
+                    elif stop_action:
                         raise GracefulStopRequested(stop_action)
                     set_live_latency_context(None)
                     approval_queue = getattr(args, "_popup_approval_queue", None)
@@ -4245,6 +4438,12 @@ def run_microphone(args: argparse.Namespace) -> int:
                                 recognition_time=recognition_time,
                                 text_detector=text_detector,
                             )
+                            if long_passage_reading and not scripture_range_reading_active(args):
+                                # Do not feed the same final phrase back into
+                                # normal citation detection after restoring.
+                                record_processing_timing({"source": "scripture_reading_return"})
+                                continue
+                            long_passage_reading = scripture_range_reading_active(args)
                             list_clock_start, list_clock_end, list_clock_basis = reading_list_clock(
                                 result,
                                 fallback=recognition_time,
@@ -4689,6 +4888,8 @@ def run_microphone(args: argparse.Namespace) -> int:
                             payload["_live_latency_trace"] = latency_trace
                             set_live_latency_context(latency_trace)
                             payload["output"] = publish_payload(output_args, payload)
+                            remember_selected_scripture(args, payload, payload["output"])
+                            forget_rejected_address_marker(args, payload, payload["output"])
                             if approval_action(payload["output"]) in {
                                 "reject",
                                 "not_citation",
@@ -4831,15 +5032,18 @@ def run_microphone(args: argparse.Namespace) -> int:
             stop_reason = "operator_stop"
             print("\nОстановлено.", flush=True)
             if args.session_summary_popup and request.action != "restart":
+                logger.write_session_summary(session_refs)
                 show_session_summary_popup(session_refs)
             return 0
         except KeyboardInterrupt:
             stop_reason = "keyboard_interrupt"
             print("\nОстановлено.", flush=True)
             if args.session_summary_popup:
+                logger.write_session_summary(session_refs)
                 show_session_summary_popup(session_refs)
             return 0
         finally:
+            logger.write_session_summary(session_refs)
             logger.write("session_stopped", {"reason": stop_reason, "audio_queue_items": audio_queue.qsize()})
             close_popup_tk_root()
             if audio_log:

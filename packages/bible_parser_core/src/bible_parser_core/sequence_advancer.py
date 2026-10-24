@@ -277,7 +277,7 @@ def decide_sequence_advance(
         and float(score) >= 80.0
         and float(margin) >= 30.0
         and int(matched_words) >= 5
-        and (accepted or reason == "duplicate_cooldown")
+        and (accepted or reason in {"duplicate_cooldown", "already_selected_reference"})
     )
     if candidate_index > current_index + 1 and (strong or distant_recovery):
         if distant_recovery:

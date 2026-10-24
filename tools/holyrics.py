@@ -1851,6 +1851,25 @@ def scripture_range_reading_active(args: Any) -> bool:
     return isinstance(state, dict) and bool(state.get("targets"))
 
 
+def pause_scripture_range_reading(args: Any, *, reason: str = "operator_pause") -> dict:
+    """Restore the display without discarding the parser's Bible context."""
+    with _SCRIPTURE_OWNER_LOCK:
+        state = getattr(args, "_holyrics_scripture_range_reading", None)
+        if not isinstance(state, dict):
+            return {"ok": False, "reason": "long_passage_inactive"}
+        owner = state.get("scripture_owner")
+        base = str(getattr(args, "holyrics_url", "")).rstrip("/")
+        if not isinstance(owner, dict):
+            # Older presentation paths retain their existing completion rules.
+            return {"ok": False, "reason": "range_pause_requires_scripture_theme"}
+        ok, restore_reason, _ = restore_owned_scripture_presentation(args, base, owner)
+        result = {"ok": ok, "reason": reason, "restore_reason": restore_reason,
+                  "passage": state.get("ref"), "current_index": state.get("current_index"),
+                  "restore_pending": restore_reason == "scripture_restore_pending"}
+        holyrics_diagnostic_event(args, "scripture_reading_paused", result)
+        return result
+
+
 def sync_scripture_range_reading(args: Any) -> dict:
     """Synchronize manual Holyrics navigation with the active long passage."""
     state = getattr(args, "_holyrics_scripture_range_reading", None)

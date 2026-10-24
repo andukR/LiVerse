@@ -1029,8 +1029,34 @@ def replace_fused_hundred_ordinal(match: re.Match[str]) -> str:
     return f"{FUSED_HUNDRED_ORDINAL_STEMS[match.group(1)]} "
 
 
+# Extend the clipped «N гла» repair to known ordinals glued to the marker.
+# «четвертогла» retains «четверто» from «четвертого». An actual chapter
+# marker must end the token: never rewrite arbitrary words ending in a stem.
+FUSED_CHAPTER_MARKER_ORDINALS = dict(ORDINALS)
+FUSED_CHAPTER_MARKER_ORDINALS.update({
+    word[:-2]: value for word, value in ORDINALS.items() if word.endswith(("ого", "его"))
+})
+FEMININE_CHAPTER_WORDS = {
+    value: word for word, value in ORDINALS.items() if word.endswith(("ая", "яя", "ья"))
+}
+FUSED_ORDINAL_CHAPTER_MARKER_RE = re.compile(
+    r"\b(?:(?P<hundred>сто)\s*)?"
+    r"(?:(?P<tens>двадцать|тридцать|сорок|пятьдесят|шестьдесят|семьдесят|восемьдесят|девяносто)\s*)?"
+    r"(?P<ordinal>" + "|".join(sorted(FUSED_CHAPTER_MARKER_ORDINALS, key=len, reverse=True))
+    + r"|\d+)гла(?:в(?:а|е|ы|у|ой|ою)?)?\b"
+)
+
+
+def replace_fused_ordinal_chapter_marker(match: re.Match[str]) -> str:
+    word = match.group("ordinal")
+    number = int(word) if word.isdigit() else FUSED_CHAPTER_MARKER_ORDINALS[word]
+    ordinal = FEMININE_CHAPTER_WORDS.get(number, str(number))
+    return " ".join(part for part in (match.group("hundred"), match.group("tens"), ordinal, "глава") if part)
+
+
 def normalize_text(text: str) -> str:
     normalized = text.lower().replace("ё", "е")
+    normalized = FUSED_ORDINAL_CHAPTER_MARKER_RE.sub(replace_fused_ordinal_chapter_marker, normalized)
     for pattern, replacement in _COMPILED_ASR_REPLACEMENTS:
         normalized = pattern.sub(replacement, normalized)
     # On fast speech Sherpa can omit the boundary between «стих» and the next
@@ -1725,12 +1751,25 @@ def ref_candidates(normalized: str, book: str, bible: dict[str, dict[int, dict[i
             psalm = int(match.group(1)) + int(match.group(2))
             add(psalm, [1], match.start(), match.end(), 1.04)
 
+    # Keep an intervening book tied to its own exact alias: arbitrary sermon
+    # words between verse and chapter must not form a reversed address.
+    exact_book_names = [
+        re.escape(candidate.text)
+        for candidate in book_candidates(normalized)
+        if candidate.book == book and candidate.score >= 0.999
+    ]
+    reversed_book_gap = (
+        r"(?:(?:послани[ея]|книг[аи])\s+)?(?:"
+        + "|".join(exact_book_names)
+        + r")\s+"
+        if exact_book_names else r"(?!)"
+    )
     explicit_patterns = (
         (r"(\d+)\s*:\s*(\d+)\s*-\s*(\d+)", 1, 2, 3, 1.0),
         (r"(\d+)\s*:\s*(\d+)", 1, 2, None, 1.0),
         (r"(\d+)\s+глава\s+(\d+)\s+стих", 1, 2, None, 1.0),
         (r"(\d+)\s+глава\s+[a-z]{1,12}\s+(\d+)\s+стих", 1, 2, None, 0.985),
-        (r"(\d+)\s+стих\s+(\d+)\s+глава", 2, 1, None, 1.0),
+        (r"(\d+)\s+стих\s+(?:" + reversed_book_gap + r")?(\d+)\s+глава", 2, 1, None, 1.0),
         (r"стих\s+(\d+)\s+(\d+)\s+глава", 2, 1, None, 0.97),
         (r"(\d+)\s+(?:из\s+тех|из|стих)\s+(\d+)\s+глава", 2, 1, None, 0.96),
         (r"с\s+(\d+)\s+(?:из\s+тех|из)\s+(\d+)\s+глава", 2, 1, None, 0.96),
@@ -2406,6 +2445,14 @@ def _unanchored_person_name_book_candidate(
         and book_candidate.text in {"яков", "иакова", "иаково"}
         and not 0 <= ref_candidate.start - book_candidate.end <= 3
     ):
+        # «9 стих послания Иакова 5 глава» explicitly surrounds the book
+        # with both address markers; it is not a person mentioned in prose.
+        if re.fullmatch(
+            r"\d+\s+стих\s+(?:послани[ея]\s+)?"
+            + re.escape(book_candidate.text) + r"\s+\d+\s+глава",
+            normalized[ref_candidate.start : ref_candidate.end],
+        ):
+            return False
         return True
     # In «Иуда, брата Иакова» the two book-like words are names in the
     # surrounding biblical text, not a new citation.

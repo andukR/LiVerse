@@ -509,6 +509,7 @@ class ScriptureTextDetector:
         self._pending_at = float("-inf")
         self._confirmations = 0
         self._shown_at: dict[tuple[str, int, int, int, int] | str, float] = {}
+        self._selected_reference: tuple[str, int, int, int, int] | str | None = None
         self._search_cache: dict[str, tuple[list[str], list[BibleTextSearchResult]]] = {}
         self._last_windows: list[SpeechWindow] = []
 
@@ -521,14 +522,28 @@ class ScriptureTextDetector:
             self._suppressed_until,
             now + self.config.address_suppression_seconds,
         )
-        if reference:
-            self._shown_at[_reference_key(reference)] = now
         self._reset_pending()
         self._emit("TEXT_SUPPRESSED", {"reason": "explicit_address", "reference": reference})
 
     def mark_shown(self, reference: str, now: float) -> None:
         if reference:
             self._shown_at[_reference_key(reference)] = now
+
+    def select_reference(self, reference: str) -> None:
+        """Remember the scripture reference successfully chosen for display."""
+        if reference:
+            self._selected_reference = _reference_key(reference)
+
+    def forget_shown(self, reference: str) -> None:
+        """Remove a temporary address marker when its proposed slide was rejected."""
+        if reference:
+            self._shown_at.pop(_reference_key(reference), None)
+
+    def clear_rejected_address(self, reference: str) -> None:
+        """Resume text recognition immediately after the operator rejects an address."""
+        self.forget_shown(reference)
+        self._suppressed_until = float("-inf")
+        self._reset_pending()
 
     def process_fragment(
         self,
@@ -899,11 +914,17 @@ class ScriptureTextDetector:
             if lemma in content_lemmas and lemma not in COMMON_SPEECH_LEMMAS
         )
         shown_relation = None if ignore_recently_shown else self._recent_shown_relation(top, now)
-        if shown_relation == "contained":
+        if shown_relation in {"contained", "selected"}:
             return self._decision(
                 reference=top.reference, score=top.score, margin=margin,
                 matched_words=matched_words, window_text=window_text,
-                reason="duplicate_cooldown", top=top, second=second,
+                reason=(
+                    "already_selected_reference"
+                    if shown_relation == "selected"
+                    else "duplicate_cooldown"
+                ),
+                top=top,
+                second=second,
             )
         strong_phrase_evidence = (
             matched_words >= 5
@@ -1035,6 +1056,18 @@ class ScriptureTextDetector:
         """Classify a candidate relative to a recently displayed text range."""
         candidate_book, candidate_chapter, candidate_start, candidate_end_chapter, candidate_end = _candidate_key(candidate)
         has_next = False
+        selected = self._selected_reference
+        if isinstance(selected, tuple) and len(selected) == 5:
+            book, chapter, start, end_chapter, end = selected
+            if (
+                book == candidate_book
+                and chapter == candidate_chapter
+                and end_chapter == candidate_end_chapter
+            ):
+                if start <= candidate_start and candidate_end <= end:
+                    return "selected"
+                if candidate_start == end + 1:
+                    has_next = True
         for key, shown_at in self._shown_at.items():
             if not isinstance(key, tuple) or len(key) != 5:
                 continue

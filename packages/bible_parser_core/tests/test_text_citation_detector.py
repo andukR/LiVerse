@@ -106,6 +106,63 @@ class IdentityLemmaSearcher:
 
 
 class StreamingVerseAlignerTest(unittest.TestCase):
+    def test_church_fragment_waits_for_short_final_asr_phrase(self):
+        from tools.vosk_grammar_probe import log_live_streaming_alignment
+        from bible_parser_core.parser import bible_map
+        from bible_parser_core.bible_text_search import normalize_bible_text
+        from unittest.mock import Mock
+        bible = bible_map(DEFAULT_BIBLE)["Иаков"][5]
+        state = {"ref": "Иаков 5:7-12", "book": "Иаков", "book_id": 59,
+                 "current_index": 1, "fragment_end_index": 1,
+                 "targets": [{"chapter": 5, "verse": v,
+                              "text": " ".join(normalize_bible_text(bible[v]))} for v in range(7, 13)]}
+        args = SimpleNamespace(smart_slide_streaming_control=True, long_range_slide_mode="one_verse",
+                               _holyrics_scripture_range_reading=state)
+        speech = ("и для него терпит долго пока получит дождь ранее и поздний долготерпите и вы "
+                  "укрепите сердца ваши потому что пришествие господня")
+        with patch("tools.vosk_grammar_probe.pause_scripture_range_reading", return_value={"ok": True}) as restore:
+            log_live_streaming_alignment(args, speech, IdentityLemmaSearcher(), Mock(),
+                                         recognition_result="final", recognition_time=1)
+            restore.assert_not_called()
+            log_live_streaming_alignment(args, "приближается аминь", IdentityLemmaSearcher(), Mock(),
+                                         recognition_result="final", recognition_time=2)
+        restore.assert_called_once_with(args, reason="spoken_fragment_completed")
+
+    def test_spoken_fragment_ending_restores_before_unread_rest_of_range(self):
+        from tools.vosk_grammar_probe import log_live_streaming_alignment
+        from unittest.mock import Mock
+        state = self.state()
+        state["current_index"] = 1
+        state["fragment_end_index"] = 1
+        args = SimpleNamespace(smart_slide_streaming_control=True, long_range_slide_mode="one_verse",
+                               _holyrics_scripture_range_reading=state)
+        def pause(_args, **_kwargs):
+            _args._holyrics_scripture_range_reading = None
+            return {"ok": True, "restore_pending": True}
+        with patch("tools.vosk_grammar_probe.pause_scripture_range_reading", side_effect=pause) as restore, patch(
+            "tools.vosk_grammar_probe.apply_scripture_range_operator_hint"
+        ) as advance:
+            log_live_streaming_alignment(args, state["targets"][1]["text"], IdentityLemmaSearcher(), Mock(),
+                                         recognition_result="final", recognition_time=30)
+        restore.assert_called_once_with(args, reason="spoken_fragment_completed")
+        advance.assert_not_called()
+        self.assertIsNone(args._holyrics_scripture_range_reading)
+
+    def test_fragment_boundary_never_advances_into_unrequested_next_verse(self):
+        from tools.vosk_grammar_probe import log_live_streaming_alignment
+        from unittest.mock import Mock
+        state = self.state()
+        state["current_index"] = state["fragment_end_index"] = 1
+        args = SimpleNamespace(smart_slide_streaming_control=True, long_range_slide_mode="one_verse",
+                               _holyrics_scripture_range_reading=state)
+        with patch("tools.vosk_grammar_probe.pause_scripture_range_reading", return_value={"ok": True}) as restore, patch(
+            "tools.vosk_grammar_probe.apply_scripture_range_operator_hint"
+        ) as advance:
+            log_live_streaming_alignment(args, "приносит мир сердцам людей третий стих продолжает чтение",
+                IdentityLemmaSearcher(), Mock(), recognition_result="partial", recognition_time=31)
+        restore.assert_called_once()
+        advance.assert_not_called()
+
     @staticmethod
     def state() -> dict:
         return {
@@ -1178,7 +1235,7 @@ class ScriptureTextDetectorTest(unittest.TestCase):
         self.assertTrue(decision.accepted)
         self.assertEqual("Иер. 32:40-42", decision.reference)
 
-    def test_full_and_abbreviated_reference_share_duplicate_cooldown(self) -> None:
+    def test_selected_full_reference_suppresses_abbreviated_text_after_long_pause(self) -> None:
         strong = hit(
             "Иак. 1:26", 96.0,
             matched=("думать", "благочестивый", "обуздывать", "язык", "сердце"),
@@ -1191,15 +1248,110 @@ class ScriptureTextDetectorTest(unittest.TestCase):
             FakeSearcher([[strong]]),
             self.config(immediate_score=90.0),
         )
-        detector.suppress_after_address("Иаков 1:26", now=0.0)
+        detector.select_reference("Иаков 1:26")
 
         duplicate = detector.process_fragment(
             "думать благочестивый обуздывать язык сердце",
-            now=9.0,
+            now=60.0,
         )
 
         self.assertFalse(duplicate.accepted)
-        self.assertEqual("duplicate_cooldown", duplicate.reason)
+        self.assertEqual("already_selected_reference", duplicate.reason)
+
+    def test_explicit_address_suppression_expires_without_marking_reference_selected(self) -> None:
+        strong = hit(
+            "Ин. 3:16", 96.0,
+            matched=("ибо", "возлюбить", "бог", "мир", "сын"),
+            trigram=75.0,
+            book_id=43,
+        )
+        detector = ScriptureTextDetector(
+            FakeSearcher([[strong]]),
+            self.config(immediate_score=90.0),
+        )
+        detector.suppress_after_address("Ин. 3:16", now=0.0)
+
+        decision = detector.process_fragment("ибо возлюбить бог мир сын", now=40.0)
+
+        self.assertTrue(decision.accepted)
+        self.assertEqual("Ин. 3:16", decision.reference)
+
+    def test_selected_range_suppresses_contained_text_but_allows_next_verse(self) -> None:
+        repeated = hit(
+            "Иак. 5:10", 96.0,
+            matched=("долготерпение", "господне", "конец", "видеть"),
+            trigram=75.0,
+            book_id=59,
+            chapter=5,
+            verse=10,
+        )
+        following = hit(
+            "Иак. 5:11", 78.0,
+            matched=("блаженными", "слышали", "терпение", "иова"),
+            bigram=50.0,
+            trigram=25.0,
+            book_id=59,
+            chapter=5,
+            verse=11,
+        )
+        detector = ScriptureTextDetector(
+            FakeSearcher([[repeated], [following], [following]]),
+            self.config(immediate_score=99.0),
+        )
+        detector.select_reference("Иаков 5:9-10")
+
+        duplicate = detector.process_fragment("долготерпение господне конец видеть", now=90.0)
+        continuation = detector.process_fragment("блаженными слышали терпение иова", now=91.0)
+
+        self.assertFalse(duplicate.accepted)
+        self.assertEqual("already_selected_reference", duplicate.reason)
+        self.assertTrue(continuation.accepted)
+        self.assertEqual("Иак. 5:11", continuation.reference)
+
+    def test_new_selected_reference_replaces_previous_duplicate_guard(self) -> None:
+        old = hit(
+            "Ин. 3:16", 96.0,
+            matched=("ибо", "возлюбить", "бог", "мир", "сын"),
+            trigram=75.0,
+            book_id=43,
+            chapter=3,
+            verse=16,
+        )
+        detector = ScriptureTextDetector(
+            FakeSearcher([[old]]),
+            self.config(immediate_score=90.0),
+        )
+        detector.select_reference("Иоанн 3:16")
+        detector.select_reference("Римлянам 8:1")
+
+        decision = detector.process_fragment("ибо возлюбить бог мир сын", now=90.0)
+
+        self.assertTrue(decision.accepted)
+        self.assertEqual("Ин. 3:16", decision.reference)
+
+    def test_rejected_address_marker_can_be_removed_for_text_correction(self) -> None:
+        strong = hit(
+            "Иак. 5:9", 96.0,
+            matched=("сетовать", "брат", "друг", "друг", "судия"),
+            trigram=75.0,
+            book_id=59,
+            chapter=5,
+            verse=9,
+        )
+        detector = ScriptureTextDetector(
+            FakeSearcher([[strong]]),
+            self.config(immediate_score=90.0),
+        )
+        detector.mark_shown("Судьи 5:9", now=0.0)
+        detector.suppress_after_address("Судьи 5:9", now=0.0)
+        held = detector.process_fragment("сетовать брат друг друг судия", now=2.0)
+        detector.clear_rejected_address("Судьи 5:9")
+        decision = detector.process_fragment("сетовать брат друг друг судия", now=3.0)
+
+        self.assertFalse(held.accepted)
+        self.assertEqual("address_suppression", held.reason)
+        self.assertTrue(decision.accepted)
+        self.assertEqual("Иак. 5:9", decision.reference)
 
     def test_text_range_suppresses_contained_repeat_and_accepts_next_verse(self) -> None:
         repeated = hit(

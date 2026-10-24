@@ -325,7 +325,7 @@ class SequenceAdvancerTest(unittest.TestCase):
             state,
             self.candidate(11),
             accepted=False,
-            reason="duplicate_cooldown",
+            reason="already_selected_reference",
             score=91.0,
             margin=59.0,
             matched_words=7,

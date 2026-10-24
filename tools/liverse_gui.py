@@ -14,12 +14,13 @@ import sys
 import threading
 import time
 import traceback
+import webbrowser
 import zipfile
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -62,6 +63,7 @@ from tools.vosk_grammar_probe import (  # noqa: E402
     check_startup_update,
     load_startup_settings,
     save_startup_settings,
+    session_references_text,
 )
 
 
@@ -98,7 +100,13 @@ STATE_COLORS = {
     "error": ("#FDE8E7", "#A12622"),
     "neutral": ("#E9EEF3", "#465463"),
 }
-LOG_EXPORT_NAMES = ("session.json", "events.jsonl", "trigger_cases.jsonl", "performance.jsonl")
+LOG_EXPORT_NAMES = (
+    "session.json",
+    "session_summary.json",
+    "events.jsonl",
+    "trigger_cases.jsonl",
+    "performance.jsonl",
+)
 SENSITIVE_LOG_KEYS = ("token", "password", "secret", "authorization")
 
 
@@ -603,12 +611,6 @@ class LiVerseGui:
         self.long_range_slide_var = tk.StringVar(
             value=LONG_RANGE_SLIDE_LABELS[self.config.long_range_slide_mode]
         )
-        self.long_range_operator_hints_var = tk.BooleanVar(
-            value=self.config.long_range_operator_hints
-        )
-        self.smart_slide_streaming_control_var = tk.BooleanVar(
-            value=self.config.smart_slide_streaming_control
-        )
         self.text_operator_hints_var = tk.BooleanVar(value=self.config.text_operator_hints)
         self.performance_diagnostics_var = tk.BooleanVar(
             value=self.config.performance_diagnostics
@@ -657,9 +659,7 @@ class LiVerseGui:
             self.root.title(f"LiVerse {__version__} — диагностический тест")
         self.root.geometry("760x640")
         self.root.minsize(700, 560)
-        self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
-        if self.diagnostic_test:
-            self.root.protocol("WM_DELETE_WINDOW", self.quit_application)
+        self.root.protocol("WM_DELETE_WINDOW", self.quit_application)
         try:
             self.root.iconphoto(True, tk.PhotoImage(file=str(PROJECT_ROOT / "LiVerse.png")))
         except tk.TclError:
@@ -776,6 +776,7 @@ class LiVerseGui:
             command=self.toggle_engine,
         ).pack(side="left")
         ttk.Button(buttons, text="Проверить HoLyrics", command=self.check_holyrics).pack(side="left", padx=8)
+        ttk.Button(buttons, text="Вернуть план", command=self.pause_reading).pack(side="left")
         ttk.Button(buttons, text="Завершить LiVerse", command=self.quit_application).pack(side="right")
         ttk.Button(buttons, text="Скрыть", command=self.hide_window).pack(side="right", padx=8)
         guides = ttk.Frame(self.status_tab)
@@ -877,18 +878,6 @@ class LiVerseGui:
             wraplength=390,
         ).grid(row=mode_row, column=0, sticky="w", pady=(0, 3))
         mode_row += 1
-        ttk.Checkbutton(
-            modes,
-            text="Подсказывать оператору,\nне перелистывая автоматически",
-            variable=self.long_range_operator_hints_var,
-        ).grid(row=mode_row, column=0, sticky="w", pady=2)
-        mode_row += 1
-        ttk.Checkbutton(
-            modes,
-            text="Потоковый УПС для чтения\nстих за стихом (рекомендуется)",
-            variable=self.smart_slide_streaming_control_var,
-        ).grid(row=mode_row, column=0, sticky="w", pady=2)
-
         right_row = 0
         ttk.Label(holyrics, text="Запасная тема цитат").grid(row=right_row, column=0, sticky="w", pady=3)
         ttk.Entry(holyrics, textvariable=self.scripture_theme_var).grid(row=right_row, column=1, sticky="ew", pady=3)
@@ -989,6 +978,7 @@ class LiVerseGui:
         self.logs_listbox.configure(yscrollcommand=scrollbar.set)
         self.logs_listbox.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+        self.logs_listbox.bind("<<ListboxSelect>>", lambda _event: self._update_log_actions())
 
         ttk.Checkbutton(
             self.logs_tab,
@@ -1014,6 +1004,13 @@ class LiVerseGui:
         )
         self.check_log_button = ttk.Button(actions, text="Проверить сеанс", command=self._check_selected_log)
         self.check_log_button.pack(side="left")
+        self.session_summary_button = ttk.Button(
+            actions,
+            text="Итоги сеанса",
+            command=self._show_selected_session_summary,
+            state="disabled",
+        )
+        self.session_summary_button.pack(side="left", padx=8)
         self._create_primary_button(
             actions,
             text="Создать архив…",
@@ -1027,6 +1024,65 @@ class LiVerseGui:
         for session in self.log_sessions:
             files = [name for name in (*LOG_EXPORT_NAMES, "audio.wav") if (session / name).is_file()]
             self.logs_listbox.insert("end", f"{session.name}   ({', '.join(files)})")
+        self._update_log_actions()
+
+    def _selected_log_session(self) -> Path | None:
+        selected = self.logs_listbox.curselection()
+        if len(selected) != 1:
+            return None
+        index = selected[0]
+        if index < 0 or index >= len(self.log_sessions):
+            return None
+        return self.log_sessions[index]
+
+    def _update_log_actions(self) -> None:
+        session = self._selected_log_session()
+        available = session is not None and (session / "session_summary.json").is_file()
+        self.session_summary_button.configure(state="normal" if available else "disabled")
+
+    def _show_selected_session_summary(self) -> None:
+        session = self._selected_log_session()
+        if session is None:
+            messagebox.showinfo("LiVerse", "Выберите один сеанс в списке журналов.", parent=self.root)
+            return
+        path = session / "session_summary.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            records = data.get("references", [])
+            if not isinstance(records, list):
+                raise ValueError("Поле references должно быть списком.")
+            text = session_references_text(records)
+        except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
+            messagebox.showerror("LiVerse", f"Не удалось открыть итоги сеанса:\n{exc}", parent=self.root)
+            return
+
+        text = text or "За этот сеанс ссылки не были распознаны."
+        whatsapp_url = f"https://wa.me/?text={quote(text)}" if records else ""
+        window = tk.Toplevel(self.root)
+        window.title(f"LiVerse — итоги сеанса {session.name}")
+        window.geometry("760x560")
+        window.minsize(500, 400)
+        frame = ttk.Frame(window, padding=16)
+        frame.pack(fill="both", expand=True)
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        body = tk.Text(frame, wrap="word", font=("Segoe UI", 12), padx=12, pady=12)
+        scrollbar = ttk.Scrollbar(frame, command=body.yview)
+        body.configure(yscrollcommand=scrollbar.set)
+        body.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        body.insert("1.0", text)
+        body.configure(state="disabled")
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        ttk.Button(
+            buttons,
+            text="Поделиться в WhatsApp",
+            command=lambda: webbrowser.open(whatsapp_url) if whatsapp_url else None,
+            state="normal" if whatsapp_url else "disabled",
+        ).pack(side="left")
+        ttk.Button(buttons, text="Закрыть", command=window.destroy).pack(side="right")
+        window.protocol("WM_DELETE_WINDOW", window.destroy)
 
     def _select_latest_log(self) -> None:
         # A session directory is created by the engine at startup.  Refresh here
@@ -1036,6 +1092,7 @@ class LiVerseGui:
         if self.log_sessions:
             self.logs_listbox.selection_set(0)
             self.logs_listbox.see(0)
+        self._update_log_actions()
 
     def _export_selected_logs(self) -> None:
         selected = [self.log_sessions[index] for index in self.logs_listbox.curselection()]
@@ -1262,10 +1319,8 @@ class LiVerseGui:
                 self.long_range_slide_var.get(),
                 "compact",
             ),
-            long_range_operator_hints=bool(self.long_range_operator_hints_var.get()),
-            smart_slide_streaming_control=bool(
-                self.smart_slide_streaming_control_var.get()
-            ),
+            long_range_operator_hints=False,
+            smart_slide_streaming_control=True,
             text_operator_hints=bool(self.text_operator_hints_var.get()),
             performance_diagnostics=bool(self.performance_diagnostics_var.get()),
             open_operator_qr=bool(self.open_qr_var.get()),
@@ -1374,6 +1429,21 @@ class LiVerseGui:
                 self.tray_icon.update_menu()
             except Exception:
                 pass
+
+    def pause_reading(self) -> None:
+        if self.process is None or self.process.poll() is not None:
+            return
+        try:
+            path = engine_stop_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("x", encoding="utf-8") as command:
+                command.write("pause_reading")
+        except FileExistsError:
+            return
+        except OSError as exc:
+            self.activity_var.set(f"Не удалось запросить возврат: {exc}")
+            return
+        self.activity_var.set("Запрошен возврат к предыдущему экрану; распознавание продолжается")
 
     def stop_engine(self, *, restart: bool = False) -> None:
         process = self.process
@@ -1897,11 +1967,6 @@ class LiVerseGui:
         self.root.after(50, self.root.focus_force)
 
     def hide_window(self) -> None:
-        if self.process is None or self.process.poll() is not None:
-            self.notebook.select(self.settings_tab)
-            self.activity_var.set("Проверьте настройки перед запуском! Для выхода используйте «Выход».")
-            self.show_window()
-            return
         if self.tray_available and tray_can_hide_window(backend=self.tray_backend):
             self.root.withdraw()
         else:
